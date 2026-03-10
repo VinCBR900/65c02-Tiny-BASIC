@@ -123,8 +123,6 @@ Both ROMs work in the [Kowalski 65C02 Simulator](https://github.com/Kelmar/kowal
 
 Load the assembled binary or paste the `.asm` source click Assemble (F7), Debug (F6) and either RUN (F5) or Animate (Ctrl-F5) if you want to watch it step through - don't forget to click and type into the yellow Terminal window. The INIT trampoline at the start of uBASIC ROM means Kowalski's nominal execute-from-first-byte behaviour works correctly, as does real hardware's reset-vector startup.
 
- >**Note:** FOR/NEXT loops nested inside a GOSUB do not execute correctly in Kowalski — the NEXT cannot loop back through the GOSUB call frame. I can't tell if this is a Kowalski limitation or an interpreter bug as the batch simulator and interactive simulator both handle this correctly. The 4K BASIC v11.5 showcase works around this by using GOTO instead of GOSUB to enter the Mandelbrot section.
-
 The interactive simulator (`sim65c02_interactive.exe`) is a drop-in alternative to Kowalski for day-to-day development. It uses identical I/O port addresses, adds live ZP/variable inspection, and avoids the FOR/NEXT-inside-GOSUB limitation.
 
 ### Proprietary Simulators
@@ -561,11 +559,31 @@ uBASIC at 2 KB sits squarely in the original Tiny BASIC tradition: non-tokenised
 
 - **Oscar Toledo** for [x86 BootBASIC](https://github.com/nanochess/bootBASIC) — my original inspiration for a non-IL Tiny BASIC approach.
 - **Will Stevens'** [1kbyte 8080 Tiny BASIC](https://github.com/WillStevens/basic1K) was also a more recent inspiration and taught me a few old skool tricks on code density. 
-- **Hans Sotten** for a thorough [6502 Tiny BASIC site](http://retro.hansotten.nl/6502-sbc/kim-1-manuals-and-software/kim-1-software/tiny-basic).
+- **Hans Otten** for a thorough [6502 Tiny BASIC site](http://retro.hansotten.nl/6502-sbc/kim-1-manuals-and-software/kim-1-software/tiny-basic).
 - **[Claude AI](https://claude.ai)** for making it possible for a non-expert to ship something that had been on the back burner since 1989.
 
 ---
 
 ## Licence
 
-Use as-is; no warranty given or implied. Credit appreciated if you make something useful with this. If you make money from it, congrats — please credit me.
+Copyright (c) 2026 VinCBR900
+
+**MIT License**
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
