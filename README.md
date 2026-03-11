@@ -566,7 +566,7 @@ uBASIC at 2 KB sits squarely in the original Tiny BASIC tradition: non-tokenised
 
 ## Licence
 
-Copyright (c) 2026 VinCBR900
+Copyright (c) 2026 Vincent Crabtree
 
 **MIT License**
 
