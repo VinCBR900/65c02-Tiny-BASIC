@@ -22,7 +22,7 @@ Both interpreters have been tested on the [Kowalski 65C02 Simulator](https://git
 
 ### uBASIC — fits in a 2716 EPROM (<2 KByte)
 
-**~2039 bytes assembled. ROM at $F800–$FFFF.**
+**<2048 bytes assembled. ROM at $F800–$FFFF.**
 
 A minimal but complete integer BASIC. No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution. This costs RAM and speed but keeps the interpreter very small. Comfortably fits in a 2716 EPROM (2048 bytes), which was the original design goal.
 
@@ -99,11 +99,11 @@ A significantly more capable integer BASIC. Keywords are tokenised on entry and 
 
 | File | Description |
 |------|-------------|
-| `uBASICvXX.asm` | uBASIC source (~1750 lines, heavily commented) |
-| `4kBASICvXX.asm` | 4K BASIC source (~3100 lines, heavily commented) |
-| `asm65c02_vXX.c` | Two-pass 65C02 assembler (C) — builds standalone or embeds in sim |
-| `sim65c02-vXX.c` | 65C02 Batch simulator— includes asm65c02.c directly |
-| `sim65c02-vXX_interactive` | 65C02 simulator with virtual terminal (C) — includes asm65c02.c directly |
+| `uBASIC.asm` | uBASIC source (~1750 lines, heavily commented) |
+| `4kBASIC.asm` | 4K BASIC source (~3100 lines, heavily commented) |
+| `asm65c02.c` | Two-pass 65C02 assembler (C) — builds standalone or embeds in sim |
+| `sim65c02.c` | 65C02 Batch simulator— includes asm65c02.c directly |
+| `sim65c02_interactive` | 65C02 simulator with virtual terminal (C) — includes asm65c02.c directly |
 
 Both assembly sources include a pre-loaded **feature showcase program** at $0200. Type `RUN` to see it, `NEW` to clear it, `LIST` to read the source.
 
@@ -123,7 +123,7 @@ Both ROMs work in the [Kowalski 65C02 Simulator](https://github.com/Kelmar/kowal
 
 Load the assembled binary or paste the `.asm` source click Assemble (F7), Debug (F6) and either RUN (F5) or Animate (Ctrl-F5) if you want to watch it step through - don't forget to click and type into the yellow Terminal window. The INIT trampoline at the start of uBASIC ROM means Kowalski's nominal execute-from-first-byte behaviour works correctly, as does real hardware's reset-vector startup.
 
-The interactive simulator (`sim65c02_interactive.exe`) is a drop-in alternative to Kowalski for day-to-day development. It uses identical I/O port addresses, adds live ZP/variable inspection, and avoids the FOR/NEXT-inside-GOSUB limitation.
+The interactive simulator (`sim65c02_interactive.exe`) is a drop-in alternative to Kowalski for day-to-day development. It uses identical I/O port addresses, adds live ZP/variable inspection.
 
 ### Proprietary Simulators
 Building and Running
