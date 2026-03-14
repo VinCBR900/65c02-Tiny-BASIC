@@ -302,16 +302,22 @@ This may be old news to many people but is included here for those to whom this 
 
 The key insight is that you do not need to understand every byte of 65C02 assembly to extend these interpreters. The workflow is:
 
-1. **Upload ASM65c02.c, SIM65c02.c and the version you want to modify** to Claude, and tell it to review.
-2. **Describe what you want** to Claude in plain English — a new statement, a new operator, a bug fix, or a size optimisation.
-3. **Claude proposes the assembly change** with full explanation of what each instruction does and why.
-4. **Tell Claude to implement and Test with the simulator** - you might need to tell Claude to use a TRACE log in case the session is interrupted. If it is interrupted **Dont't Click Retry** but type "continue from Trace file" and it should.
-5. **Paste the modified source** into the Kowalski simulator or Interactive Sim:
+1. **Create a 'Project' in Claude**, Upload ASM65c02.c, SIM65c02.c to the files section, add rules like below, and in the chat window upload the ASM version you want to modify and tell it to review.
+```asm
+Create a TRACE LOG file that includes the version of any tools in it that you need and charts progress so you can continue if interrupted.
+Always uprev tool versions if you need to modify them by updating the header file and update the trace file.
+To avoid using wrong version, Copy old source version to an archive folder and only use them for regression testing.
+Ensure source files have the header updated with change log and all functions are commented with inputs, outputs and clobbers. 
+```
+3. **Describe what you want** to Claude in plain English — a new statement, a new operator, a bug fix, or a size optimisation.
+4. **Claude proposes the assembly change** with full explanation of what it is doing and whetehr the tools need updating.
+5. **Tell Claude to implement and Test with the simulator** - Claude will use the TRACE log in case the session is interrupted. If it is interrupted **Dont't Click Retry** but type "continue from Trace file" and it should.
+6. **Paste the modified source** into the Kowalski simulator or Interactive Sim:
    ```bash
    ./sim65c02_interactive ubasic13.asm "
    ```
-6. **If it works**, check the size report (`asm65c02 ubasic13.asm`) to make sure the ROM still fits.
-7. **Iterate.** The assembler gives clear error messages; the simulator lets you inject test input without hardware.
+7. **When it works**, check the size report (`asm65c02 ubasic13.asm`) to make sure the ROM still fits.
+8. **Iterate.** The assembler gives clear error messages; the simulator lets you inject test input without hardware.
 
 ### What to share with Claude
 
