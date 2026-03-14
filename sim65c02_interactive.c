@@ -1,5 +1,7 @@
 /*
- * sim65c02_interactive.c  —  interactive TUI mode for sim65c02  (v2, Mar 2026)
+ * sim65c02_interactive.c  —  interactive TUI mode for sim65c02  (v3, Mar 2026)
+ *
+ * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
  * Provides a split-screen ncurses interface:
  *   Left pane  (40 cols × 25 rows): Virtual BASIC terminal, exact Kowalski I/O mapping
@@ -26,6 +28,7 @@
  *   $E004  read   GETCH    non-blocking keyboard poll (0 = no key)
  *   $E005  write  XPOS     set cursor column (0-based)
  *   $E006  write  YPOS     set cursor row (0-based)
+ *   $E007  write  IRQ      fire maskable IRQ (Break key)
  *
  * 4K BASIC v11 zero-page map used for the state panel:
  *   $00-$01  IP      interpreter pointer
@@ -51,10 +54,13 @@
  *   F1 or Ctrl-H   →  toggle panel: VARS A-Z  ↔  ZP hex dump $00-$BF
  *   F2             →  toggle panel: FOR frames  ↔  stack $0100-$01FF (top 16)
  *   F5             →  reset CPU (warm restart via reset vector)
+ *   F6             →  fire maskable IRQ (Break key)
  *   Ctrl-C / Escape+q  →  quit
  *
  * Version history:
  *   v1  Initial version.
+ *   v2  Fix CR/LF; q/Q as normal input; improved halt display.
+ *   v3  F6 key fires maskable IRQ ($E007); status bar shows F6:break.
  */
 
 #include <stdio.h>
@@ -150,12 +156,15 @@ static uint8_t rd(uint16_t a) {
     if (a == 0xE004) return keyq_poll();   /* GETCH: consume one key */
     return mem[a];
 }
+static int irq_pending = 0;   /* set by F6 key / $E007 write */
+
 static void wr(uint16_t a, uint8_t v) {
     switch (a) {
     case 0xE000:  vterm_clear();        return;  /* CLS         */
     case 0xE001:  vterm_putch(v);       return;  /* PUTCH       */
     case 0xE005:  vcol = v < TERM_COLS ? v : TERM_COLS-1; return; /* X_POS */
     case 0xE006:  vrow = v < TERM_ROWS ? v : TERM_ROWS-1; return; /* Y_POS */
+    case 0xE007:  irq_pending = 1; return;                        /* IRQ   */
     default:      mem[a] = v;
     }
 }
@@ -559,7 +568,7 @@ static void draw_status(CPU *cpu, long long cycles) {
     wattron(wstatus, A_REVERSE);
     mvwprintw(wstatus, 0, 0,
         " PC:%04X A:%02X X:%02X Y:%02X SP:%02X  N%dV%dD%dI%dZ%dC%d"
-        "  Cyc:%-12lld  F1:ZP-dump F5:reset q:quit",
+        "  Cyc:%-12lld  F1:ZP F5:reset F6:break Ctrl-C:quit",
         cpu->PC, cpu->A, cpu->X, cpu->Y, cpu->SP,
         cpu->N, cpu->V, cpu->D, cpu->I, cpu->Z, cpu->C,
         cycles);
@@ -624,7 +633,8 @@ int main(int argc, char **argv) {
             "Usage: sim65c02_interactive <file.asm | file.bin>\n"
             "  F1  toggle ZP hex dump panel\n"
             "  F5  reset CPU\n"
-            "  q   quit\n"
+            "  F6  fire IRQ (Break key)\n"
+            "  Ctrl-C  quit\n"
             "\nBuild: gcc -O2 -o sim65c02_interactive sim65c02_interactive.c -lncurses\n"
         );
         return 1;
@@ -724,6 +734,10 @@ int main(int argc, char **argv) {
                 cycle_count = 0; cycles = 0;
                 vterm_clear();
                 break;
+            case KEY_F(6):
+                /* fire maskable IRQ (Break key) */
+                wr(0xE007, 1);
+                break;
             case 'q':
             case 'Q':
                 keyq_push((uint8_t)ch); break;  /* q/Q = normal input, not quit */
@@ -757,6 +771,15 @@ int main(int argc, char **argv) {
         }
 
         for (int i = 0; i < burst && !quit; i++) {
+            /* deliver pending IRQ before next instruction */
+            if (irq_pending && !cpu.I) {
+                irq_pending = 0;
+                PUSH(&cpu, (cpu.PC >> 8) & 0xFF);
+                PUSH(&cpu, cpu.PC & 0xFF);
+                PUSH(&cpu, pack_flags(&cpu) & ~0x10);
+                cpu.I = 1;
+                cpu.PC = (uint16_t)(mem[0xFFFE] | (mem[0xFFFF] << 8));
+            }
             trace_buf[trace_pos % TRACE_N] = cpu.PC;
             trace_pos++;
             int r = step(&cpu);

@@ -1,5 +1,7 @@
 /*
- * sim65c02.c  —  65C02 simulator  (v6, Mar 2026)
+ * sim65c02.c  —  65C02 simulator  (v7, Mar 2026)
+ *
+ * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
  * Canonical simulator for:
  *   ubasic13.asm    uBASIC v13    (2 KB ROM at $F800-$FFFF)
@@ -114,6 +116,9 @@ static int plain_mode = 0;   /* --plain: suppress cursor-pos escapes; CR→LF */
 /* ── memory ─────────────────────────────────────────────────────────────── */
 uint8_t mem[65536];   /* shared with embedded asm65c02.c */
 
+/* Pending hardware IRQ: set by write to $E007, consumed by main loop */
+static int pending_irq = 0;
+
 static uint8_t rd(uint16_t a) {
     if (a == 0xE004) {
         /* poll: if char available consume and return it, else 0 */
@@ -147,6 +152,9 @@ static void wr(uint16_t a, uint8_t v) {
     case 0xE006:             /* TERMINAL_Y_POS: set cursor row ($E006) */
         term_row = v;
         if (!plain_mode) { printf("\033[%d;%dH", term_row + 1, term_col + 1); fflush(stdout); }
+        return;
+    case 0xE007:             /* IO_IRQ: any write triggers a maskable hardware IRQ */
+        pending_irq = 1;
         return;
     default:
         mem[a] = v;
@@ -606,7 +614,7 @@ static int assemble_and_load(const char *asm_path) {
 /* ── main ────────────────────────────────────────────────────────────────── */
 static void sim_usage(FILE *out) {
     fprintf(out,
-        "sim65c02 v6 — 65C02 simulator for uBASIC v13 and 4K BASIC v11\n"
+        "sim65c02 v7 — 65C02 simulator for uBASIC v13 and 4K BASIC v11\n"
         "\n"
         "Usage:\n"
         "  sim65c02 <file.asm | file.bin> [options]\n"
@@ -733,6 +741,15 @@ int main(int argc, char **argv) {
             fprintf(stderr,"\n[SIM] Halted (BRK/unknown) at $%04X after %lld cycles\n",
                     cpu.PC-1,cycles);
             break;
+        }
+        /* hardware IRQ: fire if pending and I flag clear */
+        if (pending_irq && !cpu.I) {
+            pending_irq = 0;
+            cpu.I = 1;                                /* SEI: mask further IRQs */
+            PUSH(&cpu, (uint8_t)(cpu.PC >> 8));       /* push PChi */
+            PUSH(&cpu, (uint8_t)(cpu.PC & 0xFF));     /* push PClo */
+            PUSH(&cpu, pack_flags(&cpu) & ~0x10);     /* push P with B=0 */
+            cpu.PC = (uint16_t)mem[0xFFFE] | ((uint16_t)mem[0xFFFF] << 8);
         }
     }
     if(cycles>=maxcycles)

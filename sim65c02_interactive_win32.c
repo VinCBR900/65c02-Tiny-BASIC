@@ -1,7 +1,9 @@
 /*
- * sim65c02_interactive_win32.c  —  interactive simulator for Windows  (v4, Mar 2026)
+ * sim65c02_interactive_win32.c  —  interactive simulator for Windows  (v5, Mar 2026)
  *
  * Split-screen Windows console TUI — no external dependencies, pure Win32 API.
+ *
+ * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
  *   Left  pane (40x25): Virtual BASIC terminal, exact Kowalski I/O mapping
  *   Right pane (38 cols): Interpreter state panel (live ZP / variable display)
@@ -22,10 +24,12 @@
  *   Normal typing  → fed to GETCH as keyboard input (CR sent on Enter)
  *   F1             → toggle right panel: VARS+FOR  ↔  ZP hex dump $00-$BF
  *   F5             → reset CPU (warm restart via reset vector)
+ *   F6             → fire maskable IRQ (Break key)
  *   Escape         → quit  (q/Q are passed through to BASIC as normal input)
  *
  * Version history:
  *   v1  Initial Windows port.
+ *   v5  F6 key fires maskable IRQ ($E007); status bar shows F6:BRK.
  *   v2  Fixed HALT crash: step() replaced with proven original from sim65c02.c.
  *       Terminal redrawn via WriteConsoleOutputCharacterA for clean 40-col rendering.
  *   v3  Fix CR/LF double-spacing: CR ($0D) resets column only; LF ($0A) advances row.
@@ -192,12 +196,15 @@ static uint8_t rd(uint16_t a) {
     if (a == 0xE004) return keyq_poll();
     return mem[a];
 }
-static void wr(uint16_t a, uint8_t v) {
+static static int irq_pending = 0;   /* set by F6 key / $E007 write */
+
+void wr(uint16_t a, uint8_t v) {
     switch (a) {
     case 0xE000: vterm_clear(); return;
     case 0xE001: vterm_putch(v); return;
     case 0xE005: vcol = (v < TERM_COLS) ? v : TERM_COLS-1; return;
     case 0xE006: vrow = (v < TERM_ROWS) ? v : TERM_ROWS-1; return;
+    case 0xE007: irq_pending = 1; return;   /* IRQ trigger */
     default:     mem[a] = v;
     }
 }
@@ -693,7 +700,7 @@ static void draw_status(CPU *cpu) {
     char buf[82];
     snprintf(buf, sizeof(buf),
         " PC:%04X A:%02X X:%02X Y:%02X SP:%02X  N%dV%dD%dI%dZ%dC%d"
-        "  Cyc:%-12lld  F1:ZP  F5:RST  q:quit",
+        "  Cyc:%-12lld  F1:ZP  F5:RST  F6:BRK  Esc:quit",
         cpu->PC, cpu->A, cpu->X, cpu->Y, cpu->SP,
         cpu->N, cpu->V, cpu->D, cpu->I, cpu->Z, cpu->C,
         cycle_count);
@@ -763,6 +770,7 @@ static void handle_key(KEY_EVENT_RECORD *ke, CPU *cpu) {
 
     if (vk == VK_F1)     { panel_mode ^= 1; return; }
     if (vk == VK_F5)     { reset_flag = 1;  return; }
+    if (vk == VK_F6)     { irq_pending = 1; return; }  /* Break key */
     if (vk == VK_ESCAPE) { quit_flag  = 1;  return; }
     if (asc == 'q' || asc == 'Q') { keyq_push((uint8_t)asc); return; }  /* q/Q = normal char, not quit */
 
@@ -900,6 +908,15 @@ int main(int argc, char **argv) {
             burst = 50;
 
         for (int i = 0; i < burst && !quit_flag; i++) {
+            /* deliver pending IRQ before next instruction */
+            if (irq_pending && !cpu.I) {
+                irq_pending = 0;
+                PUSH(&cpu, (cpu.PC >> 8) & 0xFF);
+                PUSH(&cpu, cpu.PC & 0xFF);
+                PUSH(&cpu, pack_flags(&cpu) & ~0x10);
+                cpu.I = 1;
+                cpu.PC = (uint16_t)(mem[0xFFFE] | (mem[0xFFFF] << 8));
+            }
             trace_buf[trace_pos % TRACE_N] = cpu.PC;
             trace_pos++;
             int r = step(&cpu);
