@@ -2768,7 +2768,7 @@ PH_byte:
     PLA             ; Restore for low nibble (fall through)
 PH_nib:
     AND #$0F        ; Isolate nibble
-    SED             ; <--- Set Decimal Mode (1 byte)
+    .db $f8		; SED ; Set Decimal Mode - My toy assembler doenst support yet
     CMP #$0A        ; <--- Set Carry if A >= 10 (2 bytes)
     ADC #$30        ; <--- The Magic Add (2 bytes)
     CLD             ; <--- Clear Decimal Mode (1 byte)
