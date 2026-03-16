@@ -129,6 +129,7 @@ BS       = $08               ; ASCII backspace
 
 ; Kowalski trampoline: Kowalski executes from the first assembled byte rather
 ; than the reset vector.  Real hardware reaches INIT via $FFFC instead.
+ROMSTART:
          BRA INIT
 
 ; =============================================================================
@@ -1893,5 +1894,5 @@ SHOWCASE_END:               ; INIT sets PE to this address ($0623)
 ; Reset / IRQ vectors
 ; =============================================================================
          .ORG $FFFC
-         .DW INIT             ; $FFFC: reset vector
+         .DW ROMSTART		; $FFFC: reset vector
          .DW IRQ_HANDLER      ; $FFFE: IRQ vector
