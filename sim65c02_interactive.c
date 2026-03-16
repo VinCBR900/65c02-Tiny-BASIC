@@ -12,6 +12,7 @@
  *       q/Q no longer quit — they are passed to BASIC as normal input (Ctrl-C to quit).
  *       Halt message now shows op, SP, stack top 4 bytes, and last 16 PC trace.
  *       draw_terminal rewritten to use mvwaddnstr for full 40-col row rendering.
+ * 
  *   Right pane (38 cols):           ZP / interpreter state panel, live-updating
  *   Status bar (bottom):            CPU registers, cycle count, speed
  *
@@ -28,6 +29,7 @@
  *   $E004  read   GETCH    non-blocking keyboard poll (0 = no key)
  *   $E005  write  XPOS     set cursor column (0-based)
  *   $E006  write  YPOS     set cursor row (0-based)
+ * Other I/O Ports
  *   $E007  write  IRQ      fire maskable IRQ (Break key)
  *
  * 4K BASIC v11 zero-page map used for the state panel:

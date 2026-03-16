@@ -1,17 +1,20 @@
 /*
- * sim65c02_interactive_win32.c  —  interactive simulator for Windows  (v5, Mar 2026)
- *
- * Split-screen Windows console TUI — no external dependencies, pure Win32 API.
+ * sim65c02_interactive_win32.c  —  Toy interactive 65c02  simulator for Windows  (v5, Mar 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
+ *
+ * Split-screen Windows console TUI — no external dependencies, pure Win32 API.
  *
  *   Left  pane (40x25): Virtual BASIC terminal, exact Kowalski I/O mapping
  *   Right pane (38 cols): Interpreter state panel (live ZP / variable display)
  *   Bottom bar: CPU registers + cycle count
  *
- * Build (MinGW / cross-compile):
- *   x86_64-w64-mingw32-gcc -O2 -o sim65c02_interactive.exe sim65c02_interactive_win32.c
+ * Build (TCC) using Windows console interface:
+ *   TCC -O2 -o sim65c02_interactive_W32.exe sim65c02_interactive_win32.c
  *   (asm65c02.c must be in same directory)
+ *
+ * Usage: 
+ *   sim65c02_interactive.exe <file.asm | file.bin> [--load-addr 0xNNNN]
  *
  * Kowalski I/O ports (identical to Kowalski simulator):
  *   $E000  write  CLS      clear virtual terminal + home cursor
@@ -19,6 +22,8 @@
  *   $E004  read   GETCH    non-blocking key poll (0 = no key)
  *   $E005  write  XPOS     set cursor column (0-based)
  *   $E006  write  YPOS     set cursor row (0-based)
+ * Additional I/O Ports
+ *   $E007  Write  N/A      Dummy write - used to initiate an Interrupt
  *
  * Controls:
  *   Normal typing  → fed to GETCH as keyboard input (CR sent on Enter)
@@ -36,6 +41,7 @@
  *       q/Q passed to BASIC as normal input; Escape to quit.
  *       Halt message shows op, SP, stack top 4 bytes, and last-16-PC trace.
  *   v4  Version sync with Linux v2 (no functional change).
+ *   V5  Version sync with Linux - IRQ trigger writing to $E007
  */
 
 #include <windows.h>

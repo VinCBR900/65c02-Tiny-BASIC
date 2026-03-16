@@ -1,11 +1,11 @@
 /*
- * sim65c02.c  —  65C02 simulator  (v7, Mar 2026)
+ * sim65c02.c  —  Toy 65C02 simulator  (v7, Mar 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
  * Canonical simulator for:
- *   ubasic13.asm    uBASIC v13    (2 KB ROM at $F800-$FFFF)
- *   4kbasic_v7.asm  4K BASIC v11  (4 KB ROM at $F000-$FFFF)
+ *   ubasic.asm    uBASIC v13    (2 KB ROM at $F800-$FFFF)
+ *   4kbasic.asm   4K BASIC v11  (4 KB ROM at $F000-$FFFF)
  *
  * Build (requires asm65c02.c in the same directory):
  *   gcc -O2 -o sim65c02 sim65c02.c

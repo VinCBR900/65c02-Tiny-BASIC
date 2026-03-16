@@ -1,22 +1,21 @@
 /*
- * asm65c02.c  —  Two-pass 65C02 assembler  (v1.3, Mar 2026)
+ * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.4, Mar 2026)
  *
- * Direct C port of assembler.py v1.6.  No Python runtime required.
+ * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
+ *
  * Also used as an embedded assembler inside sim65c02.c (included directly).
  *
  * v1.2: source_copy[] made static — prevents 1MB stack overflow on Windows.
  * v1.3: Forward-reference sizing fix: any expression containing an undefined
+ *       symbol now forces ABS/ABSX/ABSY mode on pass 1.
+ * v1.4: Added missing SED ($F8, Set Decimal Mode) to opcode table.: any expression containing an undefined
  *       symbol now forces ABS/ABSX/ABSY mode on pass 1, regardless of the
  *       partially-evaluated value.  Previously "SYM+1" with SYM undefined
  *       evaluated to 1 on pass 1, was sized as ZP (2 bytes), then on pass 2
  *       resolved to e.g. $FFCD (3 bytes), corrupting subsequent instruction
  *       addresses and producing a wrong ROM.
  *
- * Projects:
- *   ubasic13.asm    uBASIC v13    (2 KB ROM at $F800-$FFFF)
- *   4kbasic_v7.asm  4K BASIC v11  (4 KB ROM at $F000-$FFFF)
- *
- * Build (standalone):
+  * Build (standalone):
  *   gcc -O2 -DASM65C02_MAIN -o asm65c02 asm65c02.c
  *
  *   (The -DASM65C02_MAIN flag enables main(); without it the file is a
@@ -118,6 +117,7 @@ static const OpcodeEntry OPTAB[] = {
     {"bit",M_ZPX,0x34},{"bit",M_ABSX,0x3C},
     {"brk",M_IMP,0x00},
     {"clc",M_IMP,0x18},{"cld",M_IMP,0xD8},{"cli",M_IMP,0x58},{"clv",M_IMP,0xB8},
+    {"sed",M_IMP,0xF8},
     {"cmp",M_IMM,0xC9},{"cmp",M_ZP,0xC5},{"cmp",M_ZPX,0xD5},
     {"cmp",M_ABS,0xCD},{"cmp",M_ABSX,0xDD},{"cmp",M_IND_Y,0xD1},{"cmp",M_IND_ZP,0xD2},
     {"cpx",M_IMM,0xE0},{"cpx",M_ZP,0xE4},{"cpx",M_ABS,0xEC},
@@ -984,7 +984,9 @@ static void size_report(void) {
 #ifdef ASM65C02_MAIN
 static void asm_usage(FILE *out) {
     fprintf(out,
-        "asm65c02 v1.1 — 65C02 two-pass assembler\n"
+        "asm65c02 v1.1 — Toy 65C02 two-pass assembler\n"
+        "\n"
+        "Copyright Vincent Crabtree 2026, MIT License, See LICENSE file\n"
         "\n"
         "Usage:\n"
         "  asm65c02 <file.asm> [options]\n"
