@@ -147,9 +147,9 @@ gcc -O2 -o sim65c02_interactive sim65c02_interactive.c
 
 **Run:**
 ```
-sim65c02_interactive.exe 4kbasic_v7.asm
-sim65c02_interactive.exe ubasic13.asm
-sim65c02_interactive.exe 4kbasic_v11.bin
+sim65c02_interactive.exe 4kBASIC.asm
+sim65c02_interactive.exe uBASIC.asm
+sim65c02_interactive.exe 4kBASIC.bin
 ```
 
 The assembler is embedded — pass an `.asm` file directly. The console auto-resizes to 81×29 on startup; if your terminal has a small maximum buffer you may need to widen it in Properties first.
@@ -203,16 +203,16 @@ gcc -O2 -o sim65c02 sim65c02.c
 
 **Run:**
 ```bash
-./sim65c02 ubasic13.asm --input "PRINT 42"
-./sim65c02 4kbasic_v7.asm --input "PRINT 42"
-./sim65c02 4kbasic_v7.asm --mandelbrot --maxcycles 800000000
+./sim65c02 uBASIC.asm --input "PRINT 42"
+./sim65c02 4kBASIC.asm --input "PRINT 42"
+./sim65c02 4kBASIC.asm --mandelbrot --maxcycles 800000000
 ```
 
 `--mandelbrot` simply queues `RUN` — the showcase program (ending with the Mandelbrot renderer) is pre-loaded in both ROMs. `--input` is repeatable; flags are consumed in order, simulating a user typing at the terminal. The simulator exits cleanly when input is exhausted and the interpreter is waiting for a keypress.
 
 ```bash
 # Enter and run a small program non-interactively
-./sim65c02 ubasic13.asm \
+./sim65c02 uBASIC.asm \
   --input "NEW" \
   --input "10 FOR I=1 TO 5" \
   --input "20 PRINT I" \
