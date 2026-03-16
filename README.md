@@ -22,7 +22,7 @@ Both interpreters have been tested on the [Kowalski 65C02 Simulator](https://git
 
 ### uBASIC — fits in a 2716 EPROM (<2 KByte)
 
-**<2048 bytes assembled. ROM at $F800–$FFFF.**
+**<2048 bytes assembled. ROM at $F800–$FFFF**
 
 A minimal but complete integer BASIC. No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution. This costs RAM and speed but keeps the interpreter very small. Comfortably fits in a 2716 EPROM (2048 bytes), which was the original design goal.
 
@@ -54,7 +54,7 @@ A minimal but complete integer BASIC. No tokeniser — program lines are stored 
 
 ### 4K BASIC — fits in a 2732 EPROM (<4 KByte)
 
-**~4093 bytes assembled. ROM at $F000–$FFFF (61 bytes free). Current release: v11.3.**
+**<4096 bytes assembled. ROM at $F000–$FFFF**
 
 A significantly more capable integer BASIC. Keywords are tokenised on entry and numbers converted to 16-bit binary, so the interpreter does not re-parse ASCII on execution — several times faster than uBASIC and easier on RAM. Structured loops (FOR/NEXT) and subroutines (GOSUB/RETURN) are supported.
 
@@ -103,7 +103,8 @@ A significantly more capable integer BASIC. Keywords are tokenised on entry and 
 | `4kBASIC.asm` | 4K BASIC source (~3100 lines, heavily commented) |
 | `asm65c02.c` | Two-pass 65C02 assembler (C) — builds standalone or embeds in sim |
 | `sim65c02.c` | 65C02 Batch simulator— includes asm65c02.c directly |
-| `sim65c02_interactive` | 65C02 simulator with virtual terminal (C) — includes asm65c02.c directly |
+| `sim65c02_interactive` | 65C02 simulator with NCURSES virtual terminal (C) — includes asm65c02.c directly |
+| `sim65c02_interactive_Win32` | 65C02 simulator with Win32 TUI virtual terminal (C) — includes asm65c02.c directly |
 
 Both assembly sources include a pre-loaded **feature showcase program** at $0200. Type `RUN` to see it, `NEW` to clear it, `LIST` to read the source.
 
@@ -128,20 +129,20 @@ The interactive simulator (`sim65c02_interactive.exe`) is a drop-in alternative 
 ### Proprietary Simulators
 Building and Running
 
-Rwo simulators are available: a **batch simulator** (`sim65c02.c`) for scripted testing and a **interactive simulator** (`sim65c02_interactive_win32.c`) for live use as a Kowalski replacement. Both include the assembler directly and need no external dependencies.
+Rwo simulators are available: a **batch simulator** (`sim65c02.c`) for scripted testing and a **interactive simulator** (`sim65c02_interactive.c` for Linux and `sim65c02_interactive_win32.c`) for live use as a Kowalski replacement. Both include the assembler directly and need no external dependencies. 
 
 ### Interactive simulator (Windows) — recommended for development
 
 `sim65c02_interactive_win32.c` gives a split-screen Windows console that closely mimics the Kowalski simulator environment — type BASIC directly, see the virtual terminal on the left and live interpreter state on the right.
 
-**Build on Windows with MinGW:**
+**Build on Windows with TCC:**
 ```
-gcc -O2 -o sim65c02_interactive.exe sim65c02_interactive_win32.c
+Tcc -O2 -o sim65c02_interactive.exe sim65c02_interactive_win32.c
 ```
 
 **Cross-compile on Linux:**
 ```bash
-x86_64-w64-mingw32-gcc -O2 -o sim65c02_interactive.exe sim65c02_interactive_win32.c
+gcc -O2 -o sim65c02_interactive sim65c02_interactive.c
 ```
 
 **Run:**
@@ -181,8 +182,10 @@ The right panel updates live while the CPU runs — you can watch variables chan
 | Type normally | Input sent to GETCH — type BASIC commands as usual |
 | Enter | Sends CR to the interpreter |
 | Backspace | Sends backspace |
-| **F1** | Toggle right panel: variables + FOR/GOSUB stacks ↔ ZP hex dump `$00–$BF` |
+| **F1** | Toggle right panel:VARS A-Z  ↔  ZP hex dump `$00–$BF` |
+| **F2** | Toggle right panel: FOR/GOSUB stacks ↔ stack `$0100–$01FF` (Top 16) |
 | **F5** | Reset CPU (re-runs from reset vector, clears terminal) |
+| **F6** | Fire Maskable IRQ - IRQ handler should break into running BASIC program |
 | **Escape** | Quit and restore console |
 
 **Kowalski I/O mapping** is identical: `$E000` CLS, `$E001` PUTCH, `$E004` GETCH, `$E005`/`$E006` cursor X/Y. A program that works in Kowalski should behave identically here.
@@ -237,8 +240,8 @@ The assembler can also be built on its own to check sizes, print a symbol table,
 ```bash
 gcc -O2 -DASM65C02_MAIN -o asm65c02 asm65c02.c
 
-asm65c02 ubasic13.asm
-asm65c02 4kbasic_v7.asm
+asm65c02 uBASIC.asm
+asm65c02 4kBASIC.asm
 ```
 
 Output includes key symbol addresses, the reset vector, and a ROM size report. Exits 0 on success, 1 on assembly errors.
@@ -248,12 +251,12 @@ Output includes key symbol addresses, the reset vector, and a ROM size report. E
 Use the standalone assembler with `--binary` to write a raw 65536-byte flat image to stdout, then extract the ROM region:
 
 ```bash
-# uBASIC v13 — 2 KB ROM image for a 2716 EPROM
-asm65c02 ubasic13.asm --binary | dd bs=1 skip=63488 count=2048 of=ubasic13.bin
+# uBASIC — 2 KB ROM image for a 2716 EPROM
+asm65c02 uBASIC.asm --binary | dd bs=1 skip=63488 count=2048 of=ubasic13.bin
 #  63488 = 0xF800
 
-# 4K BASIC v11 — 4 KB ROM image for a 2732 EPROM
-asm65c02 4kbasic_v7.asm --binary | dd bs=1 skip=61440 count=4096 of=4kbasic_v11.bin
+# 4K BASIC — 4 KB ROM image for a 2732 EPROM
+asm65c02 4kBASIC.asm --binary | dd bs=1 skip=61440 count=4096 of=4kbasic_v11.bin
 #  61440 = 0xF000
 ```
 
@@ -262,8 +265,8 @@ Program the `.bin` file to an EPROM so that the chip's address pin 0 maps to $F8
 The simulator can verify a `.bin` directly — it auto-detects the load address from file size (2048 bytes → $F800, 4096 bytes → $F000):
 
 ```bash
-./sim65c02 ubasic13.bin --input "PRINT 42"
-./sim65c02 4kbasic_v11.bin --input "PRINT 42"
+./sim65c02 uBASIC.bin --input "PRINT 42"
+./sim65c02 4kBASIC.bin --input "PRINT 42"
 ```
 ```
 #### Note on Running from real ROM (no pre-loaded program)
@@ -280,7 +283,7 @@ Program the `.bin` file to an EPROM so that the chip's address 0 maps to $F800 (
 
 #### Terminal I/O
 
-Fo real Hardware you will need to modify the I/O Addresses for Serial I/O, specified below.  There is currently little ROM space available for more compicated stuff like Wait/Char-Available flags or Bit-Bang serial, so you will probably have to loose a keyword to make space - See Below on Using Claude to Customize.
+For real Hardware you will need to modify the I/O Addresses for Serial I/O, specified below.  Although 4kBASIC has plenty of space avaiable, there is currently little ROM space available in uBASIC for more compicated stuff like Wait/Char-Available flags or Bit-Bang serial, so you will probably have to loose a keyword to make space - See Below on Using Claude to Customize.
 
 | Address | Kowalski Virtual Terminal Function  |
 |---------|----------|
@@ -310,24 +313,14 @@ To avoid using wrong version, Copy old source version to an archive folder and o
 Ensure source files have the header updated with change log and all functions are commented with inputs, outputs and clobbers. 
 ```
 3. **Describe what you want** to Claude in plain English — a new statement, a new operator, a bug fix, or a size optimisation.
-4. **Claude proposes the assembly change** with full explanation of what it is doing and whetehr the tools need updating.
+4. **Claude proposes the assembly change** with full explanation of what it is doing and whether the tools need updating.
 5. **Tell Claude to implement and Test with the simulator** - Claude will use the TRACE log in case the session is interrupted. If it is interrupted **Dont't Click Retry** but type "continue from Trace file" and it should.
 6. **Paste the modified source** into the Kowalski simulator or Interactive Sim:
    ```bash
-   ./sim65c02_interactive ubasic13.asm "
+   ./sim65c02_interactive uBASIC.asm "
    ```
-7. **When it works**, check the size report (`asm65c02 ubasic13.asm`) to make sure the ROM still fits.
+7. **When it works**, check the size report (`asm65c02 uBASIC.asm`) to make sure the ROM still fits.
 8. **Iterate.** The assembler gives clear error messages; the simulator lets you inject test input without hardware.
-
-### What to share with Claude
-
-Files are heavily commented with In/Out/Clobbers headers on every function, which gives Claude exactly the context it needs to reason about register state and side effects.
-
-For a new statement in uBASIC, for example, you would tell Claude to inspect:
-- The `ST_TAB` dispatch table (so Claude knows the pattern)
-- The `DO_FREE` or `DO_POKE` handler (a short existing statement as a worked example)
-- The string table near `KW_FREE` (so Claude knows where to add the new keyword string)
-- The size report output (so Claude knows how many bytes are available)
 
 ### Useful prompts to get started
 
@@ -342,19 +335,9 @@ The attached ubasic13.asm has a PRINT statement handler (DO_PRINT).
 Can you add support for PRINT TAB(n) — move to column n before printing?
 ```
 
-```
-I want to understand how the expression evaluator works before modifying it.
-Can you walk me through EXPR → EXPR_ADD → EXPR1 → EXPR2 using the source below? [paste]
-```
-
-```
-Can you check whether any of the JMP instructions in this section could be
-replaced with BRA to save bytes? [paste EXPR2 or another function]
-```
-
 ### Things to watch out for
 
-- **ROM size.** uBASIC and 4K BASIC have less than a dozen bytes free, so pretty full. Always check after a change. Claude will help you find space savings if you're over budget.
+- **ROM size.** uBASIC has less than a dozen bytes free, so pretty full. Always check after a change. Claude will help you find space savings if you're over budget.
 - **Page constraints.** The uBASIC string table must stay entirely on page $F8 (all strings accessed via a shared hi-byte). Claude can get confused if the page boundary is exceeded - it will find it eventually but after a lot of thrashing, so tell it to watch out when adding new strings to uBASIC.
 - **Zero-page register clobbers.** The In/Out/Clobbers comments on each function document which of T0/T1/T2/LP/IP/OP are live. Claude will respect these if you share the relevant headers.
 - **Fall-through chains.** Several functions share a single RTS by falling through into the next function. These are clearly marked in the source. Inserting code between them without understanding the fall-through will break things — tell Claude to watch out for them.
