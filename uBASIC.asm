@@ -64,6 +64,9 @@
 ;     LDA #>SHOWCASE_END  ->  LDA #>PROG
 ;
 ; ---- version history --------------------------------------------------------
+; v17.1 (Mar 2026)  EXPR1 DIV/MOD result-select merge; 6 bytes saved.
+;   Replaced split quotient/remainder copy tails with a single LDA/LDX source
+;   select and shared store to T0/T0+1, preserving all arithmetic behavior.
 ; v17.0 (Mar 2026)  Comment cleanup for public release.  No code changes.
 ; v16.0 (Mar 2026)  Size optimisations; 15 bytes saved, 6->21 bytes free.
 ;   GL_DONE: JSR PUTCH/LDA #LF/JSR PUTCH (8 bytes) -> JSR PRNL (3 bytes).
@@ -1260,18 +1263,15 @@ E1_DB:   ASL T1               ; shift dividend left into T2 (shift-subtract meth
          INC T1               ; quotient bit = 1
 E1_DS:   DEY
          BNE E1_DB
-         LDA OP               ; MOD ('%'): use remainder in T2; else quotient T1
+         LDA T1               ; default: copy quotient (T1) to T0
+         LDX T1+1
+         LDA OP               ; MOD ('%') overrides source to remainder (T2)
          CMP #'%'
-         BEQ E1_MOD
-         LDA T1               ; copy quotient to T0
-         STA T0
-         LDA T1+1
-         STA T0+1
-         BRA E1_SIGN          ; apply sign
-E1_MOD:  LDA T2               ; '%': copy remainder (T2) to T0
-         STA T0
-         LDA T2+1
-         STA T0+1
+         BNE E1_DIVST
+         LDA T2
+         LDX T2+1
+E1_DIVST:STA T0
+         STX T0+1
          BRA E1_SIGN          ; apply sign
 
 ; --- MUL/DIV dispatch (operator fetch, sign determination, kernel select) ----
