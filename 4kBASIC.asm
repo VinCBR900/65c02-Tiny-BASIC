@@ -57,6 +57,7 @@
 ; Numbers:     signed 16-bit integers  -32768 .. 32767
 ; Variables:   A .. Z  (26 x 2-byte, zero-page)
 ; Line range:  1 .. 32767
+;
 ; Error codes  (printed as  XX ERR [IN line]):
 ;   SN  syntax / bad expression
 ;   UL  undefined line number
@@ -66,12 +67,14 @@
 ;   ST  zero STEP in FOR
 ;   UK  unknown statement
 ;   OD  out of DATA  (READ with no more values)
+;
 ; I/O  (Kowalski virtual terminal):
 ;   $E000  write = TERMINAL_CLS     clear screen, cursor to (0,0)
 ;   $E001  write = character output (PUTCH)
 ;   $E004  read  = character input  (GETCH, non-blocking poll; 0 = no char)
 ;   $E005  write = TERMINAL_X_POS  cursor column  (0-based)
 ;   $E006  write = TERMINAL_Y_POS  cursor row     (0-based)
+;
 ; Memory map:
 ;   $0000-$00BD  zero page  (see layout below)
 ;   $0200-$0FFF  program storage  (RAM_TOP = $1000, ~3.5 KB)
@@ -82,13 +85,7 @@
 ;   $F107+       interpreter code  (INIT, MAIN, GETLINE, STMT, EXPR ...)
 ;   $FF26+       string literals   (all on same ROM page ? PUTSTR constraint)
 ;   $FFFA-$FFFF  vectors  (all point to INIT)
-; Assembler / simulator:
-;   asm65c02.c  v1.4  -- two-pass 65C02 C assembler
-;   sim65c02.c  v7    -- 65C02 simulator with Kowalski-compatible I/O
-;   Build:  gcc -O2 -DASM65C02_MAIN -o asm65c02 asm65c02.c
-;           gcc -O2 -o sim65c02 sim65c02_v7.c
-;   Run:    ./asm65c02 4kbasicv14_0.asm
-;           ./sim65c02 4kbasicv14_0.asm --input "PRINT 1+1" --maxcycles 500000
+;
 ; v14.0 changes vs v13.0 (size optimisations):
 ;   - Token reordering: all statement-tokens moved to a contiguous block
 ;     ($80..$95, 22 entries).  STMT_JT expanded from 15 to 22 entries.
@@ -289,6 +286,7 @@ ERR_UK   = 12                ; unknown statement
 ERR_OD   = 14                ; out of DATA
 ; =============================================================================
         .ORG $F000
+ROMSTART: 
 	BRA INIT	; jump over table
 ; STRING TABLE  	; all strings on same page
 ; =============================================================================
@@ -3060,5 +3058,5 @@ SHOWCASE_END:               ; INIT sets PE to this address ($06FB)
 ; =============================================================================
         .opt proc65c02
         .ORG $FFFC
-        .DW INIT             ; RESET vector
+        .DW ROMSTART             ; RESET vector
         .DW IRQ_HANDLER      ; IRQ vector
