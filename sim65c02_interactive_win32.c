@@ -236,8 +236,8 @@ static uint16_t indy(CPU *c,uint16_t pc){uint8_t z=mem[pc];return(uint16_t)((mem
 static uint16_t indx(CPU *c,uint16_t pc){uint8_t z=(mem[pc]+c->X)&0xFF;return(uint16_t)(mem[z]|(mem[(z+1)&0xFF]<<8));}
 static uint16_t indzp(uint16_t pc){uint8_t z=mem[pc];return(uint16_t)(mem[z]|(mem[(z+1)&0xFF]<<8));}
 static uint16_t ind(uint16_t pc){uint16_t a=mem[pc]|(mem[pc+1]<<8);return(uint16_t)(mem[a]|(mem[a+1]<<8));}
-static void do_adc(CPU *c,uint8_t v){uint16_t r=c->A+v+c->C;c->V=(~(c->A^v)&(c->A^(uint8_t)r)&0x80)?1:0;c->C=(r>0xFF)?1:0;c->A=(uint8_t)r;set_nz(c,c->A);}
-static void do_sbc(CPU *c,uint8_t v){do_adc(c,v^0xFF);}
+static void do_adc(CPU *c,uint8_t v){uint16_t r=c->A+v+c->C;c->V=(~(c->A^v)&(c->A^r)&0x80)?1:0;if(!c->D){c->C=(r>0xFF)?1:0;c->A=(uint8_t)r;set_nz(c,c->A);return;}int lo=(c->A&0x0F)+(v&0x0F)+c->C;int hi=(c->A>>4)+(v>>4);if(lo>9){lo+=6;hi+=1;}if(hi>9){hi+=6;}c->C=(hi>0x0F)?1:0;c->A=(uint8_t)(((hi<<4)|(lo&0x0F))&0xFF);set_nz(c,c->A);}
+static void do_sbc(CPU *c,uint8_t v){uint16_t r=(uint16_t)c->A-v-(c->C?0:1);c->V=((c->A^v)&(c->A^r)&0x80)?1:0;if(!c->D){c->C=(r<0x100)?1:0;c->A=(uint8_t)(r&0xFF);set_nz(c,c->A);return;}int lo=(c->A&0x0F)-(v&0x0F)-(c->C?0:1);int hi=(c->A>>4)-(v>>4);if(lo<0){lo-=6;hi-=1;}if(hi<0){hi-=6;}c->C=(r<0x100)?1:0;c->A=(uint8_t)((((uint8_t)hi)<<4)|(lo&0x0F));set_nz(c,c->A);}
 static void do_cmp(CPU *c,uint8_t reg,uint8_t v){uint16_t r=reg-v;c->C=(reg>=v)?1:0;set_nz(c,(uint8_t)r);}
 static uint16_t branch(uint16_t pc,uint8_t off){return(uint16_t)(pc+(int8_t)off);}
 static long long cycle_count = 0;
