@@ -2940,6 +2940,7 @@ IRQ_HANDLER:
         JMP DO_break_in      ; -> print " IN line\r\n", re-enable IRQs, back to MAIN
 IRQ_idle:
         RTI                  ; idle: silently ignore
+LAST_ROM_CODE = *            ; first byte after executable ROM code (currently $FF41)
 ; =============================================================================
 ; PRE-LOADED FEATURE SHOWCASE  (program storage at $0200)
 ; Demonstrates every statement and function in 4K BASIC v14:
@@ -3033,8 +3034,9 @@ IRQ_idle:
 SHOWCASE_END:               ; INIT sets PE to this address ($06FB)
 ; =============================================================================
 ; Vector page notes:
-;   Bytes between SHOWCASE_END and RESET vector = $FFFC - SHOWCASE_END.
-;   With current image: $FFFC - $06FB = $F901 bytes free/padding.
+;   Bytes between last ROM code byte and RESET vector = $FFFC - LAST_ROM_CODE.
+;   LAST_ROM_CODE tracks the first byte after executable code (after IRQ RTI).
+;   With current image: $FFFC - $FF41 = $00BB bytes free/padding before vectors.
         .opt proc65c02
         .ORG $FFFC
         .DW ROMSTART             ; RESET vector
