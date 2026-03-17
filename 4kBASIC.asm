@@ -37,8 +37,8 @@
 ;   GOSUB expr         call subroutine at line (expr may be variable or expression)
 ;   ON expr GOTO line1 [, line2, ...]   computed branch
 ;   ON expr GOSUB line1 [, line2, ...]  computed subroutine call
-;   Multi-statement:   ':' separates statements on one line. 
-; 			Don't have FOR/NEXT or GOSUB/RETURN on same line
+;   Multi-statement:   ':' separates statements on one line.
+;   Don't have FOR/NEXT or GOSUB/RETURN on same line
 ; Expressions  (left-to-right within tier):
 ;   Tier 1 (lowest): AND  OR  XOR       (bitwise / logical)
 ;   Tier 2:          =  <>  <  >  <=  >=  (comparisons: return -1=true, 0=false)
