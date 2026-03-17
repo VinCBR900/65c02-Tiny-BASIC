@@ -568,7 +568,7 @@ EL_LEN:  LDA (LP),Y
          INC LP+1
          BRA EL_FL
 EL_FND:  JSR DELINE            ; delete existing line at LP
-EL_INS:  JSR WPEEK             ; skip spaces, peek first body character
+EL_INS:  JSR WPEEK             ; skip spaces + peek (no consume) first body char
          CMP #CR
          BEQ EL_DN             ; CR only: delete-only (no body to insert)
          ; fall through into INSLINE to insert the body
@@ -1352,7 +1352,7 @@ E2_POS:  JSR GETCI            ; consume unary '+', then fall through
 EXPR2:
          JSR WPEEK
          CMP #'('
-         BEQ E2_PAR           ; parenthesised sub-expression
+         BEQ E2_PAR           ; parenthesised sub-expression; else fall through
 E2_NOT_PAR:
          CMP #'-'
          BEQ E2_NEG
