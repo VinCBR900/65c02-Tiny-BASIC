@@ -214,13 +214,55 @@ static uint16_t ind(uint16_t pc) { /* (abs) */
 /* ── ADC / SBC helpers ───────────────────────────────────────────────────── */
 static void do_adc(CPU *cpu, uint8_t v) {
     uint16_t r = cpu->A + v + cpu->C;
-    cpu->V = (~(cpu->A^v)&(cpu->A^r)&0x80)?1:0;
-    cpu->C = (r>0xFF)?1:0;
-    cpu->A = r&0xFF;
-    set_nz(cpu,cpu->A);
+    cpu->V = (~(cpu->A ^ v) & (cpu->A ^ r) & 0x80) ? 1 : 0;
+
+    if (!cpu->D) {
+        cpu->C = (r > 0xFF) ? 1 : 0;
+        cpu->A = r & 0xFF;
+        set_nz(cpu, cpu->A);
+        return;
+    }
+
+    int lo = (cpu->A & 0x0F) + (v & 0x0F) + cpu->C;
+    int hi = (cpu->A >> 4) + (v >> 4);
+
+    if (lo > 9) {
+        lo += 6;
+        hi += 1;
+    }
+    if (hi > 9) {
+        hi += 6;
+    }
+
+    cpu->C = (hi > 0x0F) ? 1 : 0;
+    cpu->A = (uint8_t)(((hi << 4) | (lo & 0x0F)) & 0xFF);
+    set_nz(cpu, cpu->A);
 }
 static void do_sbc(CPU *cpu, uint8_t v) {
-    do_adc(cpu, v^0xFF);
+    uint16_t r = (uint16_t)cpu->A - v - (cpu->C ? 0 : 1);
+    cpu->V = ((cpu->A ^ v) & (cpu->A ^ r) & 0x80) ? 1 : 0;
+
+    if (!cpu->D) {
+        cpu->C = (r < 0x100) ? 1 : 0;
+        cpu->A = (uint8_t)(r & 0xFF);
+        set_nz(cpu, cpu->A);
+        return;
+    }
+
+    int lo = (cpu->A & 0x0F) - (v & 0x0F) - (cpu->C ? 0 : 1);
+    int hi = (cpu->A >> 4) - (v >> 4);
+
+    if (lo < 0) {
+        lo -= 6;
+        hi -= 1;
+    }
+    if (hi < 0) {
+        hi -= 6;
+    }
+
+    cpu->C = (r < 0x100) ? 1 : 0;
+    cpu->A = (uint8_t)((((uint8_t)hi) << 4) | (lo & 0x0F));
+    set_nz(cpu, cpu->A);
 }
 static void do_cmp(CPU *cpu, uint8_t reg, uint8_t v) {
     uint16_t r = reg - v;
