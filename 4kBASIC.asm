@@ -1,6 +1,6 @@
 ; =============================================================================
 ; 4K Integer BASIC v14.0 for the 65C02
-;    
+;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; A fully-featured, self-contained integer BASIC interpreter in 4 KB of ROM.
@@ -286,12 +286,12 @@ ERR_UK   = 12                ; unknown statement
 ERR_OD   = 14                ; out of DATA
 ; =============================================================================
         .ORG $F000
-ROMSTART: 
-	BRA INIT	; jump over table
-; STRING TABLE  	; all strings on same page
+ROMSTART:
+        BRA INIT            ; jump over table
+; STRING TABLE (all strings on same page)
 ; =============================================================================
 STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string/kw addresses
-STR_BANNER: .DB "4K BASIC v14."		; drop through
+STR_BANNER: .DB "4K BASIC v14."      ; drop through
 STR_CRLF:   .DB $0D,$8A             ; CR, LF|$80 = $8A
 STR_BYTES:  .DB " BYTES FREE",$0D,$8A  ; last LF has high-bit
 STR_ERROR:  .DB " ER",$D2           ; 'R'|$80 = $D2
@@ -299,8 +299,8 @@ STR_IN:     .DB " IN ",$A0          ; last space|$80 = $A0
 STR_BREAK:  .DB $0D,$0A,"BREA",$CB  ; 'K'|$80 = $CB
 ; =============================================================================
 ; INIT ? cold start: stack, zero page, load showcase end pointer, banner
-;   In:  ? (reset entry point)
-;   Out: ? (falls through to MAIN)
+;   In:  Reset vector entry.
+;   Out: Program state initialised, then falls through to MAIN.
 ;   Clobbers: A X
 ; =============================================================================
 INIT:
@@ -308,7 +308,6 @@ INIT:
         TXS                  ; initialise stack pointer
         CLD                  ; clear decimal mode
         CLI                  ; enable maskable IRQs (for $E007 Break key)
-    ;    LDX #$BF             ; clear ZP $00-$FF inclusive (includes DATA_PTR at $BC-$BD)
 INIT_z: STZ 0,x              ; 65C02 STZ zp,x  (no LDA #0 needed)
         DEX
         BPL INIT_z
@@ -321,20 +320,14 @@ INIT_z: STZ 0,x              ; 65C02 STZ zp,x  (no LDA #0 needed)
         STA PE
         LDA #>SHOWCASE_END
         STA PE+1
-;        LDX #>STR_BANNER          ; hi byte for PUTSTR
         LDA #<STR_BANNER
         JSR PUTSTR            ; print banner
-;        JSR CALC_FREE
-	JSR DO_FREE
-;        JSR PRT16
- ;       LDX #>STR_BYTES          ; hi byte for PUTSTR
-;        LDA #<STR_BYTES
-;        JSR PUTSTR            ; print "BYTES FREE\r\n"
+        JSR DO_FREE
         ; fall through to MAIN
 ; =============================================================================
 ; MAIN ? immediate-mode prompt loop
-;   In:  ? (entered from INIT or after any statement completes)
-;   Out: ? (loops forever)
+;   In:  Returns from statement handlers, or falls through from INIT.
+;   Out: Never returns; loops at interactive prompt.
 ;   Clobbers: everything (re-initialises per iteration)
 ; =============================================================================
 MAIN:
@@ -361,7 +354,7 @@ MAIN_direct:
         BRA MAIN
 ; =============================================================================
 ; GETLINE ? read one raw-text line into IBUF, then tokenise it into TBUF
-;   In:  ?
+;   In:  None.
 ;   Out: IBUF  CR-terminated raw text
 ;        TBUF  tokenised equivalent  (via fall-through to TOKENIZE)
 ;        IP    clobbered (used by TOKENIZE)
@@ -457,11 +450,6 @@ TK_OTHER:                    ; punctuation / unrecognised: emit as-is
         JSR TKEMIT
         JSR TKADV
         BRA TK_TOP
-; TK_OTHER:                    ; punctuation / unrecognised: emit as-is
-;        LDA (T0)             ; 65C02 zp-indirect
-;        JSR TKEMIT
-;        JSR TKADV
-;        BRA TK_TOP
 TK_EOL: LDA #$0D             ; write $0D $00 end-of-line sentinel
         LDY #0
         STA (T1),y
@@ -473,7 +461,7 @@ TK_EOL: LDA #$0D             ; write $0D $00 end-of-line sentinel
 ; TKADV ? advance source pointer T0 by one byte
 ;   In:  T0   source pointer
 ;   Out: T0   incremented
-;   Clobbers: ?  (flags preserved across branch; does NOT touch A)
+;   Clobbers: Flags only (A unchanged).
 ; =============================================================================
 TKADV:  INC T0
         BNE TKADV_ok
@@ -951,7 +939,6 @@ ST_sep_m1:                   ; real label: RTS from handler adds 1 ? ST_sep
 ST_sep: JSR WPEEK            ; after any statement: check for ':'
         CMP #':'
         BEQ ST_colon         ; another statement on same line: loop
-DP_ret: ; RTS                  ; ? used by semicolon-suppress path; shares nearest RTS
 ST_nop: RTS
 ; =============================================================================
 ; STATEMENT HANDLERS
@@ -1182,7 +1169,7 @@ DO_input_dn:
         RTS
 ; =============================================================================
 ; DO_REM ? REM (comment): body already absorbed into token stream by TOKENIZE
-;   Clobbers: ?
+;   Clobbers: None.
 ; =============================================================================
 DO_REM: RTS
 ; =============================================================================
@@ -1315,7 +1302,7 @@ LS_num: JSR LS_adv           ; skip $FF token
 ; LS_ADV ? advance list pointer LP by one byte
 ;   In:  LP   pointer into program store
 ;   Out: LP   incremented
-;   Clobbers: ?
+;   Clobbers: None.
 ; =============================================================================
 LS_adv: INC LP
         BNE LS_adv_ok
@@ -1361,7 +1348,7 @@ DO_FREE:
         JMP PUTSTR           ; print " BYTES FREE\r\n" and return  (tail call)
 ; =============================================================================
 ; DO_HELP ? HELP: list available keywords one per line
-; Assumptions: 
+; Assumptions:
 ; 1. KW_TABLE is a list of null-terminated strings, ending with a double-null or a length byte of 0.
 ; 2. KW_NEXT simply adds the length of the current string to T2.
 ;   Clobbers: A X Y T2
@@ -1388,7 +1375,7 @@ HLP_norm:
         BRA HLP_pl
 HLP_done:
         ; drop through
-        
+
 ; =============================================================================
 ; PUTSTR  -  print a NUL-terminated string from the string table
 ;   In:  A = lo-byte of string address; hi-byte is always STR_PAGE
@@ -1695,7 +1682,7 @@ DO_ON:
         LDA T0+1
         BEQ DO_on_hi_ok      ; hi byte zero: value fits in lo byte
 DO_on_skip_tr:
-        rts ; JMP DO_on_skip       ; hi byte set (>255 or negative): skip
+        RTS                  ; hi byte set (>255 or negative): skip
 DO_on_hi_ok:
         LDA T0               ; lo byte = countdown (1-based); 0 = skip
         BEQ DO_on_skip_tr    ; 0: out of range, skip  (trampoline to JMP below)
@@ -1721,7 +1708,7 @@ DO_on_lp:
         JSR WPEEK
         CMP #','
         BEQ DO_on_more       ; comma: more entries to scan
-        rts ; JMP DO_on_skip       ; no comma: index out of range, fall through
+        RTS                  ; no comma: index out of range, fall through
 DO_on_more:
         JSR GETCI            ; consume ','
         BRA DO_on_lp         ; loop (JMP; BRA out of range)
@@ -1844,7 +1831,7 @@ STMT_JT:
 ;   The tokeniser copies the raw value list verbatim after TOK_DATA.
 ;   At runtime we just return; RUNLP's own SKIPEOL call advances past the body.
 ;   READ/RESTORE consume the raw bytes via DATA_PTR.  (Same pattern as DO_REM.)
-;   Clobbers: ?
+;   Clobbers: None.
 ; =============================================================================
 ; =============================================================================
 ; DO_RESTORE ? RESTORE: reset DATA pointer (0 = rescan from PROG on next READ)
@@ -1910,7 +1897,6 @@ RD_var: JSR WPEEK_UC         ; peek at next IP token (uppercased)
         BRA RD_var
 RD_od:  PLA                  ; discard saved var slot
         LDA #ERR_OD
-;        JMP DO_ERROR
         .BYTE $2C            ; BIT abs  ? consumes next 2 bytes as operand
 RD_sn:  LDA #ERR_SN
         JMP DO_ERROR
@@ -2069,7 +2055,7 @@ DO_ERR_UL:
 ; =============================================================================
 ; DO_ERROR ? print error message and return to MAIN
 ;   In:  A    error code (ERR_xx constant = index into ERR_TABLE)
-;   Out: ? (jumps to MAIN; does not return to caller)
+;   Out: Character emitted to terminal device. (jumps to MAIN; does not return to caller)
 ;   Clobbers: A X T0
 ; =============================================================================
 DO_ERROR:
@@ -2083,13 +2069,11 @@ DO_err_entry:
         INX
         LDA ERR_TABLE,x      ; second char
         JSR PUTCH
-   ;     LDX #>STR_ERROR          ; hi byte for PUTSTR
         LDA #<STR_ERROR
         JSR PUTSTR           ; " ERR"
         LDA RUN
         BEQ DO_err_noline
 DO_break_in:                  ; IRQ handler jumps here to share " IN line\r\n" exit
-   ;     LDX #>STR_IN          ; hi byte for PUTSTR
         LDA #<STR_IN
         JSR PUTSTR           ; " IN "
         LDA CURLN
@@ -2099,7 +2083,6 @@ DO_break_in:                  ; IRQ handler jumps here to share " IN line\r\n" e
         JSR PRT16            ; line number
 DO_err_noline:
         JSR PRNL
-   ;     STZ RUN	; main has STZ RUN
         CLI                  ; re-enable IRQs (harmless from error path; needed from IRQ path)
         JMP MAIN
 ; Error code table  (pairs of ASCII chars, indexed by ERR_xx constants)
@@ -2624,7 +2607,6 @@ E2_abs: JSR GETCI            ; ABS(n)
         LDA T0+1
         BPL E2_abs_pos
         JMP NEG16            ; tail call: negate if negative
-;        RTS
 ; =============================================================================
 ; EXPR2_tvar ? variable or unrecognised atom (BRA from dispatch above)
 ; =============================================================================
@@ -2739,14 +2721,14 @@ DO_let_var:
         LDA T0+1
         STA VARS+1,x
         RTS
-        
+
 DO_let_pop:
         PLA
         LDA #ERR_UK
         JMP DO_ERROR
 DO_let_dn:
         RTS
-        
+
 ; =============================================================================
 ; PRT_HEX  -  print T0 as 4-digit uppercase hexadecimal  (used by HEX$)
 ;   In:  T0  = 16-bit value
@@ -2760,9 +2742,9 @@ PRT_HEX:
 PH_byte:
     PHA             ; Save byte
     LSR            ; High nibble to low
-    LSR 
-    LSR 
-    LSR 
+    LSR
+    LSR
+    LSR
     JSR PH_nib      ; Process high nibble
     PLA             ; Restore for low nibble (fall through)
 PH_nib:
@@ -2771,11 +2753,11 @@ PH_nib:
     CMP #$0A        ; <--- Set Carry if A >= 10 (2 bytes)
     ADC #$30        ; <--- The Magic Add (2 bytes)
     CLD             ; <--- Clear Decimal Mode (1 byte)
-	; drop through
+    ; drop through
 ; PUTCH ? character output  (PRNL drops through here for the LF)
 ;   In:  A    character to send
-;   Out: ?
-;   Clobbers: ?
+;   Out: Character emitted to terminal device.
+;   Clobbers: None.
 PUTCH:  STA IO_PUTCH
         RTS
 ; =============================================================================
@@ -2846,24 +2828,25 @@ NEG16:
 ; PEEKC ? read byte at IP without advancing IP
 ;   In:  IP   token stream pointer
 ;   Out: A    byte at (IP)
-;   Clobbers: ?
+;   Clobbers: None.
 ; -----------------------------------------------------------------------------
 ; GETCI ? read byte at IP and advance IP by one
 ;   In:  IP   token stream pointer
 ;   Out: A    byte that was at (IP);  IP  incremented
-;   Clobbers: ?
+;   Clobbers: None.
 ; -----------------------------------------------------------------------------
 ; UC ? convert A to uppercase if it is a lowercase ASCII letter
 ;   In:  A    any byte
 ;   Out: A    uppercased (a-z ? A-Z); all other bytes unchanged
-;   Clobbers: ?  (flags are affected)
+;   Clobbers: None.  (flags are affected)
 ; =============================================================================
 ; (PEEKC inlined as LDA (IP) at all call sites)
 GETCI:  LDA (IP)             ; 65C02 zp-indirect: fetch byte at IP, then advance
-;        JMP INCIP            ; advance IP (16-bit) and return  (tail call)
-	; drop through
+    ; drop through
 ; INCIP ? increment IP (16-bit pointer) by 1
-;   In:  ?   Out: ?   Clobbers: ?
+;   In:  IP points at current token byte.
+;   Out: IP advanced by one byte.
+;   Clobbers: Flags.
 INCIP:  INC IP
         BNE INCIP_ok
         INC IP+1
@@ -2871,7 +2854,6 @@ INCIP_ok:
         RTS
 WPEEK_UC:
         JSR WPEEK
-;        BRA UC               ; tail call
 UC:     CMP #'a'
         BCC UC_d
         CMP #'z'+1
@@ -2884,7 +2866,7 @@ UC_d:   RTS
 ; WPEEK ? skip whitespace, peek at next non-space byte (do not consume it)
 ;   In:  IP   token stream pointer
 ;   Out: A    first non-space byte at or after (IP);  IP  unchanged
-;   Clobbers: ?
+;   Clobbers: None.
 ; =============================================================================
 WPEEK:  LDA (IP)             ; 65C02: PEEKC inlined for speed
         CMP #' '
@@ -2895,7 +2877,7 @@ WPEEK:  LDA (IP)             ; 65C02: PEEKC inlined for speed
 ; WEAT ? skip whitespace, consume (eat) the next byte
 ;   In:  IP   token stream pointer
 ;   Out: A    the consumed byte;  IP  advanced one past the first non-space
-;   Clobbers: ?
+;   Clobbers: None.
 ; -----------------------------------------------------------------------------
 ; EAT_EXPR ? skip whitespace, consume one byte, then evaluate an expression
 ;   Convenience wrapper: WEAT then EXPR.
@@ -2906,7 +2888,7 @@ WPEEK:  LDA (IP)             ; 65C02: PEEKC inlined for speed
 ; WPEEK_UC ? skip whitespace, peek next byte, uppercase it
 ;   In:  IP   token stream pointer
 ;   Out: A    first non-space byte, uppercased;  IP  unchanged
-;   Clobbers: ?
+;   Clobbers: None.
 ; -----------------------------------------------------------------------------
 ; SKIPEOL ? advance IP past the $0D end-of-line marker
 ;   In:  IP   anywhere in the current token stream line
@@ -2923,15 +2905,13 @@ SKIPEOL:
         CMP #$0D
         BEQ SKIPEOL_d
         BRA SKIPEOL
-; SKIPEOL_d:
- ;       RTS
 ; =============================================================================
 ; I/O stubs ? Kowalski simulator virtual terminal
 ; =============================================================================
 ; GETCH ? blocking character input
-;   In:  ?
+;   In:  None.
 ;   Out: A    character received
-;   Clobbers: ?
+;   Clobbers: None.
 GETCH:  LDA IO_GETCH         ; poll Kowalski virtual port
         BEQ GETCH             ; 0 = no char yet: spin
         RTS
@@ -2950,13 +2930,11 @@ GETCH:  LDA IO_GETCH         ; poll Kowalski virtual port
 IRQ_HANDLER:
         LDA RUN              ; running?
         BEQ IRQ_idle         ; no: ignore
-  ;      STZ RUN              ; clear run flag - jump to main has this
         CLD
         STZ GRET             ; clear GOSUB nesting depth
         STZ FSTK             ; clear FOR nesting depth
         LDX RUNSP            ; restore stack pointer (unwinds all call frames)
         TXS
-     ;   LDX #>STR_BREAK      ; print "\r\nBREAK"
         LDA #<STR_BREAK
         JSR PUTSTR           ; "\r\nBREAK" (no trailing CRLF -- shared exit provides it)
         JMP DO_break_in      ; -> print " IN line\r\n", re-enable IRQs, back to MAIN
@@ -2978,8 +2956,8 @@ IRQ_idle:
 ; -- TO RUN WITHOUT PRE-LOADED PROGRAM (real ROM / no Kowalski) --------------
 ;   When burning to a 2732 EPROM for real hardware, replace the two lines in
 ;   INIT that load the showcase end address with the program storage base:
-;     Change:   LDA #<SHOWCASE_END   ?   LDA #<PROG   ($00)
-;               LDA #>SHOWCASE_END   ?   LDA #>PROG   ($02)
+;     Change:   LDA #<SHOWCASE_END   ->  LDA #<PROG   ($00)
+;               LDA #>SHOWCASE_END   ->  LDA #>PROG   ($02)
 ;   This sets PE = PROG = $0200 on cold start, meaning the interpreter starts
 ;   with an empty program.  Type NEW (redundant but harmless) then enter your
 ;   own program, or load it via USR() from external storage.
@@ -3051,10 +3029,13 @@ IRQ_idle:
         .DB $D0, $02, $80, $22, $22, $0D ; 720 PRINT ""
         .DB $DA, $02, $8C, $49, $0D ; 730 NEXT I
         .DB $E4, $02, $8A, $0D ; 740 END
-        
+
 SHOWCASE_END:               ; INIT sets PE to this address ($06FB)
 ; =============================================================================
+; Vector page notes:
+;   Bytes between SHOWCASE_END and RESET vector = $FFFC - SHOWCASE_END.
+;   With current image: $FFFC - $06FB = $F901 bytes free/padding.
         .opt proc65c02
         .ORG $FFFC
         .DW ROMSTART             ; RESET vector
-        .DW IRQ_HANDLER      ; IRQ vector
+        .DW IRQ_HANDLER          ; IRQ vector
