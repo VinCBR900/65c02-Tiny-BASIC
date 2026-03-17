@@ -726,6 +726,13 @@ typedef struct {
 static LineInfo pc_map[MAX_LINES];
 static int      nlines = 0;
 
+typedef struct {
+    int first_opcode_pc;
+    int last_code_pc_before_vectors;
+} AsmStats;
+
+static AsmStats asm_stats;
+
 /* ── memory image ────────────────────────────────────────────────────────── */
 /* Standalone build (ASM65C02_MAIN): we own mem[].
    Included by sim65c02.c: sim owns mem[], we use it via extern. */
@@ -766,6 +773,8 @@ static int assemble(const char *source) {
 
     memset(mem, 0, sizeof(mem));
     nsyms = 0; nerrors = 0; nlines = 0;
+    asm_stats.first_opcode_pc = -1;
+    asm_stats.last_code_pc_before_vectors = -1;
     g_scope[0] = '\0';
 
     /* ── PASS 1: collect labels, compute addresses ── */
@@ -890,7 +899,12 @@ static int assemble(const char *source) {
         if (!strcmp(mn, ".res")) { continue; }
         if (!strcmp(mn, ".byte")) {
             uint8_t tmp[4096]; int n = parse_dot_byte(op, pc, 1, tmp, 4096, lineno);
-            for (int i = 0; i < n; i++) mem[pc+i] = tmp[i];
+            for (int i = 0; i < n; i++) {
+                int addr = (pc + i) & 0xFFFF;
+                mem[addr] = tmp[i];
+                if (addr < 0xFFFA && addr > asm_stats.last_code_pc_before_vectors)
+                    asm_stats.last_code_pc_before_vectors = addr;
+            }
             continue;
         }
         if (!strcmp(mn, ".word")) {
@@ -915,6 +929,10 @@ static int assemble(const char *source) {
                     if (e) { char msg[ERR_LEN]; snprintf(msg,ERR_LEN,".word '%s': undef",expr); add_error(lineno,msg); }
                     mem[wpc]   = val & 0xFF;
                     mem[wpc+1] = (val >> 8) & 0xFF;
+                    if (wpc < 0xFFFA && wpc > asm_stats.last_code_pc_before_vectors)
+                        asm_stats.last_code_pc_before_vectors = wpc;
+                    if ((wpc + 1) < 0xFFFA && (wpc + 1) > asm_stats.last_code_pc_before_vectors)
+                        asm_stats.last_code_pc_before_vectors = wpc + 1;
                     wpc += 2;
                 }
                 if (*q == ',') q++;
@@ -939,6 +957,13 @@ static int assemble(const char *source) {
         int val = oper.value;
         int sz  = mode_size[m];
         mem[pc] = (uint8_t)opc;
+        if (asm_stats.first_opcode_pc < 0)
+            asm_stats.first_opcode_pc = pc;
+        for (int i = 0; i < sz; i++) {
+            int addr = (pc + i) & 0xFFFF;
+            if (addr < 0xFFFA && addr > asm_stats.last_code_pc_before_vectors)
+                asm_stats.last_code_pc_before_vectors = addr;
+        }
         if (sz >= 2) {
             if (m == M_REL) {
                 int next_pc = (pc + 2) & 0xFFFF; /* wrap at 64KB */
@@ -964,20 +989,49 @@ static int assemble(const char *source) {
 
 /* ── size report ─────────────────────────────────────────────────────────── */
 static void size_report(void) {
-    /* find ROM start and end */
-    int rom_start = 0xF800;
-    int v;
-    if (sym_get("INIT", &v)) rom_start = v;
-    int highest = rom_start;
-    for (int a = 0xFFFF; a >= rom_start; a--) {
-        if (mem[a]) { highest = a; break; }
+    if (asm_stats.first_opcode_pc < 0 || asm_stats.last_code_pc_before_vectors < 0) {
+        printf("\nROM footprint: no emitted code bytes before vectors.\n");
+        return;
     }
-    int used = highest - rom_start + 1;
-    printf("\nROM footprint: $%04X-$%04X = %d bytes\n", rom_start, highest, used);
+
+    int used = asm_stats.last_code_pc_before_vectors - asm_stats.first_opcode_pc + 1;
+    printf("\nROM footprint: $%04X-$%04X = %d bytes (up to vectors at $FFFA-$FFFF)\n",
+           asm_stats.first_opcode_pc,
+           asm_stats.last_code_pc_before_vectors,
+           used);
     if (used <= 2048)
         printf("(%d/2048 = %.1f%% of 2KB)\n", used, 100.0*used/2048);
     else if (used <= 4096)
         printf("(%d/4096 = %.1f%% of 4KB)\n", used, 100.0*used/4096);
+}
+
+static int parse_hex_range(const char *s, int *start, int *end) {
+    const char *dash = strchr(s, '-');
+    if (!dash) return 0;
+
+    char left[64], right[64];
+    int llen = (int)(dash - s);
+    int rlen = (int)strlen(dash + 1);
+    if (llen <= 0 || rlen <= 0 || llen >= (int)sizeof(left) || rlen >= (int)sizeof(right)) return 0;
+
+    memcpy(left, s, llen); left[llen] = '\0';
+    memcpy(right, dash + 1, rlen); right[rlen] = '\0';
+
+    while (*left == ' ' || *left == '\t') memmove(left, left + 1, strlen(left));
+    while (*right == ' ' || *right == '\t') memmove(right, right + 1, strlen(right));
+    str_trim(left);
+    str_trim(right);
+    if (left[0] != '$' || right[0] != '$') return 0;
+
+    char *endp1 = NULL, *endp2 = NULL;
+    long a = strtol(left + 1, &endp1, 16);
+    long b = strtol(right + 1, &endp2, 16);
+    if (!endp1 || !endp2 || *endp1 != '\0' || *endp2 != '\0') return 0;
+    if (a < 0 || a > 0xFFFF || b < 0 || b > 0xFFFF || a > b) return 0;
+
+    *start = (int)a;
+    *end = (int)b;
+    return 1;
 }
 
 /* ── CLI main (standalone build only) ───────────────────────────────────── */
@@ -996,6 +1050,8 @@ static void asm_usage(FILE *out) {
         "  (none)       Assemble and print symbol report + ROM size summary.\n"
         "               Exit 0 on success, 1 on error.\n"
         "  --binary     Write raw 65536-byte flat image to stdout; errors to stderr.\n"
+        "  -o <file>    Write binary image to <file> (avoids stdout/binary issues on Win32).\n"
+        "  -r <range>   Output only address range for binary output, e.g. -r $F000-$FFFF.\n"
         "               Extract ROM with dd, e.g. for 4K BASIC at $F000:\n"
         "                 asm65c02 4kbasic_v7.asm --binary | dd bs=1 skip=61440 count=4096 of=rom.bin\n"
         "               For uBASIC at $F800:\n"
@@ -1026,12 +1082,44 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    const char *src_file = argv[1];
+    const char *src_file = NULL;
     int binary_mode = 0;
     int dump_all    = 0;
-    for (int i = 2; i < argc; i++) {
+    const char *out_file = NULL;
+    int range_enabled = 0;
+    int range_start = 0;
+    int range_end = 0xFFFF;
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '-' && !src_file) {
+            src_file = argv[i];
+            continue;
+        }
         if      (!strcmp(argv[i], "--binary"))   binary_mode = 1;
         else if (!strcmp(argv[i], "--dump-all")) dump_all    = 1;
+        else if (!strcmp(argv[i], "-o")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "-o requires a filename\n");
+                return 1;
+            }
+            out_file = argv[++i];
+            binary_mode = 1;
+        }
+        else if (!strcmp(argv[i], "-r")) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "-r requires a range like $F000-$FFFF\n");
+                return 1;
+            }
+            if (!parse_hex_range(argv[++i], &range_start, &range_end)) {
+                fprintf(stderr, "Invalid range '%s' (expected $HHHH-$HHHH)\n", argv[i]);
+                return 1;
+            }
+            range_enabled = 1;
+        }
+    }
+
+    if (!src_file) {
+        asm_usage(stderr);
+        return 1;
     }
 
     /* read source file */
@@ -1048,7 +1136,20 @@ int main(int argc, char **argv) {
         /* write flat 65536-byte image to stdout; errors to stderr */
         for (int i = 0; i < nerrors; i++) fprintf(stderr, "%s\n", errors[i]);
         if (!ok) return 1;
-        fwrite(mem, 1, 65536, stdout);
+        int out_start = range_enabled ? range_start : 0;
+        int out_end = range_enabled ? range_end : 0xFFFF;
+        size_t out_len = (size_t)(out_end - out_start + 1);
+        if (out_file) {
+            FILE *of = fopen(out_file, "wb");
+            if (!of) {
+                perror(out_file);
+                return 1;
+            }
+            fwrite(mem + out_start, 1, out_len, of);
+            fclose(of);
+        } else {
+            fwrite(mem + out_start, 1, out_len, stdout);
+        }
         return 0;
     }
 
