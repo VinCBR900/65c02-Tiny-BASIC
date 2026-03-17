@@ -1,5 +1,5 @@
 /*
- * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.4, Mar 2026)
+ * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.5, Mar 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
@@ -8,12 +8,16 @@
  * v1.2: source_copy[] made static — prevents 1MB stack overflow on Windows.
  * v1.3: Forward-reference sizing fix: any expression containing an undefined
  *       symbol now forces ABS/ABSX/ABSY mode on pass 1.
- * v1.4: Added missing SED ($F8, Set Decimal Mode) to opcode table.: any expression containing an undefined
- *       symbol now forces ABS/ABSX/ABSY mode on pass 1, regardless of the
+ * v1.4: Added missing SED ($F8, Set Decimal Mode) to opcode table and
+ *       fixed pass-1 sizing when expressions contain undefined symbols.
+ *       Any expression containing an undefined symbol now forces ABS/ABSX/ABSY
+ *       mode on pass 1, regardless of the
  *       partially-evaluated value.  Previously "SYM+1" with SYM undefined
  *       evaluated to 1 on pass 1, was sized as ZP (2 bytes), then on pass 2
  *       resolved to e.g. $FFCD (3 bytes), corrupting subsequent instruction
  *       addresses and producing a wrong ROM.
+ * v1.5: CLI refreshed and hardened: header/help synced with current options
+ *       (-o, -r, -h), unknown/extra arguments now rejected with clear errors.
  *
   * Build (standalone):
  *   gcc -O2 -DASM65C02_MAIN -o asm65c02 asm65c02.c
@@ -30,12 +34,14 @@
  *                   Exit code 0 on success, 1 on assembly errors.
  *   --binary        Write raw 65 536-byte flat memory image to stdout.
  *                   Errors go to stderr.  Used internally by sim65c02.
- *                   Extract ROM region with dd:
- *                     uBASIC (2 KB at $F800):   dd bs=1 skip=63488 count=2048
- *                     4K BASIC (4 KB at $F000):  dd bs=1 skip=61440 count=4096
+ *   -o <file>       Write binary output to a file (implies --binary).
+ *   -r $HHHH-$HHHH  Limit binary output to an address range (requires --binary or -o).
+ *                   Extract ROM region with dd (if not using -r):
+ *                     uBASIC (2 KB at $F800):   dd bs=1 skip=63488 count=2048 of=rom.bin
+ *                     4K BASIC (4 KB at $F000): dd bs=1 skip=61440 count=4096 of=rom.bin
  *   --dump-all      After the key-symbol table, print every assembled symbol
  *                   sorted by address.  Useful for detailed size analysis.
- *   --help          Print this help and exit.
+ *   --help, -h      Print this help and exit.
  *
  * Supported syntax (Kowalski-compatible subset):
  *   Directives : .ORG addr
@@ -64,10 +70,16 @@
  *   Reset vector       = $F003
  *   ROM: $F000-$FFFF  (4096 bytes)  3 bytes free before vectors
  *
- * Version history:
- *   v1.0  (Mar 2026)  Initial C port of assembler.py v1.6.
+ * Version history (newest first):
+ *   v1.5  (Mar 2026)  CLI docs aligned with implementation and argument parsing
+ *                     made strict for unknown/extra option handling.
+ *   v1.4  (Mar 2026)  Added SED opcode and pass-1 sizing fix for expressions
+ *                     with undefined symbols.
+ *   v1.3  (Mar 2026)  Forward-reference sizing fix for undefined symbols.
+ *   v1.2  (Mar 2026)  source_copy[] made static to avoid Windows stack overflow.
  *   v1.1  (Mar 2026)  Header updated: full option docs, --help flag, corrected
- *                     project version references (uBASIC v13, 4K BASIC v11).
+ *                     project version references.
+ *   v1.0  (Mar 2026)  Initial C port of assembler.py v1.6.
  */
 
 #include <stdio.h>
@@ -1038,7 +1050,7 @@ static int parse_hex_range(const char *s, int *start, int *end) {
 #ifdef ASM65C02_MAIN
 static void asm_usage(FILE *out) {
     fprintf(out,
-        "asm65c02 v1.1 — Toy 65C02 two-pass assembler\n"
+        "asm65c02 v1.5 — Toy 65C02 two-pass assembler\n"
         "\n"
         "Copyright Vincent Crabtree 2026, MIT License, See LICENSE file\n"
         "\n"
@@ -1053,15 +1065,15 @@ static void asm_usage(FILE *out) {
         "  -o <file>    Write binary image to <file> (avoids stdout/binary issues on Win32).\n"
         "  -r <range>   Output only address range for binary output, e.g. -r $F000-$FFFF.\n"
         "               Extract ROM with dd, e.g. for 4K BASIC at $F000:\n"
-        "                 asm65c02 4kbasic_v7.asm --binary | dd bs=1 skip=61440 count=4096 of=rom.bin\n"
+        "                 asm65c02 4kBASIC.asm --binary | dd bs=1 skip=61440 count=4096 of=rom.bin\n"
         "               For uBASIC at $F800:\n"
-        "                 asm65c02 ubasic13.asm --binary | dd bs=1 skip=63488 count=2048 of=rom.bin\n"
+        "                 asm65c02 uBASIC.asm --binary | dd bs=1 skip=63488 count=2048 of=rom.bin\n"
         "  --dump-all   Print all assembled symbols after the key-symbol table.\n"
-        "  --help       Print this help and exit.\n"
+        "  --help, -h   Print this help and exit.\n"
         "\n"
         "Projects:\n"
-        "  ubasic13.asm    uBASIC v13    (2 KB ROM at $F800-$FFFF)\n"
-        "  4kbasic_v7.asm  4K BASIC v11  (4 KB ROM at $F000-$FFFF)\n"
+        "  uBASIC.asm    uBASIC    (2 KB ROM at $F800-$FFFF)\n"
+        "  4kBASIC.asm   4K BASIC  (4 KB ROM at $F000-$FFFF)\n"
         "\n"
         "Build:\n"
         "  gcc -O2 -DASM65C02_MAIN -o asm65c02 asm65c02.c\n"
@@ -1089,13 +1101,29 @@ int main(int argc, char **argv) {
     int range_enabled = 0;
     int range_start = 0;
     int range_end = 0xFFFF;
+    int end_of_options = 0;
     for (int i = 1; i < argc; i++) {
-        if (argv[i][0] != '-' && !src_file) {
+        if (!strcmp(argv[i], "--")) {
+            end_of_options = 1;
+            continue;
+        }
+
+        if ((end_of_options || argv[i][0] != '-') && !src_file) {
             src_file = argv[i];
             continue;
         }
+
+        if (end_of_options || argv[i][0] != '-') {
+            fprintf(stderr, "Unexpected extra input file: %s\n", argv[i]);
+            return 1;
+        }
+
         if      (!strcmp(argv[i], "--binary"))   binary_mode = 1;
         else if (!strcmp(argv[i], "--dump-all")) dump_all    = 1;
+        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            asm_usage(stdout);
+            return 0;
+        }
         else if (!strcmp(argv[i], "-o")) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "-o requires a filename\n");
@@ -1115,10 +1143,20 @@ int main(int argc, char **argv) {
             }
             range_enabled = 1;
         }
+        else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            return 1;
+        }
     }
 
     if (!src_file) {
+        fprintf(stderr, "Missing input file.\n\n");
         asm_usage(stderr);
+        return 1;
+    }
+
+    if (range_enabled && !binary_mode) {
+        fprintf(stderr, "-r requires --binary (or -o) output mode\n");
         return 1;
     }
 
