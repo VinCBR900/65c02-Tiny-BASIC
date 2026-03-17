@@ -38,7 +38,7 @@
 ;   ON expr GOTO line1 [, line2, ...]   computed branch
 ;   ON expr GOSUB line1 [, line2, ...]  computed subroutine call
 ;   Multi-statement:   ':' separates statements on one line. 
-; 			Dont have FOR/NEXT or GOSUB/RETURN on same line
+; 			Don't have FOR/NEXT or GOSUB/RETURN on same line
 ; Expressions  (left-to-right within tier):
 ;   Tier 1 (lowest): AND  OR  XOR       (bitwise / logical)
 ;   Tier 2:          =  <>  <  >  <=  >=  (comparisons: return -1=true, 0=false)
@@ -1846,7 +1846,6 @@ STMT_JT:
 ;   READ/RESTORE consume the raw bytes via DATA_PTR.  (Same pattern as DO_REM.)
 ;   Clobbers: ?
 ; =============================================================================
-;        RTS
 ; =============================================================================
 ; DO_RESTORE ? RESTORE: reset DATA pointer (0 = rescan from PROG on next READ)
 ;   Clobbers: A
@@ -2521,10 +2520,8 @@ E2_inkey:
 ;   Clobbers: A X Y (and anything the called routine touches)
 ; =============================================================================
 E2_usr: JSR GETCI            ; consume USR token
-        JSR EAT_EXPR
-        JSR WEAT             ; consume ')'
-       ; JMP USR_THUNK        ; tail call
-	; fall through
+        JSR E2_ARG1          ; consume '(expr)' into T0
+        JMP USR_THUNK        ; tail call
 ; =============================================================================
 ; USR_THUNK ? indirect call to user machine-code routine via T0
 ;   In:  T0   16-bit address of user routine
@@ -2535,18 +2532,13 @@ USR_THUNK:
         JMP (T0)
 ; =============================================================================
 ; E2_SGN ? SGN(n): sign of n  ?  -1 (negative), 0 (zero), 1 (positive)
-;   Clobbers: A T0
-; =============================================================================
-; =============================================================================
-; E2_SGN ? SGN(n): sign of n  ?  -1 (negative), 0 (zero), 1 (positive)
 ;   In:  IP  points at SGN token
 ;   Out: T0  = -1, 0, or 1  (16-bit signed)
 ;        IP  advanced past SGN(expr)
 ;   Clobbers: A T0
 ; =============================================================================
 E2_sgn: JSR GETCI            ; consume SGN token
-        JSR EAT_EXPR         ; evaluate argument -> T0, consume '(' first
-        JSR WEAT             ; consume closing ')'
+        JSR E2_ARG1          ; evaluate argument -> T0, consume '(...)'
         LDA T0
         ORA T0+1
         BEQ E2_sgn_zero      ; T0 == 0: return 0 (T0 already zero)
@@ -2628,8 +2620,7 @@ E2_abs_pos:
 ;   Clobbers: A T0
 ; =============================================================================
 E2_abs: JSR GETCI            ; ABS(n)
-        JSR EAT_EXPR
-        JSR WEAT             ; consume ')'
+        JSR E2_ARG1
         LDA T0+1
         BPL E2_abs_pos
         JMP NEG16            ; tail call: negate if negative
@@ -2660,8 +2651,7 @@ EXPR2_tvar:
 ; =============================================================================
 E2_peek:
         JSR GETCI            ; PEEK(addr)
-        JSR EAT_EXPR
-        JSR WEAT             ; consume ')'
+        JSR E2_ARG1
         LDA (T0)             ; 65C02 zp-indirect: read memory at addr
         STA T0
         STZ T0+1
@@ -2673,8 +2663,17 @@ E2_peek:
 ; =============================================================================
 E2_chrs:
         JSR GETCI            ; CHR$(n): result is just n (char value)
-        JSR EAT_EXPR
-        JMP WEAT             ; consume ')' and return  (tail call)
+        JSR E2_ARG1
+        RTS
+
+; =============================================================================
+; E2_ARG1 ? shared parser helper for single-argument functions
+;   In:  IP points at '('
+;   Out: T0 = argument value; IP advanced past closing ')'
+; =============================================================================
+E2_ARG1:
+        JSR EAT_EXPR         ; consume '(' then evaluate argument
+        JMP WEAT             ; consume ')' and return (tail call)
 ; =============================================================================
 ; E2_ASC ? ASC("str") or ASC(n): ASCII code of first character
 ;   String form: ASC("X") ? ASCII value of X.
@@ -2892,7 +2891,6 @@ WPEEK:  LDA (IP)             ; 65C02: PEEKC inlined for speed
         BNE WPEEK_d
         JSR GETCI
         BRA WPEEK
-;        RTS
 ; =============================================================================
 ; WEAT ? skip whitespace, consume (eat) the next byte
 ;   In:  IP   token stream pointer
