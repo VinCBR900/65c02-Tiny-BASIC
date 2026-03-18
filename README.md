@@ -1,8 +1,8 @@
-# 65C02 Tiny BASICs
+# 6502/65C02 Tiny BASICs
 
 **Small Barely Functional BASICs for Nostalgic 6502ers**
 
-This repository contains two Tiny BASIC interpreters for 65C02 systems, along with a pure-C assembler and C simulator used to build and test them. Tiny BASICs are minimal BASIC interpreters from the dawn of home computing — see the original 1976 [Dr. Dobb's Journal Vol. 1](https://archive.org/details/dr_dobbs_journal_vol_01) for the history.
+This repository contains two Tiny BASIC interpreters for 6502/65C02 systems, along with a pure-C assembler and C simulator used to build and test them. Tiny BASICs are minimal BASIC interpreters from the dawn of home computing — see the original 1976 [Dr. Dobb's Journal Vol. 1](https://archive.org/details/dr_dobbs_journal_vol_01) for the history.
 
 As per Dr Dobbs, the classic approach was to use an Intermediate Language (IL) between the host CPU and the BASIC parser, which eased porting but cost speed. A hand-assembled 6502 IL version was written by Tom Pittman and is documented at [ittybittycomputers.com](http://www.ittybittycomputers.com/IttyBitty/TinyBasic/index.htm). 
 
@@ -14,7 +14,7 @@ Time inevitably passed, then recently [Anthropic made a press release where Clau
 
 Both interpreters have been tested on the [Kowalski 65C02 Simulator](https://github.com/Kelmar/kowalski) — enable 65C02 mode and set terminal emulation to E00x, don't forget to click and type into the yellow Terminal window.
 
-> **Note:** Both versions use 65C02 instructions (STZ, BRA, INC/DEC acc, indirect-zp LDA/STA). An NMOS 6502 is not supported.
+> **Note:** Only the specific uBASIC6502.asm works on an NMOS 6502, 4kBASIC use 65C02 instructions (STZ, BRA, INC/DEC acc, indirect-zp LDA/STA). 
 
 ---
 
@@ -131,7 +131,7 @@ The 4K BASIC showcase exercises every major feature: `PRINT`, `CHR$`, `ASC`, `AB
 ### Kowalski Simulator
 
 Both ROMs work in the [Kowalski 65C02 Simulator](https://github.com/Kelmar/kowalski). Set:
-- CPU mode: **65C02**
+- CPU mode: Set **65C02** if using enhanced versions
 - Terminal emulation addresses: **E000–E006**
 
 Load the assembled binary or paste the `.asm` source click Assemble (F7), Debug (F6) and either RUN (F5) or Animate (Ctrl-F5) if you want to watch it step through - don't forget to click and type into the yellow Terminal window. The INIT trampoline at the start of uBASIC ROM means Kowalski's nominal execute-from-first-byte behaviour works correctly, as does real hardware's reset-vector startup.
@@ -234,6 +234,13 @@ gcc -O2 -o sim65c02 sim65c02.c
   --maxcycles 5000000
 ```
 
+The simulator can also verify a `.bin` directly — it auto-detects the load address from file size (2048 bytes → $F800, 4096 bytes → $F000):
+
+```bash
+./sim65c02 uBASIC.bin --input "PRINT 42"
+./sim65c02 4kBASIC.bin --input "PRINT 42"
+```
+
 **Options:**
 
 | Option | Description |
@@ -259,29 +266,22 @@ asm65c02 4kBASIC.asm
 
 Output includes key symbol addresses, the reset vector, and a ROM size report. Exits 0 on success, 1 on assembly errors.
 
-### Producing a ROM binary for real hardware
+#### Producing a ROM binary for real hardware
 
-Use the standalone assembler with `--binary` to write a raw 65536-byte flat image to stdout, then extract the ROM region:
+Use the standalone assembler with `-o <file> -r $lower-upper` to write abinary file:
 
 ```bash
 # uBASIC — 2 KB ROM image for a 2716 EPROM
-asm65c02 uBASIC.asm --binary | dd bs=1 skip=63488 count=2048 of=ubasic13.bin
-#  63488 = 0xF800
+
+asm65c02 uBASIC.asm -o uBASIC.bin -r $F800-$FFFF
 
 # 4K BASIC — 4 KB ROM image for a 2732 EPROM
-asm65c02 4kBASIC.asm --binary | dd bs=1 skip=61440 count=4096 of=4kbasic_v11.bin
-#  61440 = 0xF000
+sm65c02 4kBASIC.asm -o 4kBASIC.bin -r $F000-$FFFF
 ```
 
 Program the `.bin` file to an EPROM so that the chip's address pin 0 maps to $F800 (uBASIC) or $F000 (4K BASIC). The reset vector at $FFFC/$FFFD within the image points to `INIT`, so the interpreter starts on power-up.
 
-The simulator can verify a `.bin` directly — it auto-detects the load address from file size (2048 bytes → $F800, 4096 bytes → $F000):
 
-```bash
-./sim65c02 uBASIC.bin --input "PRINT 42"
-./sim65c02 4kBASIC.bin --input "PRINT 42"
-```
-```
 #### Note on Running from real ROM (no pre-loaded program)
 
 The pre-loaded program relies on `INIT` setting `PE` to point past the program bytes. To start with an empty program instead, change two lines in `INIT`:
@@ -296,7 +296,7 @@ Program the `.bin` file to an EPROM so that the chip's address 0 maps to $F800 (
 
 #### Terminal I/O
 
-For real Hardware you will need to modify the I/O Addresses for Serial I/O, specified below.  Although 4kBASIC has plenty of space avaiable, there is currently little ROM space available in uBASIC for more compicated stuff like Wait/Char-Available flags or Bit-Bang serial, so you will probably have to loose a keyword to make space - See Below on Using Claude to Customize.
+For real Hardware you will need to modify the I/O Addresses for Serial I/O, specified below.  Although 4kBASIC has plenty of ROM space available, uBASIC (6502 and 65c02 version) only have about 2 dozen bytes free, which is just enough for simple writes to ACIA or bitbang serial.  Anything more complicated like screen handling may need to loose a keyword to make space - See Below on Using Claude to Customize.
 
 | Address | Kowalski Virtual Terminal Function  |
 |---------|----------|
@@ -491,7 +491,7 @@ Key points: variables are single letters A–Z only (no arrays, no strings). Num
 | **CLEAR / NEW** | `CLEAR` | `NEW` | `NEW` | `NEW` |
 | **RUN / LIST** | ✓ | ✓ | ✓ | ✓ |
 | **PEEK / POKE** | ✗ | ✓ | ✓ | ✓ |
-| **Machine Langauge** | ✗ | ✗ | `CALL addr` (JSR, no retval) | `USR(addr)` (JSR, returns A) |
+| **Machine Langauge** | ✗ | `USR(addr)` (JSR, returns A)  | `CALL addr` (JSR, no retval) | `USR(addr)` (JSR, returns A) |
 | **Arithmetic Ops** | ✗ | ✗ | `ABS` | `ABS` `SGN` |
 | **RND** | ✗ | ✗ | ✓ `RND(n)` → 0..n-1 | ✓ `RND` → 1..32767 |
 | **Character Conv** | ✗ | `CHR$` | ✗ | `ASC` `CHR$` |
@@ -506,7 +506,7 @@ Key points: variables are single letters A–Z only (no arrays, no strings). Num
 | **HELP / keyword list** | ✗ | uBASIC: ✓, uBASIC6502: ✗ | ✗ | ✓ |
 | **AUTO line numbering** | ✗ | ✗ | ✓ | ✗ |
 | **Cassette LOAD/SAVE** | ✗ | ✗ | ✓ (via ACI hardware) | ✗ |
-| **GOSUB nesting depth** | impl-dependent | 10 | 8 max | 8 |
+| **GOSUB nesting depth** | impl-dependent | n/a | 8 max | 8 |
 | **FOR nesting depth** | n/a | n/a | 8 max | 8 |
 | **Line number range** | 1–32767 | 0–32767 | 0–32767 | 0–32767 |
 
@@ -548,7 +548,7 @@ Key points: variables are single letters A–Z only (no arrays, no strings). Num
 | Original Tiny BASIC spec | 1975 | — (spec) | any |
 | Palo Alto Tiny BASIC v1 (Li-Chen Wang) | 1976 | 1.77 KB | 8080 |
 | Apple 1 BASIC (Wozniak) | 1976 | 4.0 KB | 6502 |
-| uBASIC (this project) | 2026 | 2.0 KB | 65C02 |
+| uBASIC (this project) | 2026 | 2.0 KB | 6502/65C02 |
 | 4K BASIC (this project) | 2026 | 4.0 KB | 65C02 |
 
 Apple 1 BASIC and 4K BASIC both occupy 4 KB, yet spend that budget in distinctly different ways. Wozniak used much of the space on arrays, strings, and `RND`; the 4K BASIC uses the same space for `DATA`/`READ`, `ELSE`, `ON…GOTO`, `SGN`, `ASC`/`CHR$`, `INKEY`, `CLS`, and cursor control — features more useful on a modern embedded target than array support. Apple 1 BASIC had the original 6502, while these Tiny BASICs uses the 65C02's extra instructions (`STZ`, `BRA`, zero-page indirect addressing) which were not available to Wozniak in 1976.
