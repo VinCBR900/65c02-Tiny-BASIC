@@ -36,9 +36,9 @@
  *                   Errors go to stderr.  Used internally by sim65c02.
  *   -o <file>       Write binary output to a file (implies --binary).
  *   -r $HHHH-$HHHH  Limit binary output to an address range (requires --binary or -o).
- *                   Extract ROM region with dd (if not using -r):
- *                     uBASIC (2 KB at $F800):   dd bs=1 skip=63488 count=2048 of=rom.bin
- *                     4K BASIC (4 KB at $F000): dd bs=1 skip=61440 count=4096 of=rom.bin
+ *                   Preferred for ROM extraction:
+ *                     uBASIC (2 KB at $F800):   -r $F800-$FFFF
+ *                     4K BASIC (4 KB at $F000): -r $F000-$FFFF
  *   --dump-all      After the key-symbol table, print every assembled symbol
  *                   sorted by address.  Useful for detailed size analysis.
  *   --help, -h      Print this help and exit.
@@ -1033,11 +1033,18 @@ static int parse_hex_range(const char *s, int *start, int *end) {
     while (*right == ' ' || *right == '\t') memmove(right, right + 1, strlen(right));
     str_trim(left);
     str_trim(right);
-    if (left[0] != '$' || right[0] != '$') return 0;
+
+    const char *lp = left;
+    const char *rp = right;
+    if (*lp == '$') lp++;
+    if (*rp == '$') rp++;
+    if ((lp[0] == '0' && (lp[1] == 'x' || lp[1] == 'X'))) lp += 2;
+    if ((rp[0] == '0' && (rp[1] == 'x' || rp[1] == 'X'))) rp += 2;
+    if (*lp == '\0' || *rp == '\0') return 0;
 
     char *endp1 = NULL, *endp2 = NULL;
-    long a = strtol(left + 1, &endp1, 16);
-    long b = strtol(right + 1, &endp2, 16);
+    long a = strtol(lp, &endp1, 16);
+    long b = strtol(rp, &endp2, 16);
     if (!endp1 || !endp2 || *endp1 != '\0' || *endp2 != '\0') return 0;
     if (a < 0 || a > 0xFFFF || b < 0 || b > 0xFFFF || a > b) return 0;
 
@@ -1064,10 +1071,10 @@ static void asm_usage(FILE *out) {
         "  --binary     Write raw 65536-byte flat image to stdout; errors to stderr.\n"
         "  -o <file>    Write binary image to <file> (avoids stdout/binary issues on Win32).\n"
         "  -r <range>   Output only address range for binary output, e.g. -r $F000-$FFFF.\n"
-        "               Extract ROM with dd, e.g. for 4K BASIC at $F000:\n"
-        "                 asm65c02 4kBASIC.asm --binary | dd bs=1 skip=61440 count=4096 of=rom.bin\n"
-        "               For uBASIC at $F800:\n"
-        "                 asm65c02 uBASIC.asm --binary | dd bs=1 skip=63488 count=2048 of=rom.bin\n"
+        "               Also accepts F000-FFFF or 0xF000-0xFFFF.\n"
+        "               Preferred ROM extraction examples:\n"
+        "                 asm65c02 uBASIC.asm -o rom.bin -r $F800-$FFFF\n"
+        "                 asm65c02 4kBASIC.asm -o rom.bin -r $F000-$FFFF\n"
         "  --dump-all   Print all assembled symbols after the key-symbol table.\n"
         "  --help, -h   Print this help and exit.\n"
         "\n"
@@ -1134,11 +1141,11 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "-r")) {
             if (i + 1 >= argc) {
-                fprintf(stderr, "-r requires a range like $F000-$FFFF\n");
+                fprintf(stderr, "-r requires a range like $F000-$FFFF (or F000-FFFF)\n");
                 return 1;
             }
             if (!parse_hex_range(argv[++i], &range_start, &range_end)) {
-                fprintf(stderr, "Invalid range '%s' (expected $HHHH-$HHHH)\n", argv[i]);
+                fprintf(stderr, "Invalid range '%s' (expected $HHHH-$HHHH or HHHH-HHHH)\n", argv[i]);
                 return 1;
             }
             range_enabled = 1;
@@ -1177,6 +1184,7 @@ int main(int argc, char **argv) {
         int out_start = range_enabled ? range_start : 0;
         int out_end = range_enabled ? range_end : 0xFFFF;
         size_t out_len = (size_t)(out_end - out_start + 1);
+        int rv = mem[0xFFFC] | (mem[0xFFFD] << 8);
         if (out_file) {
             FILE *of = fopen(out_file, "wb");
             if (!of) {
@@ -1188,6 +1196,14 @@ int main(int argc, char **argv) {
         } else {
             fwrite(mem + out_start, 1, out_len, stdout);
         }
+        fprintf(stderr,
+                "Assembled OK: input=%s output=%s range=$%04X-$%04X bytes=%zu reset=$%04X\n",
+                src_file,
+                out_file ? out_file : "stdout",
+                (unsigned)out_start,
+                (unsigned)out_end,
+                out_len,
+                (unsigned)rv);
         return 0;
     }
 
