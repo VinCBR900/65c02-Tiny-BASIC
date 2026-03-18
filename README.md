@@ -24,7 +24,9 @@ Both interpreters have been tested on the [Kowalski 65C02 Simulator](https://git
 
 **<2048 bytes assembled. ROM at $F800–$FFFF**
 
-A minimal but complete integer BASIC. No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution. This costs RAM and speed but keeps the interpreter very small. Comfortably fits in a 2716 EPROM (2048 bytes), which was the original design goal.
+A minimal but complete integer BASIC family. No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution. This costs RAM and speed but keeps the interpreter very small. Both variants below fit a 2716 EPROM (2048 bytes).
+
+#### uBASIC (65C02 baseline) — `uBASIC.asm`
 
 **Statements:** `PRINT` `IF`/`THEN` `GOTO` `LET` `INPUT` `REM` `END` `RUN` `LIST` `NEW` `POKE` `FREE` `HELP`
 
@@ -51,6 +53,15 @@ A minimal but complete integer BASIC. No tokeniser — program lines are stored 
 | $0000–$008C | Zero page: interpreter variables, input buffer, A–Z vars |
 | $0200–$0FFF | Program storage (RAM, up to ~3.5 KB) |
 | $F800–$FFFF | ROM: interpreter + string table + vectors |
+
+#### uBASIC6502 (NMOS 6502 port) — `uBASIC6502.asm`
+
+**Statements:** `PRINT` `IF`/`THEN` `GOTO` `LET` `INPUT` `REM` `END` `RUN` `LIST` `NEW` `POKE`  
+(Parser also accepts 2-letter prefixes: `PR` `IF` `GO` `LE` `IN` `RE` `EN` `RU` `LI` `NE` `PO`.)
+
+**Expressions:** `+` `-` `*` `/` `%`(mod) `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)` `CHR$(n)` `PEEK(addr)` `USR(addr)` variables `A`–`Z`
+
+**Notes:** full conventional keywords are accepted by matching the first 2 letters and consuming trailing alphabetic characters; `HELP` and `FREE` are removed in this NMOS variant to keep ROM headroom.
 
 ### 4K BASIC — fits in a 2732 EPROM (<4 KByte)
 
@@ -100,15 +111,16 @@ A significantly more capable integer BASIC. Keywords are tokenised on entry and 
 | File | Description |
 |------|-------------|
 | `uBASIC.asm` | uBASIC source (~1750 lines, heavily commented) |
+| `uBASIC6502.asm` | NMOS-6502 uBASIC variant with 2-byte keyword-prefix matcher |
 | `4kBASIC.asm` | 4K BASIC source (~3100 lines, heavily commented) |
 | `asm65c02.c` | Two-pass 65C02 assembler (C) — builds standalone or embeds in sim |
 | `sim65c02.c` | 65C02 Batch simulator— includes asm65c02.c directly |
 | `sim65c02_interactive` | 65C02 simulator with NCURSES virtual terminal (C) — includes asm65c02.c directly |
 | `sim65c02_interactive_Win32` | 65C02 simulator with Win32 TUI virtual terminal (C) — includes asm65c02.c directly |
 
-Both assembly sources include a pre-loaded **feature showcase program** at $0200. Type `RUN` to see it, `NEW` to clear it, `LIST` to read the source.
+All Tiny BASIC assembly sources include a pre-loaded **feature showcase program** at $0200. Type `RUN` (or `RU` on `uBASIC6502`) to see it, `NEW` to clear it, `LIST` to read the source.
 
-The uBASIC (2kbyte) showcase exercises `PRINT`, `CHR$`, arithmetic, comparisons, `IF`/`THEN`, `GOTO`-based loops (including nested), and finishes with a fixed point Mandelbrot renderer.
+The uBASIC / uBASIC6502 (2kbyte) showcase exercises `PRINT`, `CHR$`, arithmetic, comparisons, `IF`/`THEN`, `GOTO`-based loops (including nested), and finishes with a fixed point Mandelbrot renderer.
 
 The 4K BASIC showcase exercises every major feature: `PRINT`, `CHR$`, `ASC`, `ABS`, `SGN`, `MOD`, `NOT`, `AND`, `OR`, `XOR`, `RND`, `PEEK`/`POKE`, `DATA`/`READ`/`RESTORE`, `FOR`/`NEXT`/`STEP`, `IF`/`THEN`/`ELSE`, `GOSUB`/`RETURN`, `ON n GOSUB`, and finishes with the same Mandelbrot renderer as a stress test of the expression evaluator and nested loops.
 
@@ -204,6 +216,7 @@ gcc -O2 -o sim65c02 sim65c02.c
 **Run:**
 ```bash
 ./sim65c02 uBASIC.asm --input "PRINT 42"
+./sim65c02 uBASIC6502.asm --input "PR 42"
 ./sim65c02 4kBASIC.asm --input "PRINT 42"
 ./sim65c02 4kBASIC.asm --mandelbrot --maxcycles 800000000
 ```
@@ -451,10 +464,10 @@ Key points: variables are single letters A–Z only (no arrays, no strings). Num
 
 ### Feature comparison table
 
-| Feature | Original Tiny BASIC (spec) | uBASIC (~2 KB, 6502) | Apple 1 BASIC (~4 KB, 6502) | 4K BASIC (~4 KB, 6502) |
-|---------|---------------------------|--------------------------|-----------------------------|-----------------------------|
-| **Size** | Spec only | 2039 bytes | 4096 bytes (cassette) | 4093 bytes (ROM) |
-| **CPU target** | N/A | 65C02 | 6502 | 65C02 |
+| Feature | Original Tiny BASIC (spec) | uBASIC / uBASIC6502 (~2 KB) | Apple 1 BASIC (~4 KB, 6502) | 4K BASIC (~4 KB, 6502) |
+|---------|---------------------------|-------------------------------|-----------------------------|-----------------------------|
+| **Size** | Spec only | uBASIC: ~2 KB, uBASIC6502: 2006 bytes | 4096 bytes (cassette) | 4093 bytes (ROM) |
+| **CPU target** | N/A | uBASIC: 65C02, uBASIC6502: NMOS 6502 | 6502 | 65C02 |
 | **Tokenised** | ✗ (most impls raw ASCII) | ✗ (raw ASCII) | ✓ | ✓ |
 | **Integer only** | ✓ signed 16-bit | ✓ signed 16-bit | ✓ signed 16-bit | ✓ signed 16-bit |
 | **Variables** | A–Z | A–Z | A–Z, An (letter+digit) | A–Z |
@@ -489,8 +502,8 @@ Key points: variables are single letters A–Z only (no arrays, no strings). Num
 | **INKEY (non-blocking)** | ✗ | ✗ | ✗ | ✓ |
 | **CLS / HOME (clear screen)** | ✗ | ✗ | ✗ | ✓ `CLS` |
 | **Cursor positioning** | ✗ | ✗ | ✗ (dumb terminal only) | ✓ `AT(col,row)` in PRINT |
-| **FREE (memory query)** | ✗ | ✓ | ✓ `HIMEM=` / `LOMEM=` | ✓ |
-| **HELP / keyword list** | ✗ | ✓ | ✗ | ✓ |
+| **FREE (memory query)** | ✗ | uBASIC: ✓, uBASIC6502: ✗ | ✓ `HIMEM=` / `LOMEM=` | ✓ |
+| **HELP / keyword list** | ✗ | uBASIC: ✓, uBASIC6502: ✗ | ✗ | ✓ |
 | **AUTO line numbering** | ✗ | ✗ | ✓ | ✗ |
 | **Cassette LOAD/SAVE** | ✗ | ✗ | ✓ (via ACI hardware) | ✗ |
 | **GOSUB nesting depth** | impl-dependent | 10 | 8 max | 8 |
