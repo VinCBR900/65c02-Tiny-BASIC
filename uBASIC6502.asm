@@ -28,8 +28,8 @@
 ; ---- ROM memory map ---------------------------------------------------------
 ;   $F800          JMP INIT trampoline (Kowalski compatibility)
 ;   $F803..$F85B   string / keyword table  (all on page $F8)
-;   $F85C..$FFD5   interpreter code  (2006 bytes in current build)
-;   $FFD6..$FFF9   free (36 bytes)
+;   $F85C..$FFE0   interpreter code  (2017 bytes in current build)
+;   $FFE1..$FFF9   free (25 bytes)
 ;   $FFFC..$FFFF   reset / IRQ vectors
 ;
 ; ---- zero-page layout -------------------------------------------------------
@@ -1779,7 +1779,13 @@ MK_SKIP: JSR UCIP
          BCS MK_OK
          JSR GETCI
          BNE MK_SKIP           ; always taken here (token chars are nonzero)
-MK_OK:   CLC                  ; C=0: match
+MK_OK:   LDY #0
+         LDA (IP),Y
+         CMP #'$'              ; allow full CHR$ spelling after 2-char CH prefix
+         BNE MK_OK_RET
+         JSR GETCI
+MK_OK_RET:
+         CLC                  ; C=0: match
          RTS
 MK_FAIL_LAST:                 ; alias: same address as MK_FAIL (retained for clarity)
 MK_FAIL: LDA LP               ; restore IP to saved position
