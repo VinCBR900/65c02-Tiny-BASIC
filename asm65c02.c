@@ -1,5 +1,5 @@
 /*
- * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.5, Mar 2026)
+ * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.6, Mar 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
@@ -8,19 +8,24 @@
  * v1.2: source_copy[] made static — prevents 1MB stack overflow on Windows.
  * v1.3: Forward-reference sizing fix: any expression containing an undefined
  *       symbol now forces ABS/ABSX/ABSY mode on pass 1.
- * v1.4: Added missing SED ($F8, Set Decimal Mode) to opcode table and
- *       fixed pass-1 sizing when expressions contain undefined symbols.
- *       Any expression containing an undefined symbol now forces ABS/ABSX/ABSY
- *       mode on pass 1, regardless of the
- *       partially-evaluated value.  Previously "SYM+1" with SYM undefined
- *       evaluated to 1 on pass 1, was sized as ZP (2 bytes), then on pass 2
- *       resolved to e.g. $FFCD (3 bytes), corrupting subsequent instruction
- *       addresses and producing a wrong ROM.
- * v1.5: CLI refreshed and hardened: header/help synced with current options
- *       (-o, -r, -h), unknown/extra arguments now rejected with clear errors.
+ * v1.4: Added missing SED ($F8, Set Decimal Mode) to opcode table.
+ * v1.5: CLI refreshed: -o <file> output, -r $HHHH-$HHHH range extraction,
+ *       strict unknown-arg rejection.  AsmStats struct for accurate size_report.
+ * v1.6: .opt proc6502 / .opt proc65c02 CPU-mode switching.
+ *       When proc6502 mode is active the assembler flags any instruction
+ *       that is 65C02-only as an error.  This lets uBASIC6502.asm (NMOS
+ *       6502 target) be assembled and size-checked with the same tool.
+ *       65C02-only instructions detected:
+ *         Mnemonics : bra, phx, phy, plx, ply, stz, tsb, trb
+ *         Acc forms : inc a, dec a  ($1A/$3A)
+ *         BIT modes : bit imm, bit zpx, bit absx
+ *         Addr mode : M_IND_ZP  (zp) no-index -- all mnemonics
+ *       .opt proc65c02 (default) re-enables all 65C02 instructions.
+ *       .setcpu "6502" and .setcpu "65C02" are also accepted.
  *
-  * Build (standalone):
+ * Build (standalone):
  *   gcc -O2 -DASM65C02_MAIN -o asm65c02 asm65c02.c
+ *   x86_64-w64-mingw32-gcc -O2 -DASM65C02_MAIN -o asm65c02.exe asm65c02.c
  *
  *   (The -DASM65C02_MAIN flag enables main(); without it the file is a
  *    pure library suitable for #include by sim65c02.c.)
@@ -34,9 +39,9 @@
  *                   Exit code 0 on success, 1 on assembly errors.
  *   --binary        Write raw 65 536-byte flat memory image to stdout.
  *                   Errors go to stderr.  Used internally by sim65c02.
- *   -o <file>       Write binary output to a file (implies --binary).
- *   -r $HHHH-$HHHH  Limit binary output to an address range (requires --binary or -o).
- *                   Preferred for ROM extraction:
+ *   -o <file>       Write binary image to <file> (avoids stdout/binary issues on Win32).
+ *   -r $HHHH-$HHHH  Limit binary output to address range (requires --binary or -o).
+ *                   Preferred ROM extraction examples:
  *                     uBASIC (2 KB at $F800):   -r $F800-$FFFF
  *                     4K BASIC (4 KB at $F000): -r $F000-$FFFF
  *   --dump-all      After the key-symbol table, print every assembled symbol
@@ -48,7 +53,9 @@
  *                .DB / .BYTE  val[,val,...]   (values or "string literals")
  *                .DW / .WORD  val[,val,...]   (16-bit little-endian)
  *                .RES  n[,fill]               (reserve n bytes, optional fill)
- *                .opt / .setcpu               (accepted, ignored)
+ *                .opt proc6502 / .opt proc65c02
+ *                .setcpu "6502" / .setcpu "65C02"
+ *                                (switch CPU mode; proc6502 enables 6502-only checks)
  *   Equates    : NAME = expression
  *   Labels     : GLOBAL_LABEL:
  *                @local_label:   (scope resets at each new global label)
@@ -70,16 +77,10 @@
  *   Reset vector       = $F003
  *   ROM: $F000-$FFFF  (4096 bytes)  3 bytes free before vectors
  *
- * Version history (newest first):
- *   v1.5  (Mar 2026)  CLI docs aligned with implementation and argument parsing
- *                     made strict for unknown/extra option handling.
- *   v1.4  (Mar 2026)  Added SED opcode and pass-1 sizing fix for expressions
- *                     with undefined symbols.
- *   v1.3  (Mar 2026)  Forward-reference sizing fix for undefined symbols.
- *   v1.2  (Mar 2026)  source_copy[] made static to avoid Windows stack overflow.
- *   v1.1  (Mar 2026)  Header updated: full option docs, --help flag, corrected
- *                     project version references.
+ * Version history:
  *   v1.0  (Mar 2026)  Initial C port of assembler.py v1.6.
+ *   v1.1  (Mar 2026)  Header updated: full option docs, --help flag, corrected
+ *                     project version references (uBASIC v13, 4K BASIC v11).
  */
 
 #include <stdio.h>
@@ -222,6 +223,56 @@ static void add_error(int lineno, const char *msg) {
         snprintf(errors[nerrors], ERR_LEN, "Line %d: %s", lineno, msg);
         nerrors++;
     }
+}
+
+/* ── CPU mode ────────────────────────────────────────────────────────────── */
+/*
+ * cpu_mode: 0 = 65C02 (default, all instructions allowed)
+ *           1 = NMOS 6502 (.opt proc6502 / .setcpu "6502")
+ * Set by .opt proc6502|proc65c02 or .setcpu "6502"|"65C02" directives.
+ * Reset to 0 at the start of each assemble() call.
+ */
+static int cpu_mode = 0;   /* 0=65C02, 1=6502 */
+
+/*
+ * is_65c02only  --  return 1 if the (mnemonic, mode) combination requires
+ *                  a 65C02 and is therefore illegal in cpu_mode==1 (6502).
+ *
+ *   In:  mn   = lower-case mnemonic string
+ *        mode = resolved addressing mode
+ *   Out: 1 if 65C02-only, 0 if valid on NMOS 6502
+ */
+static int is_65c02only(const char *mn, Mode mode) {
+    /* M_IND_ZP: (zp) zero-page indirect without index -- 65C02 only for all mnemonics */
+    if (mode == M_IND_ZP) return 1;
+
+    /* Mnemonics that simply do not exist on NMOS 6502 */
+    static const char *c02_mnems[] = {
+        "bra", "phx", "phy", "plx", "ply", "stz", "tsb", "trb", NULL
+    };
+    for (int i = 0; c02_mnems[i]; i++)
+        if (!strcmp(mn, c02_mnems[i])) return 1;
+
+    /* INC A / DEC A ($1A / $3A) -- accumulator forms are 65C02 only */
+    if ((!strcmp(mn, "inc") || !strcmp(mn, "dec")) && mode == M_ACC) return 1;
+
+    /* BIT immediate, BIT zp,X, BIT abs,X -- 65C02 extensions */
+    if (!strcmp(mn, "bit") &&
+        (mode == M_IMM || mode == M_ZPX || mode == M_ABSX)) return 1;
+
+    /* JMP (abs,X) -- 65C02 indirect indexed jump */
+    /* The assembler represents this as M_IND with X suffix; in our opcode
+     * table it maps to opcode $7C.  We detect it by opcode value. */
+    if (!strcmp(mn, "jmp") && mode == M_IND) {
+        /* plain JMP (abs) = $6C is NMOS-legal; JMP (abs,X) = $7C is not.
+         * We cannot distinguish them from mode alone because the assembler
+         * folds both into M_IND.  The $7C form is not in our operand parser
+         * (it uses M_IND for all indirect jumps), so in practice uBASIC6502
+         * won't encounter it.  Leave this as a no-op for now; a source using
+         * JMP (abs,X) would need explicit opcode bytes anyway. */
+    }
+
+    return 0;
 }
 
 /* ── string helpers ──────────────────────────────────────────────────────── */
@@ -738,13 +789,6 @@ typedef struct {
 static LineInfo pc_map[MAX_LINES];
 static int      nlines = 0;
 
-typedef struct {
-    int first_opcode_pc;
-    int last_code_pc_before_vectors;
-} AsmStats;
-
-static AsmStats asm_stats;
-
 /* ── memory image ────────────────────────────────────────────────────────── */
 /* Standalone build (ASM65C02_MAIN): we own mem[].
    Included by sim65c02.c: sim owns mem[], we use it via extern. */
@@ -753,6 +797,13 @@ uint8_t mem[65536];
 #else
 extern uint8_t mem[65536];
 #endif
+
+/* ── assembly stats (for size_report) ───────────────────────────────────── */
+typedef struct {
+    int first_opcode_pc;               /* address of first emitted opcode byte */
+    int last_code_pc_before_vectors;   /* address of last non-vector byte */
+} AsmStats;
+static AsmStats asm_stats;
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * ASSEMBLE  —  main two-pass entry point
@@ -785,9 +836,10 @@ static int assemble(const char *source) {
 
     memset(mem, 0, sizeof(mem));
     nsyms = 0; nerrors = 0; nlines = 0;
+    g_scope[0] = '\0';
+    cpu_mode = 0;   /* default: 65C02 mode */
     asm_stats.first_opcode_pc = -1;
     asm_stats.last_code_pc_before_vectors = -1;
-    g_scope[0] = '\0';
 
     /* ── PASS 1: collect labels, compute addresses ── */
     int pc = 0;
@@ -856,7 +908,16 @@ static int assemble(const char *source) {
             pc += cnt * 2; continue;
         }
         if (!strcmp(mn,".opt")||!strcmp(mn,".setcpu")||
-            !strcmp(mn,".code")||!strcmp(mn,".segment")) continue;
+            !strcmp(mn,".code")||!strcmp(mn,".segment")) {
+            /* .opt proc6502 / .opt proc65c02
+               .setcpu "6502" / .setcpu "65C02"  -- set CPU mode for checking */
+            char arg[LINE_LEN]; str_lower(arg, operand);
+            char *ap = arg;
+            if (*ap == '"') { ap++; char *eq = strchr(ap,'"'); if(eq) *eq='\0'; }
+            if (!strcmp(ap,"proc6502") || !strcmp(ap,"6502"))    cpu_mode = 1;
+            if (!strcmp(ap,"proc65c02")|| !strcmp(ap,"65c02"))   cpu_mode = 0;
+            continue;
+        }
 
         /* instruction */
         if (mnem_known(mn)) {
@@ -916,6 +977,8 @@ static int assemble(const char *source) {
                 mem[addr] = tmp[i];
                 if (addr < 0xFFFA && addr > asm_stats.last_code_pc_before_vectors)
                     asm_stats.last_code_pc_before_vectors = addr;
+                if (asm_stats.first_opcode_pc < 0)
+                    asm_stats.first_opcode_pc = addr;
             }
             continue;
         }
@@ -943,8 +1006,10 @@ static int assemble(const char *source) {
                     mem[wpc+1] = (val >> 8) & 0xFF;
                     if (wpc < 0xFFFA && wpc > asm_stats.last_code_pc_before_vectors)
                         asm_stats.last_code_pc_before_vectors = wpc;
-                    if ((wpc + 1) < 0xFFFA && (wpc + 1) > asm_stats.last_code_pc_before_vectors)
-                        asm_stats.last_code_pc_before_vectors = wpc + 1;
+                    if ((wpc+1) < 0xFFFA && (wpc+1) > asm_stats.last_code_pc_before_vectors)
+                        asm_stats.last_code_pc_before_vectors = wpc+1;
+                    if (asm_stats.first_opcode_pc < 0)
+                        asm_stats.first_opcode_pc = wpc;
                     wpc += 2;
                 }
                 if (*q == ',') q++;
@@ -952,12 +1017,30 @@ static int assemble(const char *source) {
             continue;
         }
         if (!strcmp(mn,".opt")||!strcmp(mn,".setcpu")||
-            !strcmp(mn,".code")||!strcmp(mn,".segment")) continue;
+            !strcmp(mn,".code")||!strcmp(mn,".segment")) {
+            /* mirror pass-1 cpu_mode update so errors fire on the right lines */
+            char arg[LINE_LEN]; str_lower(arg, op);
+            char *ap = arg;
+            if (*ap == '"') { ap++; char *eq = strchr(ap,'"'); if(eq) *eq='\0'; }
+            if (!strcmp(ap,"proc6502") || !strcmp(ap,"6502"))    cpu_mode = 1;
+            if (!strcmp(ap,"proc65c02")|| !strcmp(ap,"65c02"))   cpu_mode = 0;
+            continue;
+        }
 
         if (!mnem_known(mn)) continue;
 
         Operand oper = parse_operand(op, mn, pc, 1);
         Mode m = promote(mn, oper.mode);
+
+        /* v1.5: 6502 mode -- flag any 65C02-only instruction as an error */
+        if (cpu_mode == 1 && is_65c02only(mn, m)) {
+            char msg[ERR_LEN];
+            snprintf(msg, ERR_LEN,
+                "'%s' is a 65C02 instruction, not valid for NMOS 6502 target",
+                mn);
+            add_error(lineno, msg);
+            continue;
+        }
         int opc = opcode_lookup(mn, m);
         if (opc < 0) {
             char msg[ERR_LEN];
@@ -1005,59 +1088,50 @@ static void size_report(void) {
         printf("\nROM footprint: no emitted code bytes before vectors.\n");
         return;
     }
-
-    int used = asm_stats.last_code_pc_before_vectors - asm_stats.first_opcode_pc + 1;
-    printf("\nROM footprint: $%04X-$%04X = %d bytes (up to vectors at $FFFA-$FFFF)\n",
-           asm_stats.first_opcode_pc,
-           asm_stats.last_code_pc_before_vectors,
-           used);
+    int start  = asm_stats.first_opcode_pc;
+    int end    = asm_stats.last_code_pc_before_vectors;
+    int used   = end - start + 1;
+    int free_v = 0xFFFA - end - 1;
+    if (free_v < 0) free_v = 0;
+    printf("\nROM footprint: $%04X-$%04X = %d bytes (code before vectors)",
+           start, end, used);
+    if (free_v > 0)
+        printf("  (%d bytes free before vectors)", free_v);
+    printf("\n");
     if (used <= 2048)
         printf("(%d/2048 = %.1f%% of 2KB)\n", used, 100.0*used/2048);
     else if (used <= 4096)
         printf("(%d/4096 = %.1f%% of 4KB)\n", used, 100.0*used/4096);
 }
 
+/* ── CLI main (standalone build only) ───────────────────────────────────── */
+#ifdef ASM65C02_MAIN
+
 static int parse_hex_range(const char *s, int *start, int *end) {
     const char *dash = strchr(s, '-');
     if (!dash) return 0;
-
-    char left[64], right[64];
-    int llen = (int)(dash - s);
-    int rlen = (int)strlen(dash + 1);
-    if (llen <= 0 || rlen <= 0 || llen >= (int)sizeof(left) || rlen >= (int)sizeof(right)) return 0;
-
-    memcpy(left, s, llen); left[llen] = '\0';
-    memcpy(right, dash + 1, rlen); right[rlen] = '\0';
-
-    while (*left == ' ' || *left == '\t') memmove(left, left + 1, strlen(left));
-    while (*right == ' ' || *right == '\t') memmove(right, right + 1, strlen(right));
-    str_trim(left);
-    str_trim(right);
-
-    const char *lp = left;
-    const char *rp = right;
-    if (*lp == '$') lp++;
-    if (*rp == '$') rp++;
-    if ((lp[0] == '0' && (lp[1] == 'x' || lp[1] == 'X'))) lp += 2;
-    if ((rp[0] == '0' && (rp[1] == 'x' || rp[1] == 'X'))) rp += 2;
-    if (*lp == '\0' || *rp == '\0') return 0;
-
-    char *endp1 = NULL, *endp2 = NULL;
-    long a = strtol(lp, &endp1, 16);
-    long b = strtol(rp, &endp2, 16);
-    if (!endp1 || !endp2 || *endp1 != '\0' || *endp2 != '\0') return 0;
+    char left[32], right[32];
+    int ll = (int)(dash - s), rl = (int)strlen(dash+1);
+    if (ll <= 0 || rl <= 0 || ll >= (int)sizeof(left) || rl >= (int)sizeof(right)) return 0;
+    memcpy(left, s, ll); left[ll] = '\0';
+    memcpy(right, dash+1, rl); right[rl] = '\0';
+    str_trim(left); str_trim(right);
+    const char *lp = left,  *rp = right;
+    if (*lp == '$') lp++;  if (*rp == '$') rp++;
+    if ((lp[0]=='0' && (lp[1]=='x'||lp[1]=='X'))) lp+=2;
+    if ((rp[0]=='0' && (rp[1]=='x'||rp[1]=='X'))) rp+=2;
+    if (!*lp || !*rp) return 0;
+    char *ep1=NULL, *ep2=NULL;
+    long a = strtol(lp, &ep1, 16), b = strtol(rp, &ep2, 16);
+    if (!ep1||!ep2||*ep1||*ep2) return 0;
     if (a < 0 || a > 0xFFFF || b < 0 || b > 0xFFFF || a > b) return 0;
-
-    *start = (int)a;
-    *end = (int)b;
+    *start = (int)a; *end = (int)b;
     return 1;
 }
 
-/* ── CLI main (standalone build only) ───────────────────────────────────── */
-#ifdef ASM65C02_MAIN
 static void asm_usage(FILE *out) {
     fprintf(out,
-        "asm65c02 v1.5 — Toy 65C02 two-pass assembler\n"
+        "asm65c02 v1.6 — Toy 65C02/6502 two-pass assembler\n"
         "\n"
         "Copyright Vincent Crabtree 2026, MIT License, See LICENSE file\n"
         "\n"
@@ -1069,105 +1143,76 @@ static void asm_usage(FILE *out) {
         "  (none)       Assemble and print symbol report + ROM size summary.\n"
         "               Exit 0 on success, 1 on error.\n"
         "  --binary     Write raw 65536-byte flat image to stdout; errors to stderr.\n"
-        "  -o <file>    Write binary image to <file> (avoids stdout/binary issues on Win32).\n"
-        "  -r <range>   Output only address range for binary output, e.g. -r $F000-$FFFF.\n"
-        "               Also accepts F000-FFFF or 0xF000-0xFFFF.\n"
-        "               Preferred ROM extraction examples:\n"
-        "                 asm65c02 uBASIC.asm -o rom.bin -r $F800-$FFFF\n"
-        "                 asm65c02 4kBASIC.asm -o rom.bin -r $F000-$FFFF\n"
+        "  -o <file>    Write binary image to <file> (cleaner on Win32 than stdout).\n"
+        "  -r <range>   Output only address range (requires --binary or -o).\n"
+        "               e.g.  -r $F800-$FFFF   or   -r F000-FFFF\n"
+        "               uBASIC:    asm65c02 uBASIC6502.asm -o rom.bin -r $F800-$FFFF\n"
+        "               4K BASIC:  asm65c02 4kBASIC.asm -o rom.bin -r $F000-$FFFF\n"
         "  --dump-all   Print all assembled symbols after the key-symbol table.\n"
         "  --help, -h   Print this help and exit.\n"
         "\n"
+        "CPU mode directives (in source):\n"
+        "  .opt proc6502      Target NMOS 6502: flags 65C02-only instructions as errors.\n"
+        "  .opt proc65c02     Target 65C02 (default): all instructions permitted.\n"
+        "  .setcpu \"6502\"     Equivalent to .opt proc6502.\n"
+        "  .setcpu \"65C02\"    Equivalent to .opt proc65c02.\n"
+        "\n"
         "Projects:\n"
-        "  uBASIC.asm    uBASIC    (2 KB ROM at $F800-$FFFF)\n"
-        "  4kBASIC.asm   4K BASIC  (4 KB ROM at $F000-$FFFF)\n"
+        "  uBASIC6502.asm  uBASIC6502  (NMOS 6502, 2 KB ROM at $F800-$FFFF)\n"
+        "  uBASIC.asm      uBASIC      (65C02,     2 KB ROM at $F800-$FFFF)\n"
+        "  4kBASIC.asm     4K BASIC    (65C02,     4 KB ROM at $F000-$FFFF)\n"
         "\n"
         "Build:\n"
         "  gcc -O2 -DASM65C02_MAIN -o asm65c02 asm65c02.c\n"
+        "  x86_64-w64-mingw32-gcc -O2 -DASM65C02_MAIN -o asm65c02.exe asm65c02.c\n"
     );
 }
 
 int main(int argc, char **argv) {
-    /* --help (or -h) anywhere in args */
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            asm_usage(stdout);
-            return 0;
+            asm_usage(stdout); return 0;
         }
     }
-
-    if (argc < 2) {
-        asm_usage(stderr);
-        return 1;
-    }
+    if (argc < 2) { asm_usage(stderr); return 1; }
 
     const char *src_file = NULL;
-    int binary_mode = 0;
-    int dump_all    = 0;
     const char *out_file = NULL;
-    int range_enabled = 0;
-    int range_start = 0;
-    int range_end = 0xFFFF;
-    int end_of_options = 0;
+    int binary_mode  = 0;
+    int dump_all     = 0;
+    int range_on     = 0;
+    int range_start  = 0;
+    int range_end    = 0xFFFF;
+    int end_opts     = 0;
+
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--")) {
-            end_of_options = 1;
-            continue;
+        if (!strcmp(argv[i], "--")) { end_opts = 1; continue; }
+        if ((end_opts || argv[i][0] != '-') && !src_file) { src_file = argv[i]; continue; }
+        if (end_opts || argv[i][0] != '-') {
+            fprintf(stderr, "Unexpected argument: %s\n", argv[i]); return 1;
         }
-
-        if ((end_of_options || argv[i][0] != '-') && !src_file) {
-            src_file = argv[i];
-            continue;
-        }
-
-        if (end_of_options || argv[i][0] != '-') {
-            fprintf(stderr, "Unexpected extra input file: %s\n", argv[i]);
-            return 1;
-        }
-
         if      (!strcmp(argv[i], "--binary"))   binary_mode = 1;
         else if (!strcmp(argv[i], "--dump-all")) dump_all    = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            asm_usage(stdout);
-            return 0;
+            asm_usage(stdout); return 0;
         }
         else if (!strcmp(argv[i], "-o")) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "-o requires a filename\n");
-                return 1;
-            }
-            out_file = argv[++i];
-            binary_mode = 1;
+            if (i+1 >= argc) { fprintf(stderr, "-o requires a filename\n"); return 1; }
+            out_file = argv[++i]; binary_mode = 1;
         }
         else if (!strcmp(argv[i], "-r")) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "-r requires a range like $F000-$FFFF (or F000-FFFF)\n");
-                return 1;
-            }
+            if (i+1 >= argc) { fprintf(stderr, "-r requires a range like $F800-$FFFF\n"); return 1; }
             if (!parse_hex_range(argv[++i], &range_start, &range_end)) {
-                fprintf(stderr, "Invalid range '%s' (expected $HHHH-$HHHH or HHHH-HHHH)\n", argv[i]);
-                return 1;
+                fprintf(stderr, "Invalid range '%s' (expected $HHHH-$HHHH)\n", argv[i]); return 1;
             }
-            range_enabled = 1;
+            range_on = 1;
         }
-        else {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
-            return 1;
-        }
+        else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
     }
 
-    if (!src_file) {
-        fprintf(stderr, "Missing input file.\n\n");
-        asm_usage(stderr);
-        return 1;
-    }
+    if (!src_file) { fprintf(stderr, "Missing input file.\n\n"); asm_usage(stderr); return 1; }
+    if (range_on && !binary_mode) { fprintf(stderr, "-r requires --binary or -o\n"); return 1; }
 
-    if (range_enabled && !binary_mode) {
-        fprintf(stderr, "-r requires --binary (or -o) output mode\n");
-        return 1;
-    }
-
-    /* read source file */
     FILE *f = fopen(src_file, "r");
     if (!f) { perror(src_file); return 1; }
     static char source[1024*1024];
@@ -1178,32 +1223,25 @@ int main(int argc, char **argv) {
     int ok = assemble(source);
 
     if (binary_mode) {
-        /* write flat 65536-byte image to stdout; errors to stderr */
         for (int i = 0; i < nerrors; i++) fprintf(stderr, "%s\n", errors[i]);
         if (!ok) return 1;
-        int out_start = range_enabled ? range_start : 0;
-        int out_end = range_enabled ? range_end : 0xFFFF;
-        size_t out_len = (size_t)(out_end - out_start + 1);
-        int rv = mem[0xFFFC] | (mem[0xFFFD] << 8);
+        int out_s = range_on ? range_start : 0;
+        int out_e = range_on ? range_end   : 0xFFFF;
+        size_t out_len = (size_t)(out_e - out_s + 1);
         if (out_file) {
             FILE *of = fopen(out_file, "wb");
-            if (!of) {
-                perror(out_file);
-                return 1;
-            }
-            fwrite(mem + out_start, 1, out_len, of);
+            if (!of) { perror(out_file); return 1; }
+            fwrite(mem + out_s, 1, out_len, of);
             fclose(of);
+            fprintf(stderr, "Assembled OK: %s -> %s  range=$%04X-$%04X  bytes=%zu  reset=$%04X\n",
+                    src_file, out_file, out_s, out_e, out_len,
+                    (unsigned)(mem[0xFFFC]|(mem[0xFFFD]<<8)));
         } else {
-            fwrite(mem + out_start, 1, out_len, stdout);
+            fwrite(mem + out_s, 1, out_len, stdout);
+            fprintf(stderr, "Assembled OK: range=$%04X-$%04X  bytes=%zu  reset=$%04X\n",
+                    out_s, out_e, out_len,
+                    (unsigned)(mem[0xFFFC]|(mem[0xFFFD]<<8)));
         }
-        fprintf(stderr,
-                "Assembled OK: input=%s output=%s range=$%04X-$%04X bytes=%zu reset=$%04X\n",
-                src_file,
-                out_file ? out_file : "stdout",
-                (unsigned)out_start,
-                (unsigned)out_end,
-                out_len,
-                (unsigned)rv);
         return 0;
     }
 
@@ -1215,7 +1253,6 @@ int main(int argc, char **argv) {
         printf("No errors.\n");
     }
 
-    /* key symbols */
     static const char *key_syms[] = {
         "INIT","MAIN","GETLINE","STMT","EXPR","STR_BANNER",
         "DO_PRINT","DO_LET","DO_IF","DO_GOTO","DO_INPUT",
