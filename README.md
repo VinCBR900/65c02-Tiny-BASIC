@@ -1,6 +1,6 @@
 # 6502/65C02 Tiny BASICs
 
-**Small Barely Functional BASICs for Nostalgic 6502ers**
+**Small Functional BASICs for Nostalgic 6502ers**
 
 This repository contains two Tiny BASIC interpreters for 6502/65C02 systems, along with a pure-C assembler and C simulator used to build and test them. Tiny BASICs are minimal BASIC interpreters from the dawn of home computing — see the original 1976 [Dr. Dobb's Journal Vol. 1](https://archive.org/details/dr_dobbs_journal_vol_01) for the history.
 
@@ -14,7 +14,7 @@ Time inevitably passed, then recently [Anthropic made a press release where Clau
 
 Both interpreters have been tested on the [Kowalski 65C02 Simulator](https://github.com/Kelmar/kowalski) — enable 65C02 mode and set terminal emulation to E00x, don't forget to click and type into the yellow Terminal window.
 
-> **Note:** Only the specific uBASIC6502.asm works on an NMOS 6502, 4kBASIC use 65C02 instructions (STZ, BRA, INC/DEC acc, indirect-zp LDA/STA). 
+> **Note:** Only the specific uBASIC6502.asm works on an NMOS 6502, 4kBASIC and uBASIC use 65C02 instructions (STZ, BRA, INC/DEC acc, indirect-zp LDA/STA). 
 
 ---
 
