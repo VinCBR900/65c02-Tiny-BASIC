@@ -61,7 +61,7 @@ A minimal but complete integer BASIC family. No tokeniser — program lines are 
 
 **Expressions:** `+` `-` `*` `/` `%`(mod) `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)` `CHR$(n)` `PEEK(addr)` `USR(addr)` variables `A`–`Z`
 
-Courtesy of [Sehugg and Mango 1](https://github.com/sehugg/mango_one), You can open this project in [8 Bit Workshop](https://8bitworkshop.com/v3.12.1/?repo=VinCBR900%2Fmango_one&platform=verilog&file=mango1.v) and try it Out! Type `LIST` to see the embedded BASIC program and `RUN` to execute it. 
+Courtesy of [Sehugg and Mango 1](https://github.com/sehugg/mango_one), You can open this project in [8 Bit Workshop](https://8bitworkshop.com/v3.12.1/?repo=VinCBR900%2Fmango_one&platform=verilog&file=mango1.v) and try it Out! Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing `ESC` aborts running program. 
 
 **Notes:** full conventional keywords are accepted by matching the first 2 letters and consuming trailing alphabetic characters; `HELP` and `FREE` are removed in this NMOS variant to keep ROM headroom.
 
