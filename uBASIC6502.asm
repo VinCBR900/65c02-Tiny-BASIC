@@ -1702,8 +1702,8 @@ PUTCH:   STA IO_OUT
 ; =============================================================================
 GETCH:   LDA IO_IN
          BEQ GETCH            ; spin until a char is available
-         JMP PUTCH            ; echo it, then return (tail call)
-
+         BNE PUTCH            ; Always taken - echo it, then return (tail call)
+                              ; Shoudl never get here
 ; =============================================================================
 ; USR_CALL / USR_RET  --  machine-code call helper for USR(addr) atom
 ;
