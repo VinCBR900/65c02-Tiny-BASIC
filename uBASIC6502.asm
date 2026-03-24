@@ -561,7 +561,9 @@ EL_GO:   LDY #1               ; compare stored line number hi-byte first
          CMP CURLN
          BCC EL_SKIP
          BEQ EL_FND            ; exact match: delete existing then (re)insert
-         JMP EL_INS
+         ; JMP EL_INS
+	BNE EL_INS		; always taken
+	
 EL_SKIP: LDY #2                ; advance LP to next line: scan for CR
 EL_LEN:  LDA (LP),Y
          INY
@@ -896,8 +898,9 @@ RUNGO:   JSR STMT_LINE         ; execute statement(s) on this line (honouring ':
 SK_LP:   JSR GETCI            ; advance IP past CR (SKIPEOL inlined)
          CMP #CR
          BNE SK_LP
-         JMP RUNLP
-
+         ; JMP RUNLP
+	BEQ RUNLP		; always taken
+	
 ; =============================================================================
 ; DO_END  --  END  :  halt program execution and return to immediate mode
 ;
@@ -1075,8 +1078,9 @@ EQ_OP:   JSR GETCI            ; consume '='
          LDA T1+1
          CMP T0+1
          BEQ REL_T
-EQ_F:    JMP REL_F
-
+EQ_F:    ; JMP REL_F
+	BNE REL_F		; always taken
+	
 ; --- LT_OP  ( <  also entry for <=  <> ) ---
 LT_OP:   JSR GETCI            ; consume '<'
          LDY #0
@@ -1092,8 +1096,9 @@ LT_OP:   JSR GETCI            ; consume '<'
          LDA T1+1
          SBC T0+1
          BMI REL_T
-         JMP REL_F
-
+         ; JMP REL_F
+	 BPL REL_F	; always taken
+	 
 ; --- NE_OP  ( <> ) ---
 NE_OP:   JSR GETCI            ; consume '>'
          JSR REL_SETUP
@@ -1103,8 +1108,9 @@ NE_OP:   JSR GETCI            ; consume '>'
          LDA T1+1
          CMP T0+1
          BNE REL_T
-         JMP REL_F
-
+         ; JMP REL_F
+	BPL REL_F	; always taken
+	 
 ; --- LE_OP  ( <= ) ---
 LE_OP:   JSR GETCI            ; consume '='
          JSR REL_SETUP        ; T0 - T1; negative means T0 < T1, i.e. NOT <=
@@ -1138,8 +1144,9 @@ GT_OP:   JSR GETCI            ; consume '>'
          LDA T0+1
          SBC T1+1
          BMI REL_T
-         JMP REL_F
-
+         ; JMP REL_F
+	BPL REL_F	; always taken
+	 
 ; --- GE_OP  ( >= ) ---
 GE_OP:   JSR GETCI            ; consume '='
          JSR REL_SETUP        ; T1 - T0; negative means T1 < T0, i.e. NOT >=
@@ -1149,8 +1156,9 @@ GE_OP:   JSR GETCI            ; consume '='
          LDA T1+1
          SBC T0+1
          BMI REL_F
-         JMP REL_T
-
+        ; JMP REL_T
+	BPL REL_T	; always taken
+	 
 ; =============================================================================
 ; EXPR_ADD  --  additive level: + and -
 ;
@@ -1339,6 +1347,7 @@ EXPR2:
          CMP #'('
          BNE E2_NOT_PAR
          JMP E2_PAR
+         
 E2_NOT_PAR:
          CMP #'-'
          BEQ E2_NEG
@@ -1361,6 +1370,7 @@ E2_NOTCHRS:
          LDA #0
          STA T0+1
          RTS
+
 E2_NOT_PEEK:
          LDA #<KW_USR
          JSR MTCHKW           ; matched "USR"?
@@ -1372,6 +1382,7 @@ E2_NOT_PEEK:
          LDA T0+1
          STA T2+1
          JMP USR_CALL         ; tail-call; JMP(T2), user RTS -> USR_RET
+
 E2_NOT_USR:
          LDY #0
          LDA (IP),Y           ; peek next char without consuming
@@ -1380,7 +1391,7 @@ E2_NOT_USR:
          CMP #'9'+1
          BCS E2_VAR
          JMP PNUM             ; tail call: parse decimal literal -> T0
-
+	
 E2_BAD:  LDA #0               ; unrecognised atom: return 0 (no error)
          STA T0
          STA T0+1
