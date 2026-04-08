@@ -1,2552 +1,1889 @@
-; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v1.11 - BUG-SCA-12: *SWSTK→SWSTK in DO_RUN; BUG-SCA-13: inline labels split
+; =============================================================================
+; uBASIC6502 v1.1  --  2 KB Tiny BASIC (NMOS 6502)
 ;
-; Initial Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
-;   Code base $0440.  Variables pinned at $1500 (ORG).  Program store $15B8+.
-;   I/O via PIPBUG ROM entry points (BSTA,UN):
-;     COUT $02B4  — output char in R0
-;     CHIN $0286  — blocking input, char returned in R0
-;     CRLF $008A  — emit CR+LF (R0 not significant on entry or exit)
+; Derived from uBASIC 65C02 v17.0, refactored for NMOS 6502 mnemonics and
+; 2-byte keyword-prefix matching while retaining support for conventional
+; full BASIC keywords in source input.
 ;
-; Assembler: asm2650.c v1.6   Simulator: sim2650.c v1.9
-; Build:
-;   gcc -Wall -O2 -o asm2650 asm2650.c
-;   gcc -Wall -O2 -o sim2650 sim2650.c
-;   ./asm2650 uBASIC2650.asm uBASIC2650.hex
-;   ./sim2650 --pipbug uBASIC2650.hex
-;   ./sim2650 --pipbug -t uBASIC2650.hex             # CPU trace
-;   ./sim2650 --pipbug -b 0xADDR uBASIC2650.hex      # breakpoint
-;   ./sim2650 --pipbug -m 0xADDR LEN uBASIC2650.hex  # mem dump at halt
+; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
-; NOTE: Winarcadia assembler expects LABELS: to be on a dedicated line
+; Statements accepted (full or 2-letter prefix):
+;   PRINT  IF..THEN  GOTO  LIST  RUN  NEW  INPUT  REM  END  LET  POKE
+;   (also PR IF GO LI RU NE IN RE EN LE PO)
 ;
-; CC SEMANTICS (2650 ALU — SUB sets opposite of most CPUs):
-;   ADD: no-carry->GT  carry+zero->EQ  carry+nonzero->LT
-;   SUB: no-borrow+nonzero->GT  no-borrow+zero->EQ  borrow->LT
-;   Carry skip:  BCTA,GT lbl  (GT = C=0 = no carry)
-;   Borrow skip: BCFA,LT lbl  (NOT LT = no borrow, covers GT+EQ)
+; Expressions:
+;   + - * / %   = < > <= >= <>   unary -
+;   CHR$(n)   PEEK(addr)   USR(addr)   A-Z variables
 ;
-; HI/LO OPERATOR CONVENTION (WinArcadia / asm2650.py standard):
-;   <ADDR = HIGH byte (bits 15:8)   e.g. <$1584 = $15
-;   >ADDR = LOW  byte (bits  7:0)   e.g. >$1584 = $84
+; Numbers      : signed 16-bit  (-32768 .. 32767)
+; String print : "literals" and CHR$() only; no string variables
 ;
-; DO_ERROR convention: LODI,R0 <code>; BCTA,UN DO_ERROR
-;   Saves RUNFLG, clears run state, then BCTA,UN REPL (flushes hardware RAS).
+; Error codes (printed as "?N"):
+;   ?0  syntax / bad expression
+;   ?1  undefined line number
+;   ?2  division or modulo by zero
+;   ?3  out of memory
+;   ?4  bad variable name in LET
 ;
-; RAS DEPTH BUDGET (8-level hardware stack, shared by BSTA and BSTR):
-;   PIPBUG COUT: uses BSTR DLAY inside = caller+2. CRLF: BSTR COUT→BSTR DLAY = caller+3.
-;   PIPBUG CHIN: uses BSTR DLAY/DLY inside = caller+2.
-;   Our deepest path: STMT_EXEC(1)→PARSE_EXPR(2)→APPLY_OP(3)→MUL16(4)→INC_EXP(5)
-;                  or STMT_EXEC(1)→PRINT_S16(2)→COUT(3)→[BSTR DLAY inside COUT](4)
-;   Verified max depth = 5. Limit = 8. Margin = 3. DO_IF adds 2 more → max 7. Safe.
+; ---- ROM memory map ---------------------------------------------------------
+;   $F800          JMP INIT trampoline (Kowalski compatibility)
+;   $F803..$F85B   string / keyword table  (all on page $F8)
+;   $F85C..$FFE0   interpreter code  (2017 bytes in current build)
+;   $FFE1..$FFF9   free (25 bytes)
+;   $FFFC..$FFFF   reset / IRQ vectors
 ;
-; SCRATCH REGISTER ALLOCATION:
-;   SC0:SC1   — general scratch; clobbered by STMT_EXEC (do NOT use for inter-
-;               statement state — see BUG-BASIC-13)
-;   SWSTK[0:1] ($152E:$152F) — DO_RUN next-line-pointer save across STMT_EXEC
-;   LNUMH:LNUML — scratch line number; also used as save in DO_LIST (BUG-BASIC-12)
-;   R2        — never written by any routine; safe as long-lived scratch
-;   TMPH:TMPL — general 16-bit temp; clobbered by PRINT_S16 (loads DIVTAB ptr)
+; ---- zero-page layout -------------------------------------------------------
+;   $00-$01  IP     interpreter pointer (into IBUF or program store)
+;   $02-$03  PE     program end pointer (one past last program byte)
+;   $04-$05  LP     line pointer / multi-purpose scratch pointer
+;   $06-$07  T0     primary scratch word / expression result
+;   $08-$09  T1     secondary scratch word
+;   $0A-$0B  T2     tertiary scratch word / STMT indirect-jump target
+;   $0C-$0D  CURLN  currently-executing line number
+;   $0E      RUN    run flag: $00 = immediate mode, $FF = program running
+;   $0F      OP     saved operator for MUL/DIV/MOD kernel ('*', '/', '%')
+;   $10-$2F  IBUF   input line buffer (32 bytes)
+;   $30-$4F  --     free RAM
+;   $50-$8B  VARS   A-Z variable store (2 bytes each, 52 bytes total)
+;   $8C      RUNSP  stack-pointer snapshot for GOTO / BREAK unwind
 ;
-; Change history:
-;   v1.11 BUG-SCA-12 FIXED: DO_RUN next-line-pointer save/restore used
-;           STRA,R0 *SWSTK / LODA,R0 *SWSTK (indirect — dereferences the value
-;           stored AT SWSTK as a pointer, then accesses that address). After
-;           CLRV, SWSTK=$00:$00, so the first RUN wrote the next-line pointer
-;           hi byte into PIPBUG ROM at $0000. Fix: STRA,R0 SWSTK / LODA,R0 SWSTK
-;           (direct), matching the correct SWSTK+1 usage on adjacent lines.
-;         BUG-SCA-13 FIXED: WinArcadia assembler requires labels to be on their
-;           own dedicated line (per header comment). Three labels had code on the
-;           same line: UC_DO:, UC_RET:, EW_DS:. WinArcadia silently dropped the
-;           instruction on the label line, so UC_DO jumped to RETC,UN instead of
-;           SUBI,R0 32 — lowercase input was never uppercased, so every keyword
-;           scan failed and every direct command returned ?0. Fix: split all
-;           three labels onto their own lines.
-;   v1.10 BUG-SCA-11 FIXED: BDRR/BDRA semantics are rn--; if(rn!=0) branch —
-;           exit when rn hits zero (not signed underflow to $FF as previously
-;           assumed). All v1.9 BDRR conversions that load a count from memory
-;           (bodylen, shift count) are correct because N iterations occur for
-;           load value N. Two sites had hardcoded wrong loads:
-;           (a) CLRV: load was $33 → only 51 iterations, missing last VARS byte
-;               at $15B7. Fix: load $34 for 52 iterations.
-;           (b) PU16_M10: load was 9 → only 9 multiplications (off by 1 in
-;               every multi-digit number). Fix: load 10 for 10 iterations.
-;           Also corrected all BDRR loop comments to say "if R3!=0 branch"
-;           instead of "while R3>=0 signed".
-;   v1.9  BUG-SCA-01 FIXED: CLRV loop used BRNR,R3 (pure test, no decrement) →
-;           infinite loop on startup. R3 never reached zero. Fix: BDRR,R3 with
-;           initial load adjusted for BDRR semantics (exits after N+1 iters when
-;           loaded with N; load $33 for 52 clears, guard zero case not needed as
-;           VARS is always 52 bytes). Label CLRV_NC removed (no longer needed).
-;         BUG-SCA-02 FIXED: DO_LIST DLS_BLPX body-print loop used BRNR,R3 →
-;           infinite loop printing first byte of every stored line body.
-;           Fix: BDRR,R3. R3 loaded from memory; guard COMI,R3 $00 / BCTA,EQ
-;           DLS_NL before loop entry retained (BDRR with R3=0 would execute once).
-;           Label DLS_BNC removed.
-;         BUG-SCA-03 FIXED: DO_RUN DR_CPY copy-to-IBUF loop used BRNR,R3 →
-;           infinite loop copying line body. Fix: BDRR,R3.
-;           Labels DR_TNC, DR_INC removed.
-;         BUG-SCA-04 FIXED: STORE_LINE SL_SHLOOP shift loop used BRNR,R3 →
-;           infinite loop during any line insertion that requires shifting.
-;           Fix: BDRR,R3. Existing zero-count guard (COMI,R3 / BCTA,EQ SL_NOSHIFT)
-;           at loop entry retained (BDRR with R3=0 executes once).
-;         BUG-SCA-05 FIXED: STORE_LINE SL_WBODY write-body loop used BRNR,R3 →
-;           infinite loop writing body bytes. Fix: BDRR,R3.
-;           Labels SL_WBNC, SL_WENC removed.
-;         BUG-SCA-06 FIXED: FIND_LINE FL_AS advance loop used BRNR,R3 →
-;           infinite loop advancing past body bytes; search never found any line
-;           beyond the first record. Fix: BDRR,R3. Label FL_ASN removed.
-;         BUG-SCA-07 FIXED: FIND_INS FI_AS advance loop — same as BUG-SCA-06.
-;           Fix: BDRR,R3. Label FI_ASN removed.
-;         BUG-SCA-08 FIXED: DELETE_LINE DL2_SKIP advance loop used BRNR,R3 →
-;           infinite loop; deletion never found copy start. Fix: BDRR,R3.
-;           Label DL2_SN removed.
-;         BUG-SCA-09 FIXED: MUL16 right-operand abs() NEGFLG toggle was inside
-;           the carry path only (BCTA,GT jumped over both the hi-byte increment
-;           AND the EORI/STRA toggle). For most negative right values (e.g. -3:
-;           abs complement+1 = no carry), NEGFLG was never toggled, giving wrong
-;           sign: 3*(-3)=+9 instead of -9. Fix: introduce MU_RA_NC label so the
-;           no-carry path skips only the hi-byte increment but falls through to
-;           the NEGFLG toggle. Same fix applied to DIV16 DV_VA block (BUG-SCA-09b).
-;         BUG-SCA-10 FIXED: PARSE_U16 multiply-by-10 loop used BRNR,R3 with
-;           LODI,R3 10 — R3 never decremented, so any number with 2+ digits
-;           entered an infinite loop during parsing. Fix: BDRR,R3 with load
-;           adjusted to 9 (BDRR gives 10 iterations: 9→8→...→0→exit).
-;   v1.8  ISSUE-01 RE-FIX: MUL16/DIV16 NEGFLG placement was still wrong.
-;           The LODI,R0 1 / STRA,R0 NEGFLG in v1.7 was placed after the
-;           hi-byte carry increment, which is only reached on carry. For
-;           values like -3 ($FFFD): XOR→$0002, +1→$0003 — no carry, so
-;           BCTA,GT branched past NEGFLG=1 to MU_LA/DV_DA. Sign was lost,
-;           result printed positive. Fix: introduce MU_LNC/DV_DNC labels,
-;           branch there on carry (skipping hi-byte inc), then BOTH paths
-;           fall into LODI,R0 1 / STRA,R0 NEGFLG before MU_LA/DV_DA.
-;   v1.7  ISSUE-03 FIXED: DO_GOTO set GOTOFLG=$00 (EORZ/STRA) instead of $01.
-;           GOTO was silently ignored during RUN — DR_GOTO path never triggered.
-;           Fix: LODI,R0 1 / STRA,R0 GOTOFLG.
-;         ISSUE-01 FIXED: MUL16/DIV16 NEGFLG reset bug. The abs(left) block
-;           contained EORZ,R0 / STRA,R0 NEGFLG AFTER the two's-complement
-;           negation carry propagation step. This unconditionally cleared NEGFLG
-;           to zero even after it had been set to 1 for a negative left operand.
-;           Net effect: negative×anything gave wrong sign (e.g. -3*2=6 not -6).
-;           Fix: replace EORZ/STRA in abs(left) blocks with LODI,R0 1 / STRA,R0
-;           NEGFLG in both MUL16 and DIV16.
-;         ISSUE-02 FIXED: STORE_LINE shift-dest carry corrupted GOTOH.
-;           After ADDA,R0 SC1 / STRA,R0 GOTOL, the carry from the low-byte add
-;           was lost when LODA,R0 LNUMH loaded LNUMH (clobbering CC). The
-;           subsequent BCTA,GT SL_DSNCA tested LNUMH's sign/zero, not carry.
-;           Fix: test carry with BCTA,GT before LODA, duplicate LODA on both
-;           paths (carry / no-carry), store GOTOH on both paths.
-;         ISSUE-05 FIXED: PARSE_RELOP no-match path returned ERRFLG=$00 (success)
-;           when no relop character found. DO_IF proceeded as if relop was valid,
-;           using the previous RELOP value — silent wrong comparison.
-;           Fix: set ERRFLG=$01 before RETC,UN on the no-match path.
-;         ISSUE-04 FIXED: SE_SCAN / SE_C2N table-advance used BCTR,GT (relative
-;           short branch) to skip TMPH hi-byte increment, but CC after STRA is
-;           set by the stored value not the carry. Replaced with carry-safe idiom:
-;           test carry via BCTA,GT before STRA, then branch two paths.
-;           Note: practical risk was near-zero (KW_TAB <64B, no page wrap), but
-;           corrected for correctness.
-;         ISSUE-06 FIXED: Removed redundant second NUL check in RDLINE. After
-;           BUG-ASM-08 fix (v1.6), the first NUL check at RL_LP entry catches
-;           EOF. The second check after RL_STORE was unreachable dead code.
-;   v1.6  BUG-BASIC-14 FIXED: DO_LET variable letter saved to SC0 before
-;           PARSE_EXPR, but PARSE_EXPR clobbers SC0 (operator stack writes it
-;           repeatedly). DL_STORE read the token id, not the letter. All LET
-;           statements wrote to the wrong VARS slot.
-;           Fix: STRZ,R2 saves letter to R2 (never written by any routine);
-;           DL_STORE restores with LODZ,R2 before computing VARS address.
-;           DO_INPUT also updated for consistency.
-;         BUG-BASIC-15 FIXED: PF_LOADVAR saved variable letter to SC0, called
-;           INC_IP (clobbers R0 with new IPL), then used R0 directly for the
-;           VARS offset calculation instead of reloading from SC0.
-;           Fix: LODA,R0 SC0 added after INC_IP call.
-;         BUG-BASIC-16 FIXED: All 15 indexed VARS/stack accesses used
-;           STRA,R1 TMPL after ADDZ,R1. ADDZ,R1 means R0 += R1 (ends-in-Z
-;           affects R0); R1 is unchanged. Storing R1 always wrote the base
-;           address low byte, not the computed offset. This is the v1.4
-;           BUG-BASIC-07 "fix" applied backwards — it swapped R0→R1 but R0
-;           is correct (R0 holds the sum after ADDZ). The original code was
-;           right; the v1.4 fix broke it. All 15 STRA,R1 TMPL → STRA,R0 TMPL.
-;         BUG-ASM-08 FIXED: RDLINE entered infinite NUL loop after stdin EOF.
-;           GETKEY returns NUL ($00) forever once stdin is exhausted. RDLINE
-;           stored NULs filling IBUF, then overflowed into VARS ($1584+),
-;           zeroing variable values set by LET during RUN. This is why LET
-;           worked (confirmed by watchpoint at $1585) but the value was then
-;           clobbered before PRINT could read it.
-;           Fix: added COMI,R0 NUL / BCTA,EQ RL_EOL immediately after GETKEY
-;           in RL_LP. NUL from stdin EOF is treated as end-of-line.
-;   v1.5  BUG-BASIC-09 FIXED: TRY_STORE_LINE/TSL_DONE cleared ERRFLG to $00
-;           after storing a numbered line. REPL checks ERRFLG=$01 to skip
-;           execution, so every stored line was immediately executed too.
-;           Fix: TSL_DONE sets ERRFLG=$01.
-;         BUG-BASIC-10 FIXED: FIND_LINE never set ERRFLG=$01 for "not found".
-;           ERRFLG was cleared at entry and never set to $01; FL_RET returned
-;           with ERRFLG=$00 (same as "found"), so DELETE_LINE always believed
-;           a line existed and corrupted the program store on every STORE_LINE.
-;           Fix: FL_RET sets ERRFLG=$01 before returning.
-;         BUG-BASIC-11 FIXED: FIND_INS used BCTA,UN FI_RET on both GT and EQ
-;           hi-byte compare, making the lo-byte check dead code. Lines sharing
-;           the same hi byte (e.g. 10 and 20, both hi=$00) were always inserted
-;           at the first record found, corrupting sort order.
-;           Fix: BCTA,GT FI_RET so EQ falls through to lo-byte comparison.
-;         BUG-BASIC-12 FIXED: DO_LIST called PRINT_S16 without saving TMPH:TMPL.
-;           PRINT_S16 loads DIVTAB address into TMPH:TMPL, destroying the LIST
-;           iterator. Result: infinite loop printing garbage after first line
-;           number. Fix: save/restore TMPH:TMPL via LNUMH:LNUML around call.
-;         BUG-BASIC-13 FIXED: DO_RUN saved the next-line pointer in SC0:SC1,
-;           but SC0:SC1 are general scratch clobbered by STMT_EXEC (PRINT_S16,
-;           STORE_LINE, parser all write SC0/SC1). After executing any line the
-;           restored TMPH:TMPL was garbage, causing RUN to jump to a random
-;           address. Fix: save next-line pointer in SWSTK[0:1] ($152E:$152F),
-;           which are unused until GOSUB is implemented.
-;   v1.4  BUG-BASIC-07 (INCORRECTLY FIXED — re-fixed in v1.6 above):
-;           Changed STRA,R0 TMPL to STRA,R1 TMPL, believing ADDZ,R1 stored
-;           the result in R1. Correct understanding: ADDZ,R1 = R0 += R1.
-;   v1.3  BUG-BASIC-03..06, BUG-ASM-04/06/10 fixed (see earlier sessions).
-;   v1.2  BUG-BASIC-01: All HI/LO operators corrected (66 swapped lines).
-;   v1.1  Initial PIPBUG 1 port.
+; ---- program storage --------------------------------------------------------
+;   Base $0200; ceiling RAM_TOP ($1000 for 4 KB SRAM).
+;   Line format:  <lineno_lo> <lineno_hi> <raw ASCII body> <CR>
+;   No tokenisation; body bytes are stored exactly as typed.
+;
+; ---- Kowalski simulator note ------------------------------------------------
+;   Kowalski v2.x executes from the first assembled byte rather than the
+;   reset vector.  A JMP INIT trampoline at $F800 bridges over the
+;   string table so both Kowalski and real hardware work identically.
+;
+; ---- ROM / no-showcase note -------------------------------------------------
+;   To start with an empty program store (no pre-loaded showcase), change
+;   the two lines in INIT that load SHOWCASE_END into PE to instead load PROG:
+;     LDA #<SHOWCASE_END  ->  LDA #<PROG
+;     LDA #>SHOWCASE_END  ->  LDA #>PROG
+;
+; ---- version lineage --------------------------------------------------------
+; 65C02 base:
+;   v17.0 (Mar 2026)  comment cleanup/public release baseline.
+;
+; NMOS 6502 branch:
+;   v1.0  (Mar 2026)  6502-mnemonic port + 2-byte keyword-prefix matcher.
+;                     Full BASIC keywords remain accepted because MTCHKW
+;                     matches first two letters then consumes trailing
+;                     alphabetic characters in the token.
+;   v1.1  (Mar 2026)  Three fixes ported from mango_one repo:
+;                     (A) BUG FIX: EXPR_ADD EA_DO operator-save corrected.
+;                         v1.0 pushed T0-lo twice and lost the operator char,
+;                         causing wrong results for multi-term subtraction.
+;                         Fixed: TAX saves operator before A is clobbered.
+;                         Also saves 1 byte (9->8 bytes in EA_DO preamble).
+;                     (B) DO_LIST: added LP>=PE safety guard inside LS_BODY
+;                         loop; prevents infinite listing if a line is missing
+;                         its CR terminator (corrupted program store).
+;                     (C) Showcase Mandelbrot: column scan range narrowed from
+;                         -128..16 to -120..4 for a better-centred render.
+;                     (D) STR_BANNER updated to "uBASIC6502 v1.1".
+; =============================================================================
+;
+; ---- assembler mode ---------------------------------------------------------
+         .opt proc6502
 
-; ─── ASCII ────────────────────────────────────────────────────────────────────
-CR      EQU     $0D
-LF      EQU     $0A
-BS      EQU     $08
-SP      EQU     $20
-NUL     EQU     $00
-DQ      EQU     $22
+; ---- hardware I/O ports (Kowalski simulator UART) ----------------------------
+IO_OUT   = $E001             ; UART output: write character to terminal
+IO_IN    = $E004             ; UART input:  read character (0 = no char ready)
+IO_IRQ   = $E007             ; write any value to fire a maskable hardware IRQ
 
-; ─── PIPBUG 1 I/O entry points ────────────────────────────────────────────────
-COUT    EQU     $02B4   ; putchar: R0 = char to output
-CHIN    EQU     $0286   ; getchar: blocking: R0 =  key
-CRLF    EQU     $008A   ; print CR+LF (no registers used/changed)
+; ---- RAM ceiling -------------------------------------------------------------
+RAM_TOP  = $1000             ; first address above usable SRAM (4 KB)
 
-; ─── RAM variables — pinned above code, below PROGLIM ────────────────────────────────────────────────────
-; BUG-ASM-10 FIX: Addres $1500 pins variables regardless of code growth.
-; Code ceiling: ~$14FF (code must not reach $1500 or assembler will error).
-; Variables: $1500-$15B8 (185 bytes). Program store: $15B9-$1BFF (1607 bytes).
-IPH     EQU $1500   ; interpreter pointer hi
-IPL     EQU $1501   ; interpreter pointer lo
-PEH     EQU $1502   ; program end pointer hi
-PEL     EQU $1503   ; program end pointer lo
-RUNFLG  EQU $1504   ; $01=running $00=immediate
-GOTOFLG EQU $1505   ; $01=GOTO/GOSUB pending
-GOTOH   EQU $1506   ; pending target line hi
-GOTOL   EQU $1507   ; pending target line lo
-CURH    EQU $1508   ; current line hi  (error reporting)
-CURL    EQU $1509   ; current line lo
-LNUMH   EQU $150A   ; scratch line number hi
-LNUML   EQU $150B   ; scratch line number lo
-SC0     EQU $150C   ; scratch byte 0
-SC1     EQU $150D   ; scratch byte 1
-ERRFLG  EQU $150E   ; error flag $00=ok $01=error/handled
-NEGFLG  EQU $150F   ; sign / CHR$ flag
-EXPH    EQU $1510   ; expression result hi
-EXPL    EQU $1511   ; expression result lo
-TMPH    EQU $1512   ; temp 16-bit hi
-TMPL    EQU $1513   ; temp 16-bit lo
-OPSTK   EQU $1514   ; operator stack [8]  $1514-$151B
-VALSH   EQU $151C   ; value stack hi  [8]  $151C-$1523
-VALSL   EQU $1524   ; value stack lo  [8]  $1524-$152B
-STKIDX  EQU $152C   ; parser stack top ($FF=empty)
-SWSP    EQU $152D   ; SW call stack pointer ($FF=empty)
-SWSTK   EQU $152E   ; SW call stack 8×2 bytes  $152E-$153D
-RELOP   EQU $153E   ; relational op 1-6
-IBUF    EQU $1544   ; input buffer 64 bytes  $1544-$1583
-VARS    EQU $1584   ; A-Z variables 2 bytes each  $1584-$15B7
-PROG    EQU $15B8   ; program store base
-PROGLIM EQU $1c00   ; one past end of program store
+; ---- zero-page symbols -------------------------------------------------------
+IP       = $00               ; 16-bit: interpreter pointer
+PE       = $02               ; 16-bit: program end (one past last byte)
+LP       = $04               ; 16-bit: line pointer / multi-purpose scratch
+T0       = $06               ; 16-bit: primary scratch word / expression result
+T1       = $08               ; 16-bit: secondary scratch word
+T2       = $0A               ; 16-bit: tertiary scratch word / STMT jump target
+CURLN    = $0C               ; 16-bit: currently-executing line number
+RUN      = $0E               ; 8-bit:  run flag ($00 = immediate, $FF = running)
+OP       = $0F               ; 8-bit:  saved operator for MUL/DIV/MOD ('*'/'/'/'%')
+IBUF     = $10               ; 32-byte input line buffer
+VARS     = $50               ; 52-byte variable store (A-Z, 2 bytes each)
+RUNSP    = $8C               ; 8-bit:  stack-pointer snapshot for GOTO/BREAK unwind
 
-; ─── CODE starts at $0440 (after Pipbug 1kB ROM + 64B RAM) ───────────────────
-        ORG     $0440
+; ---- program store base ------------------------------------------------------
+PROG     = $0200
 
-; ─── RESET / ENTRY ────────────────────────────────────────────────────────────
-RESET:
-        LODI,R0 <PROG
-        STRA,R0 PEH
-        LODI,R0 >PROG
-        STRA,R0 PEL
-        LODI,R0 $FF
-        STRA,R0 SWSP
-        EORZ,R0 ; Clear R0
-        STRA,R0 RUNFLG
-        STRA,R0 GOTOFLG
-        ; clear A-Z variables (52 bytes) using IPH:IPL as scratch pointer
-        LODI,R0 <VARS
-        STRA,R0 IPH
-        LODI,R0 >VARS
-        STRA,R0 IPL
-; BUG-SCA-01 FIX: was LODI,R3 $34 / BRNR,R3 — BRNR never decrements R3.
-; BUG-SCA-11 FIX: BDRR semantics are rn--; if(rn!=0) branch — exits when rn
-; hits zero. Load N for exactly N iterations: $34→$33→...→$01→$00→exit = 52.
-        LODI,R3 $34             ; 52 iterations: R3 counts $34→$33→...→$01→$00→exit
-CLRV:
-        EORZ,R0 ; Clear R0
-        STRA,R0 *IPH
-        BSTA,UN INC_IP
-        BDRR,R3 CLRV            ; R3--; if R3!=0 branch
-        LODI,R0 <BANNER
-        STRA,R0 IPH
-        LODI,R0 >BANNER
-        STRA,R0 IPL
-        BSTA,UN PRTSTR
+; ---- error codes -------------------------------------------------------------
+ERR_SN   = 0                 ; syntax / bad expression
+ERR_UL   = 1                 ; undefined line number
+ERR_OV   = 2                 ; division or modulo by zero
+ERR_OM   = 3                 ; out of memory
+ERR_UK   = 4                 ; bad variable name in LET
 
-; ─── REPL ────────────────────────────────────────────────────────────────────
-REPL:
-        LODI,R0 A'>'
-        BSTA,UN COUT
-        LODI,R0 SP
-        BSTA,UN COUT
-        BSTA,UN RDLINE
-        LODI,R0 <IBUF
-        STRA,R0 IPH
-        LODI,R0 >IBUF
-        STRA,R0 IPL
-        BSTA,UN TRY_STORE_LINE
-        LODA,R0 ERRFLG
-        COMI,R0 $01
-        BCTA,EQ REPL
-        BSTA,UN STMT_EXEC
-        BCTR,UN REPL
+; ---- miscellaneous constants -------------------------------------------------
+IBUF_MAX = 31                ; highest valid index into IBUF
+VARS_MAX = $3B               ; highest X index for variable clear loop ($50..$8B)
+CR       = $0D               ; ASCII carriage return
+LF       = $0A               ; ASCII line feed
+BS       = $08               ; ASCII backspace
 
-; ─── TABLES ───────────────────────────────────────────────────────────────────
-BANNER:
-        DB CR, LF
-        DB A'u',A'B',A'A',A'S',A'I',A'C',A' ',A'2',A'6',A'5',A'0',A' ',A'v',A'1',A'.',A'0'
-        DB CR, LF, NUL
+; =============================================================================
+; ROM START  ($F800)
+; =============================================================================
+         .ORG $F800
 
-; Keyword table: [c1][c2][token]  NUL-terminated.
-; Matched on first two uppercase chars; EATWORD skips the rest.
-; Token 11 (THEN) matched internally by DO_IF — not dispatched here.
+; Kowalski trampoline: Kowalski executes from the first assembled byte rather
+; than the reset vector.  Real hardware reaches INIT via $FFFC instead.
+ROMSTART:
+         JMP INIT
+
+; =============================================================================
+; STRING / KEYWORD TABLE  (page $F8, $F802 onward)
+;
+; All strings and 2-byte keyword entries are kept on STR_PAGE ($F8).
+; PUTSTR uses STR_PAGE as the fixed hi-byte, and MTCHKW sets T1+1 to STR_PAGE
+; when reading keyword bytes by (T1),Y.
+;
+; TERMINATION: the last byte of every string has bit 7 set (value |= $80).
+;   PUTSTR strips bit 7 with AND #$7F before printing the final character.
+;   All string content is 7-bit ASCII so bit 7 never occurs naturally --
+;   the scheme is unambiguous.
+;
+; Named T_x constants are used for bit-7-set final characters because the
+; Kowalski assembler cannot evaluate "ch"|$80 inside a .DB argument.  Each
+; constant is simply the ASCII value plus 128 (addition equals OR here since
+; all base characters are below $80).
+; =============================================================================
+STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string and keyword addresses
+
+; ---- bit-7 terminal-character constants -------------------------------------
+; Naming: T_<char>  where <char> is the ASCII letter or symbol.
+T_LF  = 138              ; $0A + $80  (LF  -- final byte of STR_CRLF)
+T_SP  = 160              ; $20 + $80  (' ' -- final byte of STR_IN)
+T_D   = 196              ; $44 + $80  ('D' -- END)
+T_E   = 197              ; $45 + $80  ('E' -- NE, RE, LE, PE)
+T_F   = 198              ; $46 + $80  ('F' -- IF)
+T_H   = 200              ; $48 + $80  ('H' -- TH, CH)
+T_I   = 201              ; $49 + $80  ('I' -- LI)
+T_K   = 203              ; $4B + $80  ('K' -- BREAK, PEEK)
+T_M   = 205              ; $4D + $80  ('M' -- REM)
+T_N   = 206              ; $4E + $80  ('N' -- RUN, THEN)
+T_O   = 207              ; $4F + $80  ('O' -- GO, PO)
+T_P   = 208              ; $50 + $80
+T_R   = 210              ; $52 + $80  ('R' -- USR)
+T_S   = 211              ; $53 + $80  ('S' -- US)
+T_T   = 212              ; $54 + $80
+T_U   = 213              ; $55 + $80  ('U' -- RU)
+T_W   = 215              ; $57 + $80  ('W' -- NEW)
+T_DS  = 164              ; $24 + $80  ('$' -- CHR$)
+
+; ---- human-readable strings -------------------------------------------------
+; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
+; v1.1: STR_BANNER updated from "uBASIC6502 v1.0" to "uBASIC6502 v1.1"
+STR_BANNER: .DB "uBASIC6502 v1.1"  ; startup banner; falls into STR_CRLF for CR+LF
+STR_CRLF:   .DB CR, T_LF       ; CR + LF
+STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
+STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
+
+; ---- keyword strings --------------------------------------------------------
+; Two uppercase ASCII bytes per keyword (no bit-7 terminator).
+; MTCHKW compares a 16-bit prefix and then skips trailing letters in input.
 KW_TAB:
-        DB A'P',A'R', 1   ; PRINT / PR
-        DB A'L',A'E', 2   ; LET   / LE
-        DB A'L',A'I', 3   ; LIST  / LI
-        DB A'R',A'E', 4   ; REM   / RE
-        DB A'R',A'U', 5   ; RUN   / RU
-        DB A'E',A'N', 6   ; END   / EN
-        DB A'I',A'N', 7   ; INPUT / IN
-        DB A'I',A'F', 8   ; IF
-        DB A'N',A'E', 9   ; NEW   / NE
-        DB A'G',A'O',10   ; GOTO  / GO
-        DB A'P',A'O',12   ; POKE  / PO
-        DB NUL
+KW_PRINT:   .DB 'P','R'
+KW_IF:      .DB 'I','F'
+KW_GOTO:    .DB 'G','O'
+KW_LIST:    .DB 'L','I'
+KW_RUN:     .DB 'R','U'
+KW_NEW:     .DB 'N','E'
+KW_INPUT:   .DB 'I','N'
+KW_REM:     .DB 'R','E'
+KW_END:     .DB 'E','N'
+KW_LET:     .DB 'L','E'
+KW_THEN:    .DB 'T','H'
+KW_CHRS:    .DB 'C','H'      ; opening '(' consumed separately by EAT_EXPR
+KW_POKE:    .DB 'P','O'
+KW_PEEK:    .DB 'P','E'
+KW_USR:     .DB 'U','S'
 
-; Divisor table for PRINT_S16: big-endian pairs, sentinel $0000
-DIVTAB:
-        DB $27,$10      ; 10000
-        DB $03,$E8      ;  1000
-        DB $00,$64      ;   100
-        DB $00,$0A      ;    10
-        DB $00,$00      ; sentinel
-
-; ─── STMT_EXEC ────────────────────────────────────────────────────────────────
-; Decode and dispatch one statement from IP.
-; RAS depth: 1 from REPL, or 3 from DO_IF (THEN body).
-; Worst inner depth from here: +4 (->DO_xxx->PARSE_EXPR->PARSE_FACTOR->UPCASE)
-STMT_EXEC:
-        BSTA,UN WSKIP                   ; [+1]
-        LODA,R0 *IPH
-        COMI,R0 NUL
-        ; BCTA,EQ SE_RET  ; blank line
-        RETC,EQ ; Blank line
-
-        BSTA,UN GETCI_UC
-        STRA,R0 SC0  ; [+1] char1 uppercase, IP advanced
-        BSTA,UN GETCI_UC
-        STRA,R0 SC1  ; [+1] char2 uppercase, IP advanced
-
-        ; scan KW_TAB with TMPH:TMPL as pointer
-        LODI,R0 <KW_TAB
-        STRA,R0 TMPH
-        LODI,R0 >KW_TAB
-        STRA,R0 TMPL
-SE_SCAN:
-        LODA,R0 *TMPH
-        COMI,R0 NUL
-        BCTA,EQ SE_SYNERR  ; end of table
-        SUBA,R0 SC0
-        BCTR,EQ SE_CHK2  ; c1 matches
-        ; ISSUE-04 FIX: advance 3 bytes to next entry with correct carry check.
-        ; Old code: ADDI/STRA/BCTR,GT — STRA clobbers CC, branch tests stored
-        ; value not carry. New code: test CC from ADDI before STRA.
-        LODA,R0 TMPL
-        ADDI,R0 3
-        BCTR,GT SE_SC_NC        ; GT = no carry
-        STRA,R0 TMPL
-        LODA,R0 TMPH
-        ADDI,R0 1
-        STRA,R0 TMPH
-        BCTA,UN SE_SCAN
-SE_SC_NC:
-        STRA,R0 TMPL
-        BCTA,UN SE_SCAN
-SE_CHK2:
-        ; advance to c2
-        BSTA,UN INC_TMP
-SE_C2N:
-        LODA,R0 *TMPH
-        SUBA,R0 SC1
-        BCTR,EQ SE_MATCH
-        ; c2 mismatch: ISSUE-04 FIX: advance 2 more bytes with correct carry check.
-        LODA,R0 TMPL
-        ADDI,R0 2
-        BCTR,GT SE_C2_NC        ; GT = no carry
-        STRA,R0 TMPL
-        LODA,R0 TMPH
-        ADDI,R0 1
-        STRA,R0 TMPH
-        BCTA,UN SE_SCAN
-SE_C2_NC:
-        STRA,R0 TMPL
-        BCTA,UN SE_SCAN
-SE_MATCH:
-        ; advance to token byte
-        BSTA,UN INC_TMP
-SE_TN:
-        LODA,R0 *TMPH
-        STRA,R0 SC0  ; SC0 = token id
-        BSTA,UN EATWORD                  ; [+1] consume remaining alpha chars
-
-        ; dispatch
-        LODA,R0 SC0
-        COMI,R0  1
-        BCTA,EQ DO_PRINT
-        COMI,R0  2
-        BCTA,EQ DO_LET
-        COMI,R0  3
-        BCTA,EQ DO_LIST
-        COMI,R0  4
-        BCTA,EQ DO_REM
-        COMI,R0  5
-        BCTA,EQ DO_RUN
-        COMI,R0  6
-        BCTA,EQ DO_END
-        COMI,R0  7
-        BCTA,EQ DO_INPUT
-        COMI,R0  8
-        BCTA,EQ DO_IF
-        COMI,R0  9
-        BCTA,EQ DO_NEW
-        COMI,R0 10
-        BCTA,EQ DO_GOTO
-SE_SYNERR:
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
-
-DO_NEW:
-        LODI,R0 <PROG
-        STRA,R0 PEH
-        LODI,R0 >PROG
-        STRA,R0 PEL
-        ; RETC,UN
-        ; drop through
-DO_END:
-        EORZ,R0 ; Clear R0
-        STRA,R0 RUNFLG
-        ; drop through
-; ─── SIMPLE STATEMENTS ────────────────────────────────────────────────────────
-SE_RET:
-DO_REM:
-        RETC,UN
-
-; ─── DO_PRINT ─────────────────────────────────────────────────────────────────
-; PRINT [item {, item}]    item = "string" | expr
-; CHR$ flag: NEGFLG=$01 after PARSE_FACTOR detects CHR$ — print EXPL as char.
-DO_PRINT:
-        BSTA,UN WSKIP                    ; [+1]
-        LODA,R0 *IPH
-        COMI,R0 NUL ; No opening " so just CRLF
-        BCTA,EQ DP_NL
-
-DP_ITEM:
-        BSTA,UN WSKIP                    ; [+1]
-        LODA,R0 *IPH
-        COMI,R0 DQ
-        BCTR,EQ DP_STRING
-        EORZ,R0 ; Clear R0
-        STRA,R0 NEGFLG  ; clear CHR$ flag before parse
-        BSTA,UN PARSE_EXPR               ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ DP_NUM
-        BSTA,UN PRTSTR_IP
-        BCTA,UN DP_NL  ; [+1] raw text fallback
-DP_NUM:
-        LODA,R0 NEGFLG
-        COMI,R0 $01
-        BCTR,EQ DP_CHAR
-        BSTA,UN PRINT_S16
-        BCTR,UN DP_SEP  ; [+1]
-DP_CHAR:
-        LODA,R0 EXPL
-        BSTA,UN COUT
-        BCTR,UN DP_SEP
-
-DP_STRING:
-        ; consume opening "
-        BSTA,UN INC_IP
-DP_SLP:
-        LODA,R1 *IPH
-        COMI,R1 NUL
-        BCTA,EQ DP_SDONE
-        COMI,R1 DQ
-        BCTR,EQ DP_SCLS
-        LODZ,R1
-        BSTA,UN COUT
-        BSTA,UN INC_IP
-        BCTR,UN DP_SLP
-DP_SCLS:
-        ; consume closing "
-        BSTA,UN INC_IP
-DP_SDONE:
-DP_SEP:
-        BSTA,UN WSKIP                    ; [+1]
-        LODA,R0 *IPH
-        COMI,R0 A','
-        BCTR,EQ DP_COMMA
-        BCTR,UN DP_NL
-DP_COMMA:
-        BSTA,UN INC_IP
-        BCTA,UN DP_ITEM
-DP_NL:
-        BSTA,UN CRLF
-        RETC,UN
-
-; ─── DO_LET / shared store path ───────────────────────────────────────────────
-; DO_INPUT jumps to DL_STORE with SC0 = variable letter already set.
-DO_LET:
-        BSTA,UN WSKIP                    ; [+1]
-        LODA,R0 *IPH
-        BSTA,UN UPCASE  ; [+1]
-        COMI,R0 A'A'
-        BCTR,LT DL_ERR
-        COMI,R0 A'Z'+1
-        BCTA,LT DL_VAROK
-DL_ERR:
-        LODI,R0 4
-        BCTA,UN DO_ERROR
-DL_VAROK:
-        STRA,R0 SC0                      ; save variable letter in SC0 (immediate use)
-        STRZ,R2                          ; BUG-BASIC-14 FIX: also save in R2 (STRZ stores R0→Rn).
-        ; SC0 is general scratch clobbered by PARSE_EXPR (operator-stack ops
-        ; write SC0 repeatedly). R2 is never written by any routine and
-        ; survives the full PARSE_EXPR call below.
-        BSTA,UN INC_IP
-DL_EQ:
-        BSTA,UN WSKIP                    ; [+1]
-        LODA,R0 *IPH
-        COMI,R0 A'='
-        BCTA,EQ DL_EQC
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
-DL_EQC:
-        BSTA,UN INC_IP
-DL_EX:
-        BSTA,UN PARSE_EXPR               ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ DL_STORE
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
-DL_STORE:
-        ; address = VARS + (SC0 - 'A') * 2
-        ; BUG-BASIC-14 FIX: restore variable letter from R2 (SC0 was clobbered
-        ; by PARSE_EXPR). R2 is caller-saved across PARSE_EXPR (never written
-        ; by any routine). DO_INPUT jumps here with letter already in SC0 and R2.
-        LODZ,R2                          ; R0 = variable letter (preserved in R2 across PARSE_EXPR)
-        STRA,R0 SC0                      ; resync SC0 for any code reading it below
-        SUBI,R0 A'A'  ; 0-25
-        STRA,R0 SC1
-        ADDA,R0 SC1  ; *2  (SC1 = index, R0 = index*2)
-        LODI,R1 >VARS
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <VARS
-        BCTR,GT DL_NC
-        ADDI,R0 1
-DL_NC:
-        STRA,R0 TMPH
-        LODA,R0 EXPH
-        STRA,R0 *TMPH  ; store hi
-        BSTA,UN INC_TMP
-DL_NC2:
-        LODA,R0 EXPL
-        STRA,R0 *TMPH  ; store lo
-        RETC,UN
-
-; ─── DO_INPUT ─────────────────────────────────────────────────────────────────
-DO_INPUT:
-        BSTA,UN WSKIP                    ; [+1]
-        LODA,R0 *IPH
-        BSTA,UN UPCASE  ; [+1]
-        COMI,R0 A'A'
-        BCTR,LT DIN_ERR
-        COMI,R0 A'Z'+1
-        BCTR,LT DIN_VAROK
-DIN_ERR:
-        LODI,R0 4
-        BCTA,UN DO_ERROR
-DIN_VAROK:
-        STRA,R0 SC0                      ; save variable letter
-        STRZ,R2                          ; also save in R2 for DL_STORE (SC0 clobbered by PARSE_S16)
-        BSTA,UN INC_IP
-DIN_PR:
-        LODI,R0 A'?'
-        BSTA,UN COUT
-        LODI,R0 SP
-        BSTA,UN COUT
-        BSTA,UN RDLINE                   ; [+1]
-        LODI,R0 <IBUF
-        STRA,R0 IPH
-        LODI,R0 >IBUF
-        STRA,R0 IPL
-        BSTA,UN PARSE_S16                ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTA,EQ DL_STORE
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
-
-; ─── DO_IF ────────────────────────────────────────────────────────────────────
-; IF expr relop expr THEN stmt
-; Depth at entry: 2 (from REPL->STMT_EXEC) or 4 (from REPL->STMT_EXEC->DO_IF->STMT_EXEC->here)
-; After THEN: calls STMT_EXEC at +1, which can call DO_xxx at +1, PARSE_EXPR at +1,
-;             PARSE_FACTOR at +1 → max total 2+1+1+1+1+1 = depth 7 OK.
-DO_IF:
-        BSTA,UN PARSE_EXPR               ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTA,EQ DIF_LS
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
-DIF_LS:
-        LODA,R0 EXPH
-        STRA,R0 TMPH  ; save left in TMPH:TMPL
-        LODA,R0 EXPL
-        STRA,R0 TMPL
-        BSTA,UN PARSE_RELOP              ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ DIF_RP
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
-DIF_RP:
-        BSTA,UN PARSE_EXPR               ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ DIF_EVAL
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
-DIF_EVAL:
-        ; signed 16-bit compare: TMPH:TMPL (left) vs EXPH:EXPL (right)
-        ; bias hi bytes by XOR $80 → unsigned compare
-        LODA,R0 TMPH
-        EORI,R0 $80
-        STRA,R0 SC0
-        LODA,R0 EXPH
-        EORI,R0 $80
-        SUBA,R0 SC0             ; biased right.hi - biased left.hi
-        BCTR,LT DIF_LT
-        BCTR,GT DIF_GT
-        ; hi bytes equal: compare lo (unsigned)
-        LODA,R0 EXPL
-        SUBA,R0 TMPL
-        BCTR,LT DIF_LT
-        BCTR,GT DIF_GT
-        EORZ,R0 ; Clear R0
-        STRA,R0 SC1
-        BCTR,UN DIF_TH  ; EQ
-DIF_LT:
-        LODI,R0 $FF
-        STRA,R0 SC1
-        BCTA,UN DIF_TH  ; LT
-DIF_GT:
-        EORZ,R0 ; Clear R0
-        STRA,R0 SC1  ; GT
-
-DIF_TH:
-        ; consume THEN keyword: expect T then H then EATWORD
-        BSTA,UN WSKIP                    ; [+1]
-        BSTA,UN GETCI_UC                 ; [+1]  must be A'T'
-        COMI,R0 A'T'
-        BCTR,EQ DIF_TH2
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
-DIF_TH2:
-        BSTA,UN GETCI_UC                 ; [+1]  must be A'H'
-        COMI,R0 A'H'
-        BCTA,EQ DIF_EW
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
-DIF_EW:
-        BSTA,UN EATWORD                  ; [+1]
-
-        ; test condition using SC1 ($FF=LT $00=EQ $01=GT) vs RELOP
-        LODA,R0 RELOP
-        COMI,R0 1
-        BCTR,EQ DIF_CEQ  ; =
-        COMI,R0 2
-        BCTR,EQ DIF_CNE  ; <>
-        COMI,R0 3
-        BCTR,EQ DIF_CLT  ; <
-        COMI,R0 4
-        BCTR,EQ DIF_CGT  ; >
-        COMI,R0 5
-        BCTR,EQ DIF_CLE  ; <=
-        COMI,R0 6
-        BCTR,EQ DIF_CGE  ; >=
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
-
-DIF_CEQ: 
-        LODA,R0 SC1
-        COMI,R0 $00
-        BCTR,EQ DIF_TRUE
-        BCTR,UN DIF_FALSE
-DIF_CNE: 
-        LODA,R0 SC1
-        COMI,R0 $00
-        BCFR,EQ DIF_TRUE
-        BCTR,UN DIF_FALSE
-DIF_CLT: 
-        LODA,R0 SC1
-        COMI,R0 $FF
-        BCTR,EQ DIF_TRUE
-        ;BCTR,UN DIF_FALSE
-        RETC,UN
-DIF_CGT: 
-        LODA,R0 SC1
-        COMI,R0 $01
-        BCTR,EQ DIF_TRUE
-        ;BCTR,UN DIF_FALSE
-        RETC,UN
-DIF_CLE: 
-        LODA,R0 SC1
-        COMI,R0 $01
-        BCFR,EQ DIF_TRUE
-        ; BCTR,UN DIF_FALSE
-        RETC,UN
-DIF_CGE: 
-        LODA,R0 SC1
-        COMI,R0 $FF
-        BCFR,EQ DIF_TRUE
-        ; BCTR,UN DIF_FALSE
-        RETC,UN
-DIF_TRUE:
-        BSTA,UN STMT_EXEC                ; [+1]  execute THEN body
-DIF_FALSE:
-        RETC,UN
-
-; ─── DO_GOTO ──────────────────────────────────────────────────────────────────
-DO_GOTO:
-        BSTA,UN PARSE_U16                ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ DG_OK
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
-DG_OK:
-        LODA,R0 EXPH
-        STRA,R0 GOTOH
-        LODA,R0 EXPL
-        STRA,R0 GOTOL
-        LODI,R0 1               ; ISSUE-03 FIX: was EORZ/STRA ($00) — must be $01
-        STRA,R0 GOTOFLG
-        LODA,R0 RUNFLG
-        COMI,R0 $01
-        ;BCTR,EQ DG_RET
-        RETC,EQ
-        EORZ,R0 ; Clear R0
-        STRA,R0 RUNFLG  ; start run if in immediate mode
-DG_RET:
-        RETC,UN
-
-
-DO_LIST:
-        LODI,R0 <PROG
-        STRA,R0 TMPH
-        LODI,R0 >PROG
-        STRA,R0 TMPL
-DLS_LP:
-        LODA,R0 TMPH
-        SUBA,R0 PEH
-        ; BCTA,GT DLS_RET
-        RETC,GT
-        BCTA,LT DLS_BODY
-        LODA,R0 TMPL
-        SUBA,R0 PEL
-        BCTR,LT DLS_BODY
-        ; BCTA,UN DLS_RET
-        RETC,UN
-DLS_BODY:
-        ; line number hi:lo
-        LODA,R0 *TMPH
-        STRA,R0 EXPH
-        BSTA,UN INC_TMP
-DLS_N1:
-        LODA,R0 *TMPH
-        STRA,R0 EXPL
-        BSTA,UN INC_TMP
-DLS_N2:
-        ; BUG-BASIC-12 FIX: PRINT_S16 clobbers TMPH:TMPL (loads DIVTAB ptr).
-        ; Save TMPH:TMPL in LNUMH:LNUML and restore after the call.
-        LODA,R0 TMPH
-        STRA,R0 LNUMH
-        LODA,R0 TMPL
-        STRA,R0 LNUML
-        BSTA,UN PRINT_S16                ; [+1]
-        LODA,R0 LNUMH
-        STRA,R0 TMPH
-        LODA,R0 LNUML
-        STRA,R0 TMPL
-        LODI,R0 SP
-        BSTA,UN COUT
-        ; body length into R3
-        LODA,R3 *TMPH
-        BSTA,UN INC_TMP
-DLS_N3:
-        ; BUG-SCA-02 FIX: was BRNR,R3 (pure test, R3 never decremented → inf loop).
-        ; Guard zero-body case first (BDRR with R3=0 would execute once wrongly).
-        COMI,R3 $00
-        BCTA,EQ DLS_NL
-DLS_BLPX:
-        LODA,R0 *TMPH
-        BSTA,UN COUT
-        BSTA,UN INC_TMP
-        BDRR,R3 DLS_BLPX       ; R3--; if R3!=0 branch
-DLS_NL:
-        BSTA,UN CRLF
-        BCTA,UN DLS_LP
-DLS_RET:
-        ; RETC,UN
-
-; ─── DO_RUN ───────────────────────────────────────────────────────────────────
-; Executes stored lines sequentially, honouring GOTOFLG for GOTO/GOSUB/RETURN.
-; SC0:SC1 = next-line-pointer saved BEFORE STMT_EXEC so DO_GOSUB can read it.
-DO_RUN:
-        LODI,R0 1 
-        STRA,R0 RUNFLG
-        EORZ,R0 ; Clear R0
-        STRA,R0 GOTOFLG
-        LODI,R0 <PROG
-        STRA,R0 TMPH
-        LODI,R0 >PROG
-        STRA,R0 TMPL
-DR_LP:
-        LODA,R0 RUNFLG
-        COMI,R0 $00
-        ; BCTA,EQ DR_RET
-        RETC,EQ
-        ; end of program?
-        LODA,R0 TMPH
-        SUBA,R0 PEH
-        BCTA,GT DR_STOP
-        BCTR,LT DR_EXEC
-        LODA,R0 TMPL
-        SUBA,R0 PEL
-        BCTR,LT DR_EXEC
-        BCTA,UN DR_STOP
-DR_EXEC:
-        ; save line number for error reporting
-        LODA,R0 *TMPH
-        STRA,R0 CURH
-        BSTA,UN INC_TMP
-DR_N1:
-        LODA,R0 *TMPH
-        STRA,R0 CURL
-        BSTA,UN INC_TMP
-DR_N2:
-        ; body length into R3
-        LODA,R3 *TMPH
-        BSTA,UN INC_TMP
-DR_N3:
-        ; copy body to IBUF
-        LODI,R0 <IBUF
-        STRA,R0 IPH
-        LODI,R0 >IBUF
-        STRA,R0 IPL
-        COMI,R3 $00
-        BCTA,EQ DR_CD
-DR_CPY:
-        LODA,R1 *TMPH
-        STRA,R1 *IPH
-        BSTA,UN INC_TMP
-        BSTA,UN INC_IP
-        ; BUG-SCA-03 FIX: was BRNR,R3 — R3 never decremented → infinite copy loop.
-        BDRR,R3 DR_CPY          ; R3--; if R3!=0 branch
-DR_CD:
-        LODI,R1 NUL
-        STRA,R1 *IPH  ; NUL-terminate
-        ; BUG-BASIC-13 FIX: Save next-line pointer in SWSTK[0:1] instead of
-        ; SC0:SC1. SC0 and SC1 are scratch bytes clobbered by STMT_EXEC (used
-        ; by PRINT_S16, STORE_LINE, parser, etc.).  SWSTK is the GOSUB return
-        ; stack, indexed from the top; [0:1] at $152E:$152F are unused while
-        ; SWSP=$FF (empty) and GOSUB is not yet implemented.
-        LODA,R0 TMPH
-        STRA,R0 SC0      ; SC0:SC1 still set (DO_GOSUB reads them for return addr)
-        ; BUG-SCA-12 FIX: was STRA,R0 *SWSTK — indirect addressing writes to the
-        ; address stored AT SWSTK ($152E:$152F), not into SWSTK itself. After CLRV
-        ; SWSTK contains $0000, so the next-line pointer hi byte was written into
-        ; PIPBUG ROM at $0000. Fix: direct STRA,R0 SWSTK stores into $152E.
-        STRA,R0 SWSTK    ; NLP_H: save hi byte of next-line ptr directly into $152E
-        LODA,R0 TMPL
-        STRA,R0 SC1
-        LODA,R0 TMPL
-        STRA,R0 SWSTK+1  ; NLP_L: save lo byte directly into $152F
-        ; execute line
-        LODI,R0 <IBUF
-        STRA,R0 IPH
-        LODI,R0 >IBUF
-        STRA,R0 IPL
-        BSTA,UN STMT_EXEC                ; [+1]
-        ; check GOTO/GOSUB/RETURN flag
-        LODA,R0 GOTOFLG
-        COMI,R0 $01
-        BCTR,EQ DR_GOTO
-        ; advance: restore next-line pointer from SWSTK[0:1] (SC0:SC1 clobbered)
-        ; BUG-SCA-12 FIX: was LODA,R0 *SWSTK (indirect). Direct read from $152E.
-        LODA,R0 SWSTK
-        STRA,R0 TMPH
-        LODA,R0 SWSTK+1
-        STRA,R0 TMPL
-        BCTA,UN DR_LP
-DR_GOTO:
-        EORZ,R0 ; Clear R0
-        STRA,R0 GOTOFLG
-        LODA,R0 GOTOH
-        STRA,R0 LNUMH
-        LODA,R0 GOTOL
-        STRA,R0 LNUML
-        BSTA,UN FIND_LINE                ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTA,EQ DR_LP
-        LODI,R0 1
-        BSTA,UN DO_ERROR  ; [+1] undefined line — returns to REPL
-        BCTA,UN DR_LP
-DR_STOP:
-        EORZ,R0 ; Clear R0
-        STRA,R0 RUNFLG
-DR_RET:
-        RETC,UN
-
-; ─── TRY_STORE_LINE ───────────────────────────────────────────────────────────
-; If IP starts with a digit, parse and store/delete the numbered line.
-; Returns ERRFLG=$01 if handled as a numbered line, $00 if immediate.
-TRY_STORE_LINE:
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        LODA,R0 *IPH
-        COMI,R0 A'0'
-        ; BCTR,LT TSL_RET
-        RETC,LT
-        COMI,R0 A'9'+1
-        BCTR,LT TSL_NUM
-TSL_RET:
-        RETC,UN
-TSL_NUM:
-        BSTA,UN PARSE_U16                ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ TSL_GOT
-        ;BCTR,UN TSL_RET
-        RETC,UN
-TSL_GOT:
-        ; validate 1..32767
-        LODA,R0 EXPH
-        ANDI,R0 $80
-        BCTR,EQ TSL_RNG
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        RETC,UN  ; >=32768 silently ignore
-TSL_RNG:
-        LODA,R0 EXPH
-        COMI,R0 $00
-        BCTR,GT TSL_NZ
-        LODA,R0 EXPL
-        COMI,R0 $00
-        ; BCTA,EQ TSL_RET2  ; line 0 invalid
-        RETC,EQ
-TSL_NZ:
-        LODA,R0 EXPH
-        STRA,R0 LNUMH
-        LODA,R0 EXPL
-        STRA,R0 LNUML
-        BSTA,UN WSKIP                    ; [+1]  skip space after line number
-        LODA,R0 *IPH
-        COMI,R0 NUL
-        BCTR,EQ TSL_DEL
-        BSTR,UN STORE_LINE               ; [+1]
-        BCTR,UN TSL_DONE
-TSL_DEL:
-        BSTA,UN DELETE_LINE              ; [+1]
-TSL_DONE:
-        LODI,R0 1               ; BUG-BASIC-09 FIX: $01 = "line stored, skip exec"
-        STRA,R0 ERRFLG
-TSL_RET2:
-        RETC,UN
-
-; ─── STORE_LINE ───────────────────────────────────────────────────────────────
-; Insert line LNUMH:LNUML with body at IP into program store (sorted).
-; Record format: [linehi][linelo][bodylen][body...]
-; Strategy: delete existing line, measure body, check space, find insertion
-;           point (EXPH:EXPL), shift existing records up, write new record.
-STORE_LINE:
-        BSTA,UN DELETE_LINE              ; [+1]  remove if exists
-
-        ; measure body length: walk from IP to NUL, count in R3
-        LODA,R0 IPH
-        STRA,R0 TMPH
-        LODA,R0 IPL
-        STRA,R0 TMPL  ; TMPH:TMPL = body start (save for write)
-        LODI,R3 0
-SL_MEAS:
-        LODA,R0 *TMPH
-        COMI,R0 NUL
-        BCTR,EQ SL_MEASD
-        BSTA,UN INC_TMP
-SL_MNC:
-        BIRR,R3 SL_MEAS         ; R3++ then always branch (counts: 0→1→2...)
-SL_MEASD:
-        ; R3 = body length.  SC0 = body len.  SC1 = record size = 3 + R3.
-        STRA,R3 SC0
-        LODA,R0 SC0
-        ADDI,R0 3
-        STRA,R0 SC1
-
-        ; check free space: PROGLIM - PE >= SC1
-        LODI,R0 >PROGLIM
-        SUBA,R0 PEL
-        STRA,R0 TMPL
-        LODI,R0 <PROGLIM
-        SUBA,R0 PEH
-        BCFR,LT SL_NBC
-        SUBI,R0 1  ; borrow skip: BCFA,LT
-SL_NBC:
-        STRA,R0 TMPH            ; TMPH:TMPL = free bytes
-        LODA,R0 TMPH
-        COMI,R0 $00
-        BCTR,GT SL_ROOM
-        LODA,R0 TMPL
-        SUBA,R0 SC1
-        BCFR,LT SL_ROOM  ; free >= needed?
-        LODI,R0 3
-        BCTA,UN DO_ERROR  ; out of memory
-
-SL_ROOM:
-        ; find sorted insertion point → EXPH:EXPL
-        BSTA,UN FIND_INS                 ; [+1]  sets TMPH:TMPL
-        ; save insertion point in EXPH:EXPL (TMPH:TMPL will be used as walk pointer)
-        LODA,R0 TMPH
-        STRA,R0 EXPH
-        LODA,R0 TMPL
-        STRA,R0 EXPL
-
-        ; shift bytes PE-1 down to EXPH:EXPL upward by SC1 positions (backwards copy)
-        ; shift count = PE - EXPH:EXPL
-        LODA,R0 PEL
-        SUBA,R0 EXPL
-        STRA,R0 TMPL
-        LODA,R0 PEH
-        SUBA,R0 EXPH
-        BCFR,LT SL_SHCNB
-        SUBI,R0 1
-SL_SHCNB:
-        STRA,R0 TMPH            ; TMPH:TMPL = shift count
-
-        ; if shift count == 0 skip loop
-        LODA,R0 TMPH
-        COMI,R0 $00
-        BCTR,GT SL_DOSHIFT
-        LODA,R0 TMPL
-        COMI,R0 $00
-        BCTA,EQ SL_NOSHIFT
-SL_DOSHIFT:
-        ; src = PE-1 in NEGFLG:SC1 (use two scratch bytes; LNUMH:LNUML free now)
-        LODA,R0 PEL
-        SUBI,R0 1
-        STRA,R0 LNUML
-        LODA,R0 PEH
-        BCFA,LT SL_SNBR
-        SUBI,R0 1
-SL_SNBR:
-        STRA,R0 LNUMH           ; LNUMH:LNUML = src = PE-1
-        ; dst = src + SC1 (record size = shift amount)
-        ; ISSUE-02 FIX: must test carry from ADDA before any LODA clobbers CC.
-        ; Old code did STRA / LODA LNUMH / BCTA,GT — LODA wiped the carry.
-        ; New code: test carry immediately after ADDA, then load LNUMH on both paths.
-        LODA,R0 LNUML
-        ADDA,R0 SC1
-        STRA,R0 GOTOL
-        BCTA,GT SL_DSNCA        ; GT = no carry from low-byte add (CC still valid)
-        LODA,R0 LNUMH           ; carry path: hi += 1
-        ADDI,R0 1
-        STRA,R0 GOTOH
-        BCTA,UN SL_DSNCB
-SL_DSNCA:
-        LODA,R0 LNUMH           ; no-carry path: hi unchanged
-        STRA,R0 GOTOH
-SL_DSNCB:
-
-        ; use R3 as count (shift count lo; assume <256 for any real program)
-        ; BUG-SCA-04 FIX: was BRNR,R3 at loop end — R3 never decremented → infinite shift.
-        ; Guard zero case first (BDRR with R3=0 would execute once wrongly).
-        LODA,R3 TMPL
-SL_SHLOOP:
-        COMI,R3 $00
-        BCTA,EQ SL_NOSHIFT
-        ; read from LNUMH:LNUML
-        LODA,R1 *LNUMH
-        ; write to GOTOH:GOTOL
-        STRA,R1 *GOTOH
-        ; decrement both pointers
-        LODA,R0 LNUML
-        SUBI,R0 1
-        STRA,R0 LNUML
-        BCFA,LT SL_SRNB
-        LODA,R0 LNUMH
-        SUBI,R0 1
-        STRA,R0 LNUMH
-SL_SRNB:
-        LODA,R0 GOTOL
-        SUBI,R0 1
-        STRA,R0 GOTOL
-        BCFR,LT SL_DRNB
-        LODA,R0 GOTOH
-        SUBI,R0 1
-        STRA,R0 GOTOH
-SL_DRNB:
-        BDRR,R3 SL_SHLOOP       ; R3--; if R3!=0 branch
-
-SL_NOSHIFT:
-        ; write record at EXPH:EXPL (insertion point)
-        ; restore IP body start to TMPH:TMPL (saved at top of STORE_LINE)
-        ; TMPH:TMPL currently = shift count — need to reload body start from IP
-        ; IP still points to body start (WSKIP was called before STORE_LINE)
-        LODA,R0 IPH
-        STRA,R0 TMPH
-        LODA,R0 IPL
-        STRA,R0 TMPL
-
-        LODA,R0 LNUMH
-        STRA,R0 *EXPH  ; write line hi
-        BSTA,UN INC_EXP
-SL_WN1:
-        LODA,R0 LNUML
-        STRA,R0 *EXPH  ; write line lo
-        BSTA,UN INC_EXP
-SL_WN2:
-        LODA,R0 SC0
-        STRA,R0 *EXPH  ; write body length
-        BSTA,UN INC_EXP
-SL_WN3:
-        ; write body bytes (R3 = body len from SC0)
-        ; BUG-SCA-05 FIX: was BRNR,R3 — R3 never decremented → infinite write.
-        ; Guard zero-body case first.
-        LODA,R3 SC0
-        COMI,R3 $00
-        BCTA,EQ SL_WDONE
-SL_WBODY:
-        LODA,R1 *TMPH
-        STRA,R1 *EXPH  ; copy body byte
-        BSTA,UN INC_TMP
-        BSTA,UN INC_EXP
-        BDRR,R3 SL_WBODY        ; R3--; if R3!=0 branch
-SL_WDONE:
-        ; update PE += SC1 (record size)
-        LODA,R0 PEL
-        ADDA,R0 SC1
-        STRA,R0 PEL
-        BCTR,GT SL_PENC
-        LODA,R0 PEH
-        ADDI,R0 1
-        STRA,R0 PEH
-SL_PENC:
-        RETC,UN
-
-; ─── DELETE_LINE ──────────────────────────────────────────────────────────────
-DELETE_LINE:
-        BSTA,UN FIND_LINE                ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTA,EQ DL2_FOUND
-        RETC,UN
-DL2_FOUND:
-        ; record start in TMPH:TMPL.  Get size: 3 + bodylen at TMPH:TMPL+2.
-        LODA,R0 TMPH
-        STRA,R0 EXPH  ; save record start in EXPH:EXPL
-        LODA,R0 TMPL
-        STRA,R0 EXPL
-        LODA,R0 TMPL
-        ADDI,R0 2
-        STRA,R0 TMPL
-        BCTR,GT DL2_BLN
-        LODA,R0 TMPH
-        ADDI,R0 1
-        STRA,R0 TMPH
-DL2_BLN:
-        LODA,R0 *TMPH
-        ADDI,R0 3
-        STRA,R0 SC0  ; SC0 = record size
-        ; advance TMPH:TMPL past record to get src for copy
-        LODA,R3 SC0
-        SUBI,R3 2  ; R3 = bodylen + 1  (skip len byte + body)
-        ; BUG-SCA-08 FIX: was BRNR,R3 — R3 never decremented → infinite advance,
-        ; copy source never found, deletion corrupted program store.
-DL2_SKIP:
-        COMI,R3 $00
-        BCTA,EQ DL2_COPY
-        BSTA,UN INC_TMP
-        BDRR,R3 DL2_SKIP        ; R3--; if R3!=0 branch
-        BCTA,UN DL2_COPY        ; R3 wrapped: all bytes skipped
-DL2_COPY:
-        ; copy TMPH:TMPL..PE-1 to EXPH:EXPL
-DL2_LP:
-        LODA,R0 TMPH
-        SUBA,R0 PEH
-        BCTR,GT DL2_DONE
-        BCTR,LT DL2_MOV
-        LODA,R0 TMPL
-        SUBA,R0 PEL
-        BCTR,LT DL2_MOV
-        BCTR,UN DL2_DONE
-DL2_MOV:
-        LODA,R1 *TMPH
-        STRA,R1 *EXPH
-        BSTA,UN INC_TMP
-DL2_TNC:
-        BSTA,UN INC_EXP
-DL2_ENC:
-        BCTR,UN DL2_LP
-DL2_DONE:
-        ; PE -= SC0
-        LODA,R0 PEL
-        SUBA,R0 SC0
-        STRA,R0 PEL
-        BCFA,LT DL2_PNC
-        LODA,R0 PEH
-        SUBI,R0 1
-        STRA,R0 PEH
-DL2_PNC:
-        RETC,UN
-
-; ─── FIND_LINE ────────────────────────────────────────────────────────────────
-; Search for line LNUMH:LNUML in program store (sorted ascending).
-; Returns: TMPH:TMPL = record start if found; ERRFLG=$00 found / $01 not found.
-FIND_LINE:
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        LODI,R0 <PROG
-        STRA,R0 TMPH
-        LODI,R0 >PROG
-        STRA,R0 TMPL
-FL_LP:
-        LODA,R0 TMPH
-        SUBA,R0 PEH
-        BCTA,GT FL_RET
-        BCTR,LT FL_CHK
-        LODA,R0 TMPL
-        SUBA,R0 PEL
-        BCTR,LT FL_CHK
-        BCTA,UN FL_RET
-FL_CHK:
-        LODA,R0 *TMPH
-        SUBA,R0 LNUMH
-        BCTR,LT FL_ADV
-        BCTA,GT FL_RET  ; stored.hi > target → not found
-        ; hi bytes equal: check lo at TMPH:TMPL+1
-        LODA,R0 TMPL
-        ADDI,R0 1
-        STRA,R0 EXPL
-        LODA,R0 TMPH
-        BCTR,GT FL_LH
-        ADDI,R0 1
-FL_LH:
-        STRA,R0 EXPH                     ; EXPH:EXPL = lo byte address
-        LODA,R0 *EXPH
-        SUBA,R0 LNUML
-        BCTR,LT FL_ADV
-        BCTA,GT FL_RET
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        RETC,UN  ; exact match
-FL_ADV:
-        ; advance TMPH:TMPL by 3 + bodylen
-        LODA,R0 TMPL
-        ADDI,R0 2
-        STRA,R0 TMPL
-        BCTR,GT FL_AN
-        LODA,R0 TMPH
-        ADDI,R0 1
-        STRA,R0 TMPH
-FL_AN:
-        LODA,R3 *TMPH                    ; bodylen
-        BSTA,UN INC_TMP
-FL_AN2:
-        ; BUG-SCA-06 FIX: was BRNR,R3 — R3 never decremented → never advanced
-        ; past body, so search only ever examined first record.
-        COMI,R3 $00
-        BCTA,EQ FL_LP
-FL_AS:
-        BSTA,UN INC_TMP
-        BDRR,R3 FL_AS            ; R3--; if R3!=0 branch; fall-thru→done
-        BCTA,UN FL_LP            ; all body bytes skipped: check next record
-FL_RET:
-        LODI,R0 1               ; BUG-BASIC-10 FIX: $01 = "not found"
-        STRA,R0 ERRFLG
-        RETC,UN
-
-; ─── FIND_INS ─────────────────────────────────────────────────────────────────
-; Find sorted insertion point for LNUMH:LNUML.
-; Returns TMPH:TMPL = address where new record should be inserted.
-FIND_INS:
-        LODI,R0 <PROG
-        STRA,R0 TMPH
-        LODI,R0 >PROG
-        STRA,R0 TMPL
-FI_LP:
-        LODA,R0 TMPH
-        SUBA,R0 PEH
-        BCTA,GT FI_RET
-        BCTR,LT FI_CHK
-        LODA,R0 TMPL
-        SUBA,R0 PEL
-        BCTR,LT FI_CHK
-        BCTA,UN FI_RET
-FI_CHK:
-        LODA,R0 *TMPH
-        SUBA,R0 LNUMH
-        BCTR,LT FI_ADV
-        BCTA,GT FI_RET  ; BUG-BASIC-11 FIX: GT only; EQ falls through to lo check
-        ; hi bytes equal: check lo
-        LODA,R0 TMPL
-        ADDI,R0 1
-        STRA,R0 EXPL
-        LODA,R0 TMPH
-        BCTR,GT FI_LH
-        ADDI,R0 1
-FI_LH:
-        STRA,R0 EXPH
-        LODA,R0 *EXPH
-        SUBA,R0 LNUML
-        BCTR,LT FI_ADV
-        BCTA,UN FI_RET
-FI_ADV:
-        LODA,R0 TMPL
-        ADDI,R0 2
-        STRA,R0 TMPL
-        BCTR,GT FI_AN
-        LODA,R0 TMPH
-        ADDI,R0 1
-        STRA,R0 TMPH
-FI_AN:
-        LODA,R3 *TMPH
-        BSTA,UN INC_TMP
-FI_AN2:
-        ; BUG-SCA-07 FIX: was BRNR,R3 — same as BUG-SCA-06, insertion point
-        ; search always landed at first record position for multi-record stores.
-        COMI,R3 $00
-        BCTA,EQ FI_LP
-FI_AS:
-        BSTA,UN INC_TMP
-        BDRR,R3 FI_AS            ; R3--; if R3!=0 branch
-        BCTA,UN FI_LP            ; all body bytes skipped: check next record
-FI_RET:
-        RETC,UN
-
-; ─── PARSE_EXPR ───────────────────────────────────────────────────────────────
-; Shunting-yard iterative operator-precedence parser.
-; Entry: IP at expression.  Exit: EXPH:EXPL = result, ERRFLG=$00.
-; RAS budget: this routine is at depth N; calls PARSE_FACTOR at N+1.
-; Max depth from caller: +2. PARSE_FACTOR may call PARSE_EXPR for functions
-; at N+1+1 = N+2 total extra levels — tight at deepest path, see ARCH §12.
+; =============================================================================
+; INIT  --  cold start
 ;
-; OPSTK[0..STKIDX]: operator stack   '(' = sentinel (prec 0)
-; VALSH/VALSL[0..STKIDX]: value stack
+;   In:  -- (entered via reset vector at $FFFC, or Kowalski JMP trampoline)
+;   Out: never returns; falls through into MAIN
+;   Clobbers: everything
 ;
-; Operator precedences: '('=0 (sentinel, never reduces), '+''-'=1, '*''/'=2
-; Reduction: while top-op-prec >= cur-op-prec AND top-op != '(': apply top op
-PARSE_EXPR:
-        LODI,R0 $FF
-        STRA,R0 STKIDX
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
+;   Clears all zero-page RAM, sets the stack, enables IRQs, points PE at the
+;   end of the pre-loaded showcase program, prints the banner,
+;   then falls into MAIN.
+; =============================================================================
+INIT:
+         LDX #$FF
+         TXS                  ; set stack to top of page 1
+         CLD                  ; ensure binary (not decimal) mode
+         CLI                  ; enable maskable IRQs (for $E007 Break key)
+         LDA #0
+INIT_Z:  STA 0,X              ; clear zero-page byte at X
+         DEX
+         BPL INIT_Z
+         LDA #<SHOWCASE_END   ; point PE at end of pre-loaded showcase program
+         STA PE               ; (change to PROG/PROG for no pre-loaded program)
+         LDA #>SHOWCASE_END
+         STA PE+1
+         LDA #<STR_BANNER
+         JSR PUTSTR           ; print banner + CR+LF (STR_CRLF follows immediately)
+         ; fall through into MAIN
 
-PX_ATOM:
-        ; skip spaces then parse one atom (number, variable, unary, paren)
-        BSTA,UN WSKIP                    ; [+1]
-        LODA,R0 *IPH
-        COMI,R0 A'('
-        BCTA,EQ PX_LPAR
-        COMI,R0 A'-'
-        BCTR,EQ PX_UNEG
-        COMI,R0 A'+'
-        BCTA,EQ PX_UPOS
-        BSTA,UN PARSE_FACTOR             ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTA,EQ PX_PUSHV
-        RETC,UN
-
-PX_LPAR:
-        ; push '(' sentinel onto OPSTK
-        BSTA,UN INC_IP
-PX_LPN:
-        LODA,R0 STKIDX
-        ADDI,R0 1
-        STRA,R0 STKIDX
-        LODI,R1 >OPSTK
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <OPSTK
-        BCTR,GT PX_LPNCA
-        ADDI,R0 1
-PX_LPNCA:
-        STRA,R0 TMPH
-        LODI,R0 A'('
-        STRA,R0 *TMPH
-        BCTA,UN PX_ATOM
-
-PX_UNEG:
-        ; consume '-', parse factor, negate result
-        BSTA,UN INC_IP
-PX_UNN:
-        BSTA,UN PARSE_FACTOR             ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTA,EQ PX_NEG
-        RETC,UN
-PX_NEG:
-        LODA,R0 EXPH
-        EORI,R0 $FF
-        STRA,R0 EXPH
-        LODA,R0 EXPL
-        EORI,R0 $FF
-        STRA,R0 EXPL
-        BSTA,UN INC_EXP
-        BCTA,UN PX_PUSHV
-
-PX_UPOS:
-        ; consume '+', parse factor — result unchanged
-        BSTA,UN INC_IP
-PX_UPN:
-        BSTA,UN PARSE_FACTOR             ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTA,EQ PX_PUSHV
-        RETC,UN
-
-PX_PUSHV:
-        ; push EXPH:EXPL to value stack at STKIDX+1
-        LODA,R0 STKIDX
-        ADDI,R0 1
-        STRA,R0 STKIDX
-        LODI,R1 >VALSH
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <VALSH
-        BCTA,GT PX_VHN
-        ADDI,R0 1
-PX_VHN:
-        STRA,R0 TMPH
-        LODA,R0 EXPH
-        STRA,R0 *TMPH
-        LODA,R0 STKIDX
-        LODI,R1 >VALSL
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <VALSL
-        BCTA,GT PX_VLN
-        ADDI,R0 1
-PX_VLN:
-        STRA,R0 TMPH
-        LODA,R0 EXPL
-        STRA,R0 *TMPH
-
-PX_PEEKOP:
-        ; peek next char for operator
-        BSTA,UN WSKIP                    ; [+1]
-        LODA,R0 *IPH
-
-        COMI,R0 A')'
-        BCTA,EQ PX_RPAR  ; A')' → reduce until A'(' sentinel
-
-        BSTA,UN GET_PREC                 ; [+1]  R0 = prec(cur op)  ; 0=not an op
-        COMI,R0 $00
-        BCTA,EQ PX_RALL  ; end of expression → reduce all
-        STRA,R0 SC1                      ; SC1 = cur op prec
-
-PX_REDLP:
-        ; while STKIDX >= 1 and top-op-prec >= SC1: reduce
-        LODA,R0 STKIDX
-        COMI,R0 $00
-        BCTA,EQ PX_PUSHOP  ; only 1 value
-        ; get top op from OPSTK[STKIDX-1]
-        SUBI,R0 1
-        LODI,R1 >OPSTK
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <OPSTK
-        BCTA,GT PX_TOPNC
-        ADDI,R0 1
-PX_TOPNC:
-        STRA,R0 TMPH
-        LODA,R0 *TMPH
-        STRA,R0 SC0  ; SC0 = top op byte
-        COMI,R0 A'('
-        BCTA,EQ PX_PUSHOP  ; sentinel → stop reducing
-        BSTA,UN GET_PREC_SC0             ; [+1]  R0 = prec(SC0)
-        SUBA,R0 SC1                      ; top_prec - cur_prec
-        BCTA,LT PX_PUSHOP                ; top_prec < cur_prec → push new op
-        BSTA,UN APPLY_OP                 ; [+1]  reduce top pair
-        BCTA,UN PX_REDLP
-
-PX_PUSHOP:
-        ; push cur op byte onto OPSTK[STKIDX] and consume from IP
-        LODA,R0 *IPH
-        STRA,R0 SC0
-        BSTA,UN INC_IP
-PX_PON:
-        LODA,R0 STKIDX
-        LODI,R1 >OPSTK
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <OPSTK
-        BCTA,GT PX_OPN
-        ADDI,R0 1
-PX_OPN:
-        STRA,R0 TMPH
-        LODA,R0 SC0
-        STRA,R0 *TMPH
-        BCTA,UN PX_ATOM                  ; parse next value
-
-PX_RPAR:
-        ; consume ')'
-        BSTA,UN INC_IP
-PX_RPNCA:
-        ; reduce until '(' sentinel
-PX_RPLP:
-        LODA,R0 STKIDX
-        COMI,R0 $00
-        BCTA,EQ PX_RPDONE  ; guard
-        SUBI,R0 1
-        LODI,R1 >OPSTK
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <OPSTK
-        BCTA,GT PX_RPNCA2
-        ADDI,R0 1
-PX_RPNCA2:
-        STRA,R0 TMPH
-        LODA,R0 *TMPH
-        STRA,R0 SC0
-        COMI,R0 A'('
-        BCTA,EQ PX_POPSENT
-        BSTA,UN APPLY_OP                 ; [+1]
-        BCTA,UN PX_RPLP
-PX_POPSENT:
-        ; pop '(' sentinel: STKIDX-- (removes the op slot; val result stays at top)
-        LODA,R0 STKIDX
-        SUBI,R0 1
-        STRA,R0 STKIDX
-PX_RPDONE:
-        BCTA,UN PX_PEEKOP                ; continue scanning for more operators
-
-PX_RALL:
-        ; reduce all remaining ops
-PX_RALL_LP:
-        LODA,R0 STKIDX
-        COMI,R0 $00
-        BCTA,EQ PX_DONE
-        SUBI,R0 1
-        LODI,R1 >OPSTK
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <OPSTK
-        BCTA,GT PX_RANC
-        ADDI,R0 1
-PX_RANC:
-        STRA,R0 TMPH
-        LODA,R0 *TMPH
-        STRA,R0 SC0
-        BSTA,UN APPLY_OP                 ; [+1]
-        BCTA,UN PX_RALL_LP
-PX_DONE:
-        ; result is VALSH[0]:VALSL[0]
-        LODA,R0 VALSH
-        STRA,R0 EXPH
-        LODA,R0 VALSL
-        STRA,R0 EXPL
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        RETC,UN
-
-; ─── GET_PREC ─────────────────────────────────────────────────────────────────
-; R0 = precedence of *IPH  (0=not-an-op, 1=+/-, 2=*/)
-GET_PREC:
-        LODA,R0 *IPH
-        ; fall through to GET_PREC_SC0
-
-; R0 = precedence of char in R0
-GET_PREC_SC0:
-        COMI,R0 A'+'
-        BCTA,EQ GP_LOW
-        COMI,R0 A'-'
-        BCTA,EQ GP_LOW
-        COMI,R0 A'*'
-        BCTA,EQ GP_HIGH
-        COMI,R0 A'/'
-        BCTA,EQ GP_HIGH
-        EORZ,R0 ; Clear 
-        RETC,UN
-GP_LOW:  
-        LODI,R0 1
-        RETC,UN
-GP_HIGH: 
-        LODI,R0 2
-        RETC,UN
-
-; ─── APPLY_OP ─────────────────────────────────────────────────────────────────
-; Apply operator SC0 to top two stack values. Result → VALSH/VALSL[STKIDX-1].
-; STKIDX decremented (one value consumed).
-; Uses NEGFLG:SC1 as temp for left value during computation.
-APPLY_OP:
-        ; load right value: VALSH/VALSL[STKIDX]
-        LODA,R0 STKIDX
-        LODI,R1 >VALSH
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <VALSH
-        BCTA,GT AO_RHN
-        ADDI,R0 1
-AO_RHN:
-        STRA,R0 TMPH
-        LODA,R0 *TMPH
-        STRA,R0 EXPH  ; right.hi
-        LODA,R0 STKIDX
-        LODI,R1 >VALSL
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <VALSL
-        BCTA,GT AO_RLN
-        ADDI,R0 1
-AO_RLN:
-        STRA,R0 TMPH
-        LODA,R0 *TMPH
-        STRA,R0 EXPL  ; right.lo
-
-        ; load left value: VALSH/VALSL[STKIDX-1]
-        LODA,R0 STKIDX
-        SUBI,R0 1
-        LODI,R1 >VALSH
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <VALSH
-        BCTA,GT AO_LHN
-        ADDI,R0 1
-AO_LHN:
-        STRA,R0 TMPH
-        LODA,R0 *TMPH
-        STRA,R0 NEGFLG  ; left.hi → NEGFLG temp
-        LODA,R0 STKIDX
-        SUBI,R0 1
-        LODI,R1 >VALSL
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <VALSL
-        BCTA,GT AO_LLN
-        ADDI,R0 1
-AO_LLN:
-        STRA,R0 TMPH
-        LODA,R0 *TMPH
-        STRA,R0 SC1  ; left.lo → SC1
-
-        ; left = NEGFLG:SC1,  right = EXPH:EXPL
-        ; dispatch on SC0
-        LODA,R0 SC0
-        COMI,R0 A'+'
-        BCTA,EQ AO_ADD
-        COMI,R0 A'-'
-        BCTA,EQ AO_SUB
-        COMI,R0 A'*'
-        BCTA,EQ AO_MUL
-        COMI,R0 A'/'
-        BCTA,EQ AO_DIV
-        RETC,UN
-
-AO_ADD:
-        ; EXPH:EXPL = NEGFLG:SC1 + EXPH:EXPL
-        LODA,R0 SC1
-        ADDA,R0 EXPL
-        STRA,R0 EXPL
-        BCTA,GT AO_ADDNC
-        LODA,R0 NEGFLG
-        ADDI,R0 1
-        BCTA,UN AO_ADDHI
-AO_ADDNC:
-        LODA,R0 NEGFLG
-AO_ADDHI:
-        ADDA,R0 EXPH
-        STRA,R0 EXPH
-        BCTA,UN AO_STORE
-
-AO_SUB:
-        ; EXPH:EXPL = NEGFLG:SC1 - EXPH:EXPL
-        LODA,R0 SC1
-        SUBA,R0 EXPL
-        STRA,R0 EXPL
-        BCFA,LT AO_SUBNB                 ; no borrow → skip hi decrement
-        LODA,R0 NEGFLG
-        SUBI,R0 1
-        BCTA,UN AO_SUBHI
-AO_SUBNB:
-        LODA,R0 NEGFLG
-AO_SUBHI:
-        SUBA,R0 EXPH
-        STRA,R0 EXPH
-        BCTA,UN AO_STORE
-
-AO_MUL:
-        ; MUL16: TMPH:TMPL * EXPH:EXPL → EXPH:EXPL  (NEGFLG:SC1 = left)
-        LODA,R0 NEGFLG
-        STRA,R0 TMPH
-        LODA,R0 SC1
-        STRA,R0 TMPL
-        BSTA,UN MUL16                    ; [+1]
-        BCTA,UN AO_STORE
-
-AO_DIV:
-        LODA,R0 NEGFLG
-        STRA,R0 TMPH
-        LODA,R0 SC1
-        STRA,R0 TMPL
-        BSTA,UN DIV16                    ; [+1]
-        ; ERRFLG=$01 on /0 — DO_ERROR called inside DIV16
-        BCTA,UN AO_STORE
-
-AO_STORE:
-        ; write EXPH:EXPL to VALSH/VALSL[STKIDX-1]; STKIDX--
-        LODA,R0 STKIDX
-        SUBI,R0 1
-        LODI,R1 >VALSH
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <VALSH
-        BCTA,GT AO_SHN
-        ADDI,R0 1
-AO_SHN:
-        STRA,R0 TMPH
-        LODA,R0 EXPH
-        STRA,R0 *TMPH
-        LODA,R0 STKIDX
-        SUBI,R0 1
-        LODI,R1 >VALSL
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <VALSL
-        BCTA,GT AO_SLN
-        ADDI,R0 1
-AO_SLN:
-        STRA,R0 TMPH
-        LODA,R0 EXPL
-        STRA,R0 *TMPH
-        LODA,R0 STKIDX
-        SUBI,R0 1
-        STRA,R0 STKIDX
-        RETC,UN
-
-; ─── PARSE_FACTOR ─────────────────────────────────────────────────────────────
-; Parse one atom: variable A-Z, signed decimal, PEEK(), CHR$(), USR().
-; Called from PARSE_EXPR at depth N+1. May call PARSE_EXPR for function args
-; (adds 1 more level). Unary - and + handled by PARSE_EXPR before calling here.
-; CHR$ result: sets NEGFLG=$01 so DO_PRINT outputs EXPL as a character.
-PARSE_FACTOR:
-        EORZ,R0 ; Clear R0
-        STRA,R0 NEGFLG  ; clear CHR$ flag
-        LODA,R0 *IPH
-        BSTA,UN UPCASE  ; [+1]
-
-        ; check for variable A-Z
-        COMI,R0 A'A'
-        BCTA,LT PF_NUM
-        COMI,R0 A'Z'+1
-        BCTA,LT PF_LOADVAR
-
-PF_NUM:
-        ; decimal number (may have leading '-' but unary is in PARSE_EXPR)
-        BSTA,UN PARSE_S16                ; [+1]
-        RETC,UN
-
-PF_LOADVAR:
-        ; load variable value from VARS
-        ; BUG-BASIC-03 FIX: save letter to SC0 BEFORE INC_IP clobbers R0.
-        STRA,R0 SC0              ; save variable letter (A-Z)
-        BSTA,UN INC_IP
-PF_LVNCA:
-        ; BUG-BASIC-15 FIX: INC_IP returns new IPL in R0, clobbering the letter.
-        ; Reload from SC0 before computing the VARS offset.
-        LODA,R0 SC0
-        SUBI,R0 A'A'  ; 0-25
-        STRA,R0 SC1
-        ADDA,R0 SC1  ; *2
-        LODI,R1 >VARS
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <VARS
-        BCTA,GT PF_LVN
-        ADDI,R0 1
-PF_LVN:
-        STRA,R0 TMPH
-        LODA,R0 *TMPH
-        STRA,R0 EXPH
-        BSTA,UN INC_TMP
-PF_LVN2:
-        LODA,R0 *TMPH
-        STRA,R0 EXPL
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        RETC,UN
-
-
-PARSE_RELOP:
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        BSTA,UN WSKIP                    ; [+1]
-        LODA,R0 *IPH
-        COMI,R0 A'='
-        BCTA,EQ PRO_EQ
-        COMI,R0 A'<'
-        BCTA,EQ PRO_LT
-        COMI,R0 A'>'
-        BCTA,EQ PRO_GT
-        LODI,R0 1               ; ISSUE-05 FIX: no relop found — set error flag
-        STRA,R0 ERRFLG          ; (was RETC,UN with ERRFLG=$00 = false success)
-        RETC,UN
-
-PRO_EQ:
-        BSTA,UN INC_IP
-PRO_EQN:
-        LODI,R0 1
-        STRA,R0 RELOP
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        RETC,UN
-
-PRO_LT:
-        BSTA,UN INC_IP
-PRO_LTN:
-        BSTA,UN WSKIP                    ; [+1]
-        LODA,R0 *IPH
-        COMI,R0 A'='
-        BCTA,EQ PRO_LE
-        COMI,R0 A'>'
-        BCTA,EQ PRO_NE
-        LODI,R0 3
-        STRA,R0 RELOP
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        RETC,UN
-PRO_LE:
-        BSTA,UN INC_IP
-PRO_LEN:
-        LODI,R0 5
-        STRA,R0 RELOP
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        RETC,UN
-PRO_NE:
-        BSTA,UN INC_IP
-PRO_NEN:
-        LODI,R0 2
-        STRA,R0 RELOP
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        RETC,UN
-PRO_GT:
-        BSTA,UN INC_IP
-PRO_GTN:
-        BSTA,UN WSKIP                    ; [+1]
-        LODA,R0 *IPH
-        COMI,R0 A'='
-        BCTA,EQ PRO_GE
-        LODI,R0 4
-        STRA,R0 RELOP
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        RETC,UN
-PRO_GE:
-        BSTA,UN INC_IP
-PRO_GEN:
-        LODI,R0 6
-        STRA,R0 RELOP
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        RETC,UN
-
-; ─── PARSE_S16 ────────────────────────────────────────────────────────────────
-; Parse optional leading '-' then decimal digits → EXPH:EXPL. ERRFLG=$00 if digits.
-PARSE_S16:
-        EORZ,R0 ; Clear R0
-        STRA,R0 NEGFLG
-        BSTA,UN WSKIP                    ; [+1]
-        LODA,R0 *IPH
-        COMI,R0 A'-'
-        BCTA,EQ PS16_NEG
-        BCTA,UN PS16_UN
-PS16_NEG:
-        BSTA,UN INC_IP
-PS16_NN:
-        LODI,R0 1               ; BUG-BASIC-05 FIX: NEGFLG=1 = "negate result"
-        STRA,R0 NEGFLG          ; was EORZ,R0 which cleared flag, skipping negation
-PS16_UN:
-        BSTA,UN PARSE_U16                ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTA,EQ PS16_CHK
-        RETC,UN
-PS16_CHK:
-        LODA,R0 NEGFLG
-        COMI,R0 $00
-        BCTA,EQ PS16_RET
-        ; negate EXPH:EXPL
-        LODA,R0 EXPH
-        EORI,R0 $FF
-        STRA,R0 EXPH
-        LODA,R0 EXPL
-        EORI,R0 $FF
-        STRA,R0 EXPL
-        BSTA,UN INC_EXP
-PS16_RET:
-        RETC,UN
-
-; ─── PARSE_U16 ────────────────────────────────────────────────────────────────
-; Parse unsigned decimal digits → EXPH:EXPL. ERRFLG=$00 if ≥1 digit.
-PARSE_U16:
-        EORZ,R0 ; Clear R0
-        STRA,R0 EXPH
-        STRA,R0 EXPL
-        LODI,R0 1               ; BUG-BASIC-06 FIX: ERRFLG=1 = "no digits yet" (failure)
-        STRA,R0 ERRFLG          ; was EORZ,R0 meaning "success" before any digit seen
-PU16_LP:
-        BSTA,UN WSKIP                    ; [+1]
-        LODA,R0 *IPH
-        COMI,R0 A'0'
-        ;BCTA,LT PU16_DONE
-        RETC,LT
-        COMI,R0 A'9'+1
-        BCTA,LT PU16_DIG
-        ;BCTA,UN PU16_DONE
-        RETC,UN
-PU16_DIG:
-        SUBI,R0 A'0'
-        STRA,R0 SC0  ; digit value 0-9
-        BSTA,UN INC_IP
-PU16_DNC:
-        ; BUG-SCA-10 FIX: EXP = EXP*10.  Was LODI,R3 10 / BRNR,R3 — BRNR never
-        ; decrements R3, so loop ran forever for any input with 2+ digits.
-        ; BUG-SCA-11 FIX: BDRR semantics are rn--; if(rn!=0) branch. Load N for
-        ; exactly N iterations. Need 10 additions so load 10: 10→9→...→1→0→exit.
-        LODA,R0 EXPH
-        STRA,R0 TMPH
-        LODA,R0 EXPL
-        STRA,R0 TMPL  ; TMPH:TMPL = old EXP
-        EORZ,R0 ; Clear R0
-        STRA,R0 EXPH
-        STRA,R0 EXPL
-        LODI,R3 10              ; 10 iterations: R3 counts 10→9→...→1→0→exit
-PU16_M10:
-        LODA,R0 EXPL
-        ADDA,R0 TMPL
-        STRA,R0 EXPL
-        BCTA,GT PU16_MNC
-        LODA,R0 EXPH
-        ADDI,R0 1
-        STRA,R0 EXPH
-PU16_MNC:
-        LODA,R0 EXPH
-        ADDA,R0 TMPH
-        STRA,R0 EXPH
-        BDRR,R3 PU16_M10       ; R3--; if R3!=0 branch
-        ; EXP += digit
-        LODA,R0 EXPL
-        ADDA,R0 SC0
-        STRA,R0 EXPL
-        BCTA,GT PU16_DIG_NC
-        LODA,R0 EXPH
-        ADDI,R0 1
-        STRA,R0 EXPH
-PU16_DIG_NC:
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG  ; success: at least one digit
-        BCTA,UN PU16_LP
-PU16_DONE:
-        ; RETC,UN
-
-; ─── MUL16 ────────────────────────────────────────────────────────────────────
-; Signed TMPH:TMPL × EXPH:EXPL → EXPH:EXPL  (16-bit two's complement wrap)
-MUL16:
-        EORZ,R0 ; Clear R0
-        STRA,R0 NEGFLG
-        ; abs(left) TMPH:TMPL
-        LODA,R0 TMPH
-        ANDI,R0 $80
-        BCTA,EQ MU_LA
-        LODA,R0 TMPH
-        EORI,R0 $FF
-        STRA,R0 TMPH
-        LODA,R0 TMPL
-        EORI,R0 $FF
-        STRA,R0 TMPL
-        LODA,R0 TMPL
-        ADDI,R0 1
-        STRA,R0 TMPL
-        BCTA,GT MU_LNC
-        LODA,R0 TMPH
-        ADDI,R0 1
-        STRA,R0 TMPH
-MU_LNC:
-        LODI,R0 1               ; ISSUE-01 FIX (corrected): set NEGFLG=1 on BOTH
-        STRA,R0 NEGFLG          ; carry and no-carry paths — left was negative
-MU_LA:
-        ; abs(right) EXPH:EXPL
-        LODA,R0 EXPH
-        ANDI,R0 $80
-        BCTA,EQ MU_RA
-        LODA,R0 EXPH
-        EORI,R0 $FF
-        STRA,R0 EXPH
-        LODA,R0 EXPL
-        EORI,R0 $FF
-        STRA,R0 EXPL
-        LODA,R0 EXPL
-        ADDI,R0 1
-        STRA,R0 EXPL
-        ; BUG-SCA-09 FIX: was BCTA,GT MU_RA — this jumped over BOTH the hi-byte
-        ; increment AND the NEGFLG toggle, so for most negative right values (those
-        ; whose +1 does not carry to hi byte, e.g. -3→$FFFD, abs=$0003) NEGFLG was
-        ; never toggled → wrong sign (3*-3=+9 not -9). Fix: introduce MU_RA_NC so
-        ; no-carry path skips only the hi-byte increment, then BOTH paths toggle.
-        BCTA,GT MU_RA_NC        ; GT = no carry from lo-byte +1: skip hi increment
-        LODA,R0 EXPH
-        ADDI,R0 1
-        STRA,R0 EXPH
-MU_RA_NC:
-        LODA,R0 NEGFLG          ; toggle sign on BOTH carry and no-carry paths
-        EORI,R0 $01
-        STRA,R0 NEGFLG
-MU_RA:
-        ; save right in SC0:SC1; result EXP=0
-        LODA,R0 EXPH
-        STRA,R0 SC0
-        LODA,R0 EXPL
-        STRA,R0 SC1
-        EORZ,R0 ; Clear R0
-        STRA,R0 EXPH
-        STRA,R0 EXPL
-MU_LP:
-        LODA,R0 TMPH
-        COMI,R0 $00
-        BCTA,GT MU_ADD
-        LODA,R0 TMPL
-        COMI,R0 $00
-        BCTA,EQ MU_DONE
-MU_ADD:
-        LODA,R0 EXPL
-        ADDA,R0 SC1
-        STRA,R0 EXPL
-        BCTA,GT MU_MNC
-        LODA,R0 EXPH
-        ADDI,R0 1
-        STRA,R0 EXPH
-MU_MNC:
-        LODA,R0 EXPH
-        ADDA,R0 SC0
-        STRA,R0 EXPH
-        ; TMPH:TMPL-- (left counter)
-        LODA,R0 TMPL
-        SUBI,R0 1
-        STRA,R0 TMPL
-        BCFA,LT MU_TNB
-        LODA,R0 TMPH
-        SUBI,R0 1
-        STRA,R0 TMPH
-MU_TNB:
-        BCTA,UN MU_LP
-MU_DONE:
-        LODA,R0 NEGFLG
-        COMI,R0 $00
-        BCTA,EQ MU_RET
-        LODA,R0 EXPH
-        EORI,R0 $FF
-        STRA,R0 EXPH
-        LODA,R0 EXPL
-        EORI,R0 $FF
-        STRA,R0 EXPL
-        BSTA,UN INC_EXP
-MU_RET:
-        EORZ,R0                          ; ISSUE-01 RE-FIX pt2: clear NEGFLG on
-        STRA,R0 NEGFLG                   ; exit — dual-use with CHR$ flag in DO_PRINT
-        RETC,UN
-
-; ─── DIV16 ────────────────────────────────────────────────────────────────────
-; Signed TMPH:TMPL ÷ EXPH:EXPL → EXPH:EXPL  (truncate toward zero)
-; ERRFLG=$01 and DO_ERROR called on divide-by-zero.
-DIV16:
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        LODA,R0 EXPH
-        COMI,R0 $00
-        BCTA,GT DV_NZ
-        LODA,R0 EXPL
-        COMI,R0 $00
-        BCTA,EQ DV_ZERO
-DV_NZ:
-        EORZ,R0 ; Clear R0
-        STRA,R0 NEGFLG
-        ; abs(dividend) TMPH:TMPL
-        LODA,R0 TMPH
-        ANDI,R0 $80
-        BCTA,EQ DV_DA
-        LODA,R0 TMPH
-        EORI,R0 $FF
-        STRA,R0 TMPH
-        LODA,R0 TMPL
-        EORI,R0 $FF
-        STRA,R0 TMPL
-        LODA,R0 TMPL
-        ADDI,R0 1
-        STRA,R0 TMPL
-        BCTA,GT DV_DNC
-        LODA,R0 TMPH
-        ADDI,R0 1
-        STRA,R0 TMPH
-DV_DNC:
-        LODI,R0 1               ; ISSUE-01 FIX (corrected): set NEGFLG=1 on BOTH
-        STRA,R0 NEGFLG          ; carry and no-carry paths — dividend was negative
-DV_DA:
-        ; abs(divisor) EXPH:EXPL
-        LODA,R0 EXPH
-        ANDI,R0 $80
-        BCTA,EQ DV_VA
-        LODA,R0 EXPH
-        EORI,R0 $FF
-        STRA,R0 EXPH
-        LODA,R0 EXPL
-        EORI,R0 $FF
-        STRA,R0 EXPL
-        LODA,R0 EXPL
-        ADDI,R0 1
-        STRA,R0 EXPL
-        ; BUG-SCA-09b FIX: same as MUL16 right-operand fix. BCTA,GT DV_VA jumped
-        ; over BOTH hi-byte increment AND NEGFLG toggle for no-carry cases.
-        ; Fix: introduce DV_VA_NC so no-carry skips only the hi-byte increment.
-        BCTA,GT DV_VA_NC        ; GT = no carry: skip hi increment
-        LODA,R0 EXPH
-        ADDI,R0 1
-        STRA,R0 EXPH
-DV_VA_NC:
-        LODA,R0 NEGFLG          ; toggle sign on BOTH paths
-        EORI,R0 $01
-        STRA,R0 NEGFLG
-DV_VA:
-        LODA,R0 EXPH
-        STRA,R0 SC0  ; divisor hi
-        LODA,R0 EXPL
-        STRA,R0 SC1  ; divisor lo
-        EORZ,R0 ; Clear R0
-        STRA,R0 EXPH
-        STRA,R0 EXPL  ; quotient = 0
-DV_LP:
-        ; while TMPH:TMPL >= SC0:SC1
-        LODA,R0 TMPH
-        SUBA,R0 SC0
-        BCTA,LT DV_DONE
-        BCTA,GT DV_SUB
-        LODA,R0 TMPL
-        SUBA,R0 SC1
-        BCTA,LT DV_DONE
-DV_SUB:
-        LODA,R0 TMPL
-        SUBA,R0 SC1
-        STRA,R0 TMPL
-        BCFA,LT DV_SNB
-        LODA,R0 TMPH
-        SUBI,R0 1
-        STRA,R0 TMPH
-DV_SNB:
-        LODA,R0 TMPH
-        SUBA,R0 SC0
-        STRA,R0 TMPH
-        ; quotient++
-        BSTA,UN INC_EXP
-        BCTA,UN DV_LP
-DV_DONE:
-        LODA,R0 NEGFLG
-        COMI,R0 $00
-        BCTA,EQ DV_RET
-        LODA,R0 EXPH
-        EORI,R0 $FF
-        STRA,R0 EXPH
-        LODA,R0 EXPL
-        EORI,R0 $FF
-        STRA,R0 EXPL
-        BSTA,UN INC_EXP
-DV_RET:
-        EORZ,R0                          ; ISSUE-01 RE-FIX pt2: clear NEGFLG on
-        STRA,R0 NEGFLG                   ; exit — dual-use with CHR$ flag in DO_PRINT
-        RETC,UN
-DV_ZERO:
-        LODI,R0 2
-        BCTA,UN DO_ERROR  ; divide by zero error
-
-; ─── PRINT_S16 ────────────────────────────────────────────────────────────────
-; Print signed 16-bit value EXPH:EXPL as decimal.
-; Uses DIVTAB for digit extraction. NEGFLG = leading-zero suppression flag.
-PRINT_S16:
-        LODA,R0 EXPH
-        ANDI,R0 $80
-        BCTA,EQ PS16P_POS
-        LODI,R0 A'-'
-        BSTA,UN COUT
-        ; negate
-        LODA,R0 EXPH
-        EORI,R0 $FF
-        STRA,R0 EXPH
-        LODA,R0 EXPL
-        EORI,R0 $FF
-        STRA,R0 EXPL
-        BSTA,UN INC_EXP
-PS16P_POS:
-        LODA,R0 EXPH
-        COMI,R0 $00
-        BCTA,GT PS16P_NZ
-        LODA,R0 EXPL
-        COMI,R0 $00
-        BCTA,GT PS16P_NZ
-        LODI,R0 A'0'
-        BSTA,UN COUT
-        RETC,UN
-
-PS16P_NZ:
-        LODI,R0 <DIVTAB
-        STRA,R0 TMPH
-        LODI,R0 >DIVTAB
-        STRA,R0 TMPL
-        EORZ,R0 ; Clear R0
-        STRA,R0 NEGFLG  ; leading-zero flag
-PS16P_DIVLP:
-        ; load next divisor pair from DIVTAB
-        LODA,R0 *TMPH
-        STRA,R0 SC0  ; div hi
-        BSTA,UN INC_TMP
-PS16P_D1:
-        LODA,R0 *TMPH
-        STRA,R0 SC1  ; div lo
-        BSTA,UN INC_TMP
-PS16P_D2:
-        ; sentinel 0,0 → print final ones digit
-        LODA,R0 SC0
-        COMI,R0 $00
-        BCTA,GT PS16P_CNT
-        LODA,R0 SC1
-        COMI,R0 $00
-        BCTA,EQ PS16P_LAST
-PS16P_CNT:
-        ; count subtractions using R3 (BIRR: increment and branch while nonzero)
-        LODI,R3 $00
-PS16P_SLP:
-        LODA,R0 EXPH
-        SUBA,R0 SC0
-        BCTA,LT PS16P_EMIT
-        BCTA,GT PS16P_DO
-        LODA,R0 EXPL
-        SUBA,R0 SC1
-        BCTA,LT PS16P_EMIT
-PS16P_DO:
-        LODA,R0 EXPL
-        SUBA,R0 SC1
-        STRA,R0 EXPL
-        BCFA,LT PS16P_SNB
-        LODA,R0 EXPH
-        SUBI,R0 1
-        STRA,R0 EXPH
-PS16P_SNB:
-        LODA,R0 EXPH
-        SUBA,R0 SC0
-        STRA,R0 EXPH
-        BIRR,R3 PS16P_SLP       ; R3++  ; loop
-PS16P_EMIT:
-        ; R3 = digit value
-        LODA,R0 NEGFLG
-        COMI,R0 $00
-        BCTA,GT PS16P_FPRINT  ; already printing
-        ; leading zero check: LODZ,R3 → R0 = R3
-        LODZ,R3                 ; R0 = R3 (digit count, LODZ Rn loads Rn into R0)
-        COMI,R0 $00
-        BCTA,EQ PS16P_DIVLP  ; skip leading zero
-PS16P_FPRINT:
-        LODZ,R3                 ; R0 = R3 (digit value 0-9)
-        ADDI,R0 A'0'            ; R0 = ASCII digit
-        BSTA,UN COUT
-        LODI,R0 1               ; BUG-BASIC-04 FIX: NEGFLG=1 = "digits active, print all"
-        STRA,R0 NEGFLG          ; was EORZ,R0 which cleared flag, suppressing subsequent digits
-        BCTA,UN PS16P_DIVLP
-PS16P_LAST:
-        LODA,R0 EXPL
-        ADDI,R0 A'0'
-        BSTA,UN COUT
-        RETC,UN
-
-; ─── GETKEY ───────────────────────────────────────────────────────────────────
-; Blocking keyboard read via Pipbug CHIN.
-; CHIN is blocking — waits for a keypress before returning.
+; =============================================================================
+; MAIN  --  immediate-mode prompt / dispatch loop
 ;
-; Later Implement Proprietary Bitbanged SENSE input when basic working
-; Returns char in R0.  Clobbers R0 only.
-GETKEY:
-;        BSTA,UN CHIN            ; R0 = char (CHIN blocks until key pressed)
-;        RETC,UN
+;   In:  -- (falls through from INIT, or jumped to from DO_ERROR / DO_END)
+;   Out: never returns
+;   Clobbers: everything (infinite loop)
+;
+;   Reads one line from the terminal.  Lines that start with a digit are
+;   routed to EDITLN (program store editor); all others are executed
+;   immediately via STMT_LINE.
+; =============================================================================
+MAIN:
+         LDA #0
+         STA RUN              ; clear run flag (immediate mode)
+         JSR GETLINE_M        ; print "> "; read line; set IP = IBUF
+         JSR WPEEK            ; skip spaces; peek first non-space char into A
+         CMP #CR
+         BEQ MAIN             ; blank line: restart prompt
+         SEC
+         SBC #'0'             ; map '0'..'9' to 0..9; anything outside -> not a digit
+         CMP #10
+         BCS MAIN_DIR         ; >= 10: not a digit -- treat as direct statement
+         JSR EDITLN           ; digit: store / delete numbered line
+         JMP MAIN
+MAIN_DIR:
+         JSR STMT_LINE        ; execute as immediate statement
+         JMP MAIN
 
-; ─── RDLINE ───────────────────────────────────────────────────────────────────
-; Read a line from input into IBUF, echo with backspace support. NUL-terminates.
-; Uses GETKEY (via CHIN) for blocking input. Char received in R0 at each step;
-; saved to R1 for storage/echo so R0 is free for pointer arithmetic.
-RDLINE:
-        LODI,R0 <IBUF
-        STRA,R0 IPH
-        LODI,R0 >IBUF
-        STRA,R0 IPL
-RL_LP:
-        BSTA,UN CHIN          ; [+1] blocking — R0 = char
-        COMI,R0 NUL             ; BUG-ASM-08 FIX: NUL = EOF from sim stdin.
-        BCTA,EQ RL_EOL          ;   Treat as end-of-line so we don't flood IBUF
-        ;                       ;   (and overwrite VARS) after stdin is exhausted.
-        STRZ,R1                 ; R1 = char (R0 still has char for CR/BS checks)
-        COMI,R1 CR
-        BCTA,EQ RL_EOL
-        COMI,R1 LF
-        BCTA,EQ RL_EOL
-        ; ISSUE-06 FIX: removed redundant second COMI,R1 NUL / BCTA,EQ RL_EOL here.
-        ; BUG-ASM-08 fix (first NUL check immediately after GETKEY above) already
-        ; catches EOF before we reach this point — second check was dead code.
-        COMI,R1 BS
-        BCTA,EQ RL_BS
-        ; buffer full?  IP >= IBUF+63
-        ; BUG-BASIC-17 FIX: was SUBA (absolute read) not SUBI (immediate compare).
-        ; SUBA,R0 <IBUF reads mem[$0015] (PIPBUG ROM), not the constant $15.
-        ; All four pointer comparisons here must use SUBI.
-        LODA,R0 IPH
-        SUBI,R0 <IBUF           ; compare IPH against IBUF hi byte ($15)
-        BCTA,GT RL_FULL
-        BCTA,LT RL_STORE
-        LODA,R0 IPL
-        SUBI,R0 >IBUF+63        ; compare IPL against IBUF lo byte + 63 ($83)
-        BCTA,LT RL_STORE
-RL_FULL:
-        BCTA,UN RL_LP
-RL_STORE:
-        STRA,R1 *IPH            ; store char to buffer
-        LODZ,R1
-        BSTA,UN COUT            ; echo char
-        BSTA,UN INC_IP
-        BCTA,UN RL_LP
-RL_BS:
-        ; at IBUF start? — no backspace if buffer empty
-        LODA,R0 IPH
-        SUBI,R0 <IBUF           ; compare IPH against IBUF hi byte ($15)
-        BCTA,GT RL_BSDO
-        BCTA,LT RL_LP
-        LODA,R0 IPL
-        SUBI,R0 >IBUF           ; compare IPL against IBUF lo byte ($44)
-        BCTA,EQ RL_LP
-RL_BSDO:
-        LODA,R0 IPL
-        SUBI,R0 1
-        STRA,R0 IPL
-        BCFA,LT RL_BSNB
-        LODA,R0 IPH
-        SUBI,R0 1
-        STRA,R0 IPH
-RL_BSNB:
-        LODI,R0 BS
-        BSTA,UN COUT
-        LODI,R0 SP
-        BSTA,UN COUT
-        LODI,R0 BS
-        BSTA,UN COUT
-        BCTA,UN RL_LP
-RL_EOL:
-        LODI,R1 NUL
-        STRA,R1 *IPH            ; NUL-terminate buffer
-        BSTA,UN CRLF
-        RETC,UN
-
-; ─── PRTSTR / PRTSTR_IP ───────────────────────────────────────────────────────
-; Print NUL-terminated string at IPH:IPL.
-; PRTSTR_IP is the same routine, just an alias for clarity at the call site.
-PRTSTR_IP:
-PRTSTR:
-        LODA,R1 *IPH
-        COMI,R1 NUL
-        ;BCTA,EQ PRTSTR_RET
-        RETC,EQ
-        LODZ,R1
-        BSTA,UN COUT
-        BSTA,UN INC_IP
-        BCTR,UN PRTSTR
-PRTSTR_RET:
-       ; RETC,UN
-
-; ─── WSKIP ────────────────────────────────────────────────────────────────────
-WSKIP:
-        LODA,R0 *IPH
-        COMI,R0 SP
-        BCTR,EQ WS_ADV
-        RETC,UN
-WS_ADV:
-        BSTA,UN INC_IP
-        BCTA,UN WSKIP
-
-; ─── GETCI_UC ─────────────────────────────────────────────────────────────────
-; Read *IPH uppercase into R0, advance IP.
-; BUG-ASM-04 FIX: INC_IP clobbers R0 (returns new IPL). Save char in R1
-; across the INC_IP call using STRZ,R1 / LODZ,R1 sandwich.
-; Clobbers: R1 (caller must not rely on R1 across GETCI_UC call)
-GETCI_UC:
-        LODA,R0 *IPH
-        BSTR,UN UPCASE                   ; [+1] R0 = uppercased char
-        STRZ,R1                          ; R1 = char (save before INC_IP clobbers R0)
-        BSTA,UN INC_IP                   ; [+1] advance IP (clobbers R0)
-        LODZ,R1                          ; R0 = char (restore)
-GETCI_UC_RET:
-        RETC,UN
-
-; ─── UPCASE ───────────────────────────────────────────────────────────────────
-UPCASE:
-        COMI,R0 A'a'
-        ; BCTA,LT UC_RET
-        RETC,LT
-        COMI,R0 A'z'+1
-        BCTR,LT UC_DO
-        ;BCTR,UN UC_RET
-        RETC,UN
-UC_DO:
-        SUBI,R0 32
-UC_RET:
-        RETC,UN
-
-; ─── EATWORD ──────────────────────────────────────────────────────────────────
-; Skip [A-Za-z$] at IP.
-EATWORD:
-        LODA,R0 *IPH
-        BSTR,UN UPCASE  ; [+1]
-        COMI,R0 A'A'
-        BCTR,LT EW_DS
-        COMI,R0 A'Z'+1
-        BCTR,LT EW_ADV
-EW_DS:
-        COMI,R0 A'$'
-        BCTR,EQ EW_ADV
-        RETC,UN
-EW_ADV:
-        BSTA,UN INC_IP
-        BCTR,UN EATWORD
-
-; ─── SHARED 16-BIT POINTER INCREMENT/DECREMENT SUBROUTINES ───────────────────
-; INC_IP  : IPH:IPL  += 1   (clobbers R0)
-; INC_TMP : TMPH:TMPL += 1  (clobbers R0)
-; INC_EXP : EXPH:EXPL += 1  (clobbers R0)
-; DEC_TMP : TMPH:TMPL -= 1  (clobbers R0)
-; Rule: NO BSTA inside these — must not consume extra RAS depth.
-; Carry idiom: ADDI sets no-carry->GT, carry->EQ/LT.
-;   BCTA,GT skip  =  skip hi-byte increment if no carry from lo-byte add.
-; Borrow idiom: SUBI sets no-borrow->GT/EQ, borrow->LT.
-;   BCFA,LT skip  =  skip hi-byte decrement if no borrow (C=1).
-
-INC_IP:
-        LODA,R0 IPL
-        ADDI,R0 1
-        STRA,R0 IPL
-        ;BCTA,GT INC_IP_RET      ; no carry — hi byte unchanged
-        RETC,GT
-        LODA,R0 IPH
-        ADDI,R0 1
-        STRA,R0 IPH
-INC_IP_RET:
-        RETC,UN
-
-INC_TMP:
-        LODA,R0 TMPL
-        ADDI,R0 1
-        STRA,R0 TMPL
-        ;BCTA,GT INC_TMP_RET     ; no carry
-        RETC,GT
-        LODA,R0 TMPH
-        ADDI,R0 1
-        STRA,R0 TMPH
-INC_TMP_RET:
-        RETC,UN
-
-INC_EXP:
-        LODA,R0 EXPL
-        ADDI,R0 1
-        STRA,R0 EXPL
-        ;BCTA,GT INC_EXP_RET     ; no carry
-        RETC,GT
-        LODA,R0 EXPH
-        ADDI,R0 1
-        STRA,R0 EXPH
-INC_EXP_RET:
-        RETC,UN
-
-DEC_TMP:
-        LODA,R0 TMPL
-        SUBI,R0 1
-        STRA,R0 TMPL
-        BCFR,LT DEC_TMP_RET     ; no borrow (C=1) — hi byte unchanged
-        LODA,R0 TMPH
-        SUBI,R0 1
-        STRA,R0 TMPH
-DEC_TMP_RET:
-        RETC,UN
-
-
-; ─── DO_ERROR ─────────────────────────────────────────────────────────────────
-; Entry: R0 = error code (0-5).
-; Saves RUNFLG, clears all run state, prints "?n [IN line]", jumps to REPL.
-; This is a tail-jump (BCTA,UN DO_ERROR from callers), so it kills the full RAS.
+; =============================================================================
+; DO_ERROR  --  print error message and return to immediate mode
+;
+;   In:  A = ERR_xx code (0-4)
+;   Out: never returns to caller; jumps to MAIN
+;   Clobbers: everything
+;
+;   Prints:  CR+LF  "?N"  [" IN <linenum>"]  CR+LF  then jumps to MAIN.
+;   The " IN <linenum>" annotation is only printed when RUN != 0.
+;   DO_break_in is a mid-function entry used by IRQ_HANDLER (BREAK interrupt).
+; =============================================================================
 DO_ERROR:
-        STRA,R0 SC0                      ; save error code
-        LODA,R0 RUNFLG
-        STRA,R0 SC1  ; save run state
-        EORZ,R0 ; Clear R0
-        STRA,R0 RUNFLG  ; clear run
-        LODI,R0 $FF
-        STRA,R0 SWSP  ; clear GOSUB stack
-        LODI,R0 A'?'
-        BSTA,UN COUT
-        LODA,R0 SC0
-        ADDI,R0 A'0'
-        BSTA,UN COUT
-        LODA,R0 SC1
-        COMI,R0 $01
-        BCTR,EQ DE_IN
-        BCTR,UN DE_NL
-DE_IN:
-        LODI,R0 SP
-        BSTA,UN COUT
-        LODI,R0 A'I'
-        BSTA,UN COUT
-        LODI,R0 A'N'
-        BSTA,UN COUT
-        LODI,R0 SP
-        BSTA,UN COUT
-        LODA,R0 CURH
-        STRA,R0 EXPH
-        LODA,R0 CURL
-        STRA,R0 EXPL
-        BSTA,UN PRINT_S16                ; [+1]
-DE_NL:
-        BSTA,UN CRLF
-        BCTA,UN REPL                     ; jump to REPL — clears full hardware RAS
-ROMEND: ; so we can measure Binary rom size
-        END
+         PHA                  ; save error code
+         JSR PRNL             ; CR+LF before error message
+         LDA #'?'
+         JSR PUTCH
+         PLA
+         CLC
+         ADC #'0'
+         JSR PUTCH            ; print "?N"
+         LDA RUN
+         BEQ DO_ERR_NL        ; not running: omit " IN <line>" annotation
+DO_break_in:
+         LDA #<STR_IN
+         JSR PUTSTR           ; print " IN "
+         LDA CURLN
+         STA T0
+         LDA CURLN+1
+         STA T0+1
+         JSR PRT16            ; print line number
+DO_ERR_NL:
+         JSR PRNL             ; CR+LF after error message
+         JMP MAIN
+
+; =============================================================================
+; IRQ_HANDLER  --  maskable interrupt handler ($FFFE vector)
+;
+;   In:  -- (entered via hardware IRQ; CPU has pushed PChi, PClo, P)
+;   Out: if RUN != 0: unwinds stack, prints BREAK+linenum, jumps to MAIN
+;        if RUN == 0: silently ignored (RTI)
+;   Clobbers: A X  (stack deliberately abandoned when running)
+;
+;   Triggered by writing any value to IO_IRQ ($E007) -- the "Break" key.
+;   When a program is running: restores the stack to RUNSP (unwinding all
+;   call frames), prints "\r\nBREAK IN <linenum>\r\n", then jumps to MAIN.
+;   The program store is left intact; the user can LIST or RUN again.
+;   When idle at the prompt: RTI silently discards the interrupt.
+; =============================================================================
+IRQ_HANDLER:
+         LDA RUN              ; is a program running?
+         BEQ IRQ_idle         ; no: ignore interrupt
+         LDX RUNSP            ; yes: restore SP to pre-run snapshot
+         TXS                  ; (unwinds all JSR frames accumulated during RUN)
+         LDA #<STR_BREAK
+         JSR PUTSTR           ; print "\r\nBREAK"
+         JMP DO_break_in      ; print " IN <linenum>\r\n" then jump to MAIN
+IRQ_idle:
+         RTI                  ; idle: silently discard interrupt
+
+; =============================================================================
+; DO_INPUT  --  INPUT <var>
+;
+;   In:  IP -> variable name in source
+;   Out: named variable updated; IP restored to position after variable name
+;   Clobbers: A X Y T0 T1 T2 IP
+; =============================================================================
+DO_INPUT:
+         JSR WPEEK_UC         ; skip spaces; peek var name uppercased
+         CMP #'A'
+         BCC DO_IN_DN         ; not a letter -- nothing to do
+         CMP #'Z'+1
+         BCS DO_IN_DN
+         JSR GETCI            ; consume the variable letter
+         JSR UC               ; ensure uppercase
+         SEC
+         SBC #'A'
+         ASL                  ; -> VARS byte offset (0, 2, 4 ...)
+         PHA                  ; [S: var_offset]
+         LDA IP+1
+         PHA                  ; [S: var_offset, IP_hi]
+         LDA IP
+         PHA                  ; [S: var_offset, IP_hi, IP_lo]
+         JSR GETLINE_I        ; print "? "; read user input; IP = IBUF
+         JSR EXPR             ; evaluate expression -> T0
+         PLA
+         STA IP               ; restore IP
+         PLA
+         STA IP+1
+         PLA
+         TAX                  ; X = VARS offset
+         LDA T0
+         STA VARS,X           ; store result into variable
+         LDA T0+1
+         STA VARS+1,X
+; DO_IN_DN and ST_NOP are adjacent because DO_INPUT and the REM handler both
+; want a plain RTS and this is the nearest one.
+DO_IN_DN:
+ST_NOP:  RTS
+
+; =============================================================================
+; GETLINE  --  read one line from the terminal into IBUF; set IP = IBUF
+;
+;   Three entry points sharing one body:
+;     GETLINE_M  prints "> " (immediate-mode prompt)
+;     GETLINE_I  prints "? " (INPUT statement prompt)
+;     GETLINE    no prompt
+;
+;   In:  --
+;   Out: IBUF filled with input, CR-terminated; IP = IBUF
+;   Clobbers: A X IP
+;
+;   Supports backspace (BS) to delete the last character.
+;   Overflow characters (beyond IBUF_MAX) are silently discarded.
+;   After CR is received, outputs CR+LF via PRNL before returning.
+;
+;   Trick: GETLINE_M loads '>' then uses a .DB $2C (BIT abs opcode) as a
+;   2-byte skip to fall past the LDA #'?' in GETLINE_I.
+; =============================================================================
+GETLINE_M:
+         LDA #'>'
+         .DB $2C              ; BIT abs: fetches & discards next 2 bytes as operand
+GETLINE_I:
+         LDA #'?'
+         JSR PUTCH
+         LDA #' '
+         JSR PUTCH
+GETLINE:
+         LDX #0
+GL_LP:   JSR GETCH            ; read one char (GETCH also echoes it)
+         CMP #CR
+         BEQ GL_DONE
+         CMP #BS
+         BNE GL_STORE
+         CPX #0
+         BEQ GL_LP            ; backspace on empty buffer -- ignore
+         DEX
+         BPL GL_LP            ; always taken here (X never reaches bit7 in IBUF range)
+GL_STORE:
+         CPX #IBUF_MAX
+         BCS GL_LP            ; buffer full -- ignore overflow
+         STA IBUF,X
+         INX
+         BPL GL_LP            ; always taken here (IBUF index remains < $80)
+GL_DONE: STA IBUF,X           ; store CR as in-band terminator
+         JSR PRNL             ; output CR+LF
+         LDA #<IBUF
+         STA IP
+         LDA #>IBUF
+         STA IP+1
+; PN_DN is the RTS for both GETLINE (falls off the end here) and PNUM (branches
+; here when the first non-digit is seen).  They share because this is the
+; nearest RTS to both call sites.
+PN_DN:   RTS
+
+; =============================================================================
+; PNUM  --  parse unsigned decimal integer from ASCII at IP into T0
+;
+;   In:  IP -> ASCII digits (leading spaces skipped automatically)
+;   Out: T0 = parsed value; IP advanced past the last digit
+;   Clobbers: A X T0 T2
+;
+;   Stops at the first non-digit without consuming it.
+;   Algorithm: T0 = T0*10 + digit, using T0*8 + T0*2 to avoid a multiply.
+;   Called by EDITLN, DO_GOTO, and EXPR2.
+; =============================================================================
+PNUM:
+         JSR WSKIP            ; skip leading spaces
+         LDA #0               ; clear result
+         STA T0
+         STA T0+1
+PN_LP:   LDY #0
+         LDA (IP),Y           ; peek without consuming
+         SEC
+         SBC #'0'             ; map '0'-'9' to 0-9
+         BCC PN_DN            ; below '0' -- done  (branches to shared RTS above)
+         CMP #10
+         BCS PN_DN            ; above '9' -- done
+         PHA                  ; save digit (0-9)
+         INC IP               ; consume digit: 16-bit increment
+         BNE PN_SK
+         INC IP+1
+PN_SK:   ASL T0               ; T0 = T0 * 2
+         ROL T0+1
+         LDA T0               ; save T0*2 lo for later addition
+         STA T2
+         LDX T0+1             ; save T0*2 hi in X (1 byte vs STX T2+1)
+         ASL T0               ; T0 = T0 * 4
+         ROL T0+1
+         ASL T0               ; T0 = T0 * 8
+         ROL T0+1
+         PLA                  ; restore digit
+         CLC
+         ADC T0               ; digit + T0*8 lo
+         ADC T2               ; + T0*2 lo
+         STA T0
+         TXA
+         ADC T0+1             ; T0*2 hi + T0*8 hi + carry
+         STA T0+1
+         JMP PN_LP
+
+; =============================================================================
+; DELINE  --  remove the line at LP from the program store; adjust PE
+;
+;   In:  LP -> start of line to delete (the line-number lo byte)
+;        PE -> one past the last program byte
+;   Out: line removed; PE decremented by line length
+;   Clobbers: A X Y T0 T1 T2 PE
+;
+;   Measures the line length by scanning for CR (starting at body offset 2),
+;   then shifts all subsequent bytes forward to close the gap.
+; =============================================================================
+DELINE:
+         LDY #2
+DL_LL:   LDA (LP),Y           ; scan body + CR
+         INY
+         CMP #CR
+         BNE DL_LL            ; Y now = bytes from LP to first byte AFTER CR
+         STY T1               ; T1 = line length (header + body + CR)
+         TYA
+         CLC
+         ADC LP
+         STA T0               ; T0 = LP + length = first byte of next line
+         LDA LP+1
+         ADC #0
+         STA T0+1
+         LDA PE               ; T2 = PE - T0 = bytes to copy forward
+         SEC
+         SBC T0
+         STA T2
+         LDA PE+1
+         SBC T0+1
+         STA T2+1
+         LDA T2
+         ORA T2+1
+         BEQ DL_UPD           ; nothing to shift -- just update PE
+         LDY #0
+DL_CP:   LDA (T0),Y           ; forward copy: (T0),Y -> (LP),Y
+         STA (LP),Y
+         INY
+         BNE DL_NHI
+         INC T0+1             ; Y wrapped -- advance both hi-bytes
+         INC LP+1
+DL_NHI:  LDA T2               ; decrement 16-bit counter T2
+         BNE DL_DC
+         DEC T2+1
+DL_DC:   DEC T2
+         LDA T2
+         ORA T2+1
+         BNE DL_CP
+DL_UPD:  LDA PE               ; PE -= line length
+         SEC
+         SBC T1
+         STA PE
+         BCS DL_OK
+         DEC PE+1
+; EL_DN and DL_OK are adjacent because both EDITLN (delete-only path) and
+; DELINE share this single RTS.
+EL_DN:
+DL_OK:   RTS
+
+; =============================================================================
+; EDITLN  --  insert, replace, or delete a numbered line in the program store
+;
+;   In:  IP -> line-number digits in IBUF (spaces already skipped by MAIN)
+;   Out: program store updated; IP, LP, PE adjusted
+;   Clobbers: A X Y T0 T1 T2 IP LP PE CURLN
+;
+;   Parses the line number, locates the insertion point by scanning the store
+;   in line-number order, deletes any existing line with the same number, then
+;   inserts the new body.  An empty body (CR only) means delete-only.
+;
+;   Falls through into INSLINE when there is a body to insert.
+; =============================================================================
+EDITLN:
+         JSR PNUM             ; parse line number -> T0; IP advances past digits
+         LDA T0
+         STA CURLN
+         LDA T0+1
+         STA CURLN+1
+         LDA #<PROG
+         STA LP
+         LDA #>PROG
+         STA LP+1
+EL_FL:   LDA LP               ; is LP == PE? (reached end of store)
+         CMP PE
+         BNE EL_GO
+         LDA LP+1
+         CMP PE+1
+         BEQ EL_INS           ; yes: insert at end
+EL_GO:   LDY #1               ; compare stored line number hi-byte first
+         LDA (LP),Y
+         CMP CURLN+1
+         BCC EL_SKIP           ; stored line < target: keep scanning
+         BNE EL_INS            ; stored line > target: insert before here
+         DEY                   ; hi equal: compare lo byte
+         LDA (LP),Y
+         CMP CURLN
+         BCC EL_SKIP
+         BEQ EL_FND            ; exact match: delete existing then (re)insert
+         ; JMP EL_INS
+	BNE EL_INS		; always taken
+	
+EL_SKIP: LDY #2                ; advance LP to next line: scan for CR
+EL_LEN:  LDA (LP),Y
+         INY
+         CMP #CR
+         BNE EL_LEN
+         TYA
+         CLC
+         ADC LP
+         STA LP
+         BCC EL_FL
+         INC LP+1
+         BNE EL_FL            ; always taken here (program store never wraps to page $00)
+EL_FND:  JSR DELINE            ; delete existing line at LP
+EL_INS:  JSR WPEEK             ; skip spaces + peek (no consume) first body char
+         CMP #CR
+         BEQ EL_DN             ; CR only: delete-only (no body to insert)
+         ; fall through into INSLINE to insert the body
+
+; =============================================================================
+; INSLINE  --  insert one line at LP; body text comes from IP (in IBUF)
+;
+;   In:  LP -> insertion point in program store
+;        IP -> first byte of body text in IBUF (after the line number)
+;        CURLN = 16-bit line number to store in the 2-byte header
+;        PE -> one past the last current program byte
+;   Out: new line written; PE advanced by line size
+;   Clobbers: A X Y T0 T1 T2 IP LP PE
+;
+;   Counts body + CR to get total line size, checks OOM, shifts existing
+;   program store upward to make room, writes header then body.
+; =============================================================================
+INSLINE:
+         LDY #0
+IN_CNT:  LDA (IP),Y           ; count body bytes until CR
+         CMP #CR
+         BEQ IN_CE
+         INY
+         BNE IN_CNT           ; always taken for bounded line lengths (<256)
+IN_CE:   INY                  ; include CR itself
+         TYA
+         CLC
+         ADC #2               ; +2 for the line-number header
+         TAX                  ; X = total line size (header + body + CR)
+         TXA
+         PHA                  ; save line size on stack
+         SEC                  ; OOM check: new PE = PE + line_size
+         ADC PE
+         STA T2
+         LDA PE+1
+         ADC #0
+         STA T2+1
+         LDA T2+1
+         CMP #>RAM_TOP        ; would we cross RAM_TOP?
+         BCC IN_OK
+         PLA
+         TAX
+         LDA #ERR_OM
+         JMP DO_ERROR
+IN_OK:   LDA PE               ; T2 = PE - LP (bytes of store above insertion point)
+         SEC
+         SBC LP
+         STA T2
+         LDA PE+1
+         SBC LP+1
+         STA T2+1
+         LDA T2
+         ORA T2+1
+         BEQ IN_SHIFT         ; nothing above LP: skip the shift
+         LDA PE               ; T0 = PE - 1  (top byte of existing store)
+         SEC
+         SBC #1
+         STA T0
+         LDA PE+1
+         SBC #0
+         STA T0+1
+         TXA                  ; T1 = T0 + line_size (destination for top byte)
+         CLC
+         ADC T0
+         STA T1
+         LDA T0+1
+         ADC #0
+         STA T1+1
+IN_BK:   LDY #0               ; copy one byte: (T0) -> (T1), working downward
+         LDA (T0),Y
+         STA (T1),Y
+         LDA T0               ; decrement T0 (16-bit)
+         BNE IN_D0
+         DEC T0+1
+IN_D0:   DEC T0
+         LDA T1               ; decrement T1 (16-bit)
+         BNE IN_D1
+         DEC T1+1
+IN_D1:   DEC T1
+         LDA T2               ; decrement shift counter T2 (16-bit)
+         BNE IN_D2
+         DEC T2+1
+IN_D2:   DEC T2
+         LDA T2
+         ORA T2+1
+         BNE IN_BK
+IN_SHIFT:
+         PLA
+         TAX                  ; restore line size
+         TXA
+         CLC
+         ADC PE               ; advance PE by line size
+         STA PE
+         BCC IN_HDR
+         INC PE+1
+IN_HDR:  LDY #0
+         LDA CURLN
+         STA (LP),Y           ; write line number lo
+         INY
+         LDA CURLN+1
+         STA (LP),Y           ; write line number hi  (Y=1 here)
+         LDA LP               ; T0 = LP + 2  (where body bytes go)
+         CLC
+         ADC #2
+         STA T0
+         LDA LP+1
+         ADC #0
+         STA T0+1
+         DEY                  ; Y = 0  (was 1; DEY cheaper than LDY #0)
+IN_CP:   LDA (IP),Y           ; copy body + CR from IBUF to store
+         STA (T0),Y
+         CMP #CR
+         BEQ IN_DN
+         INY
+         BNE IN_CP            ; always taken for bounded line lengths (<256)
+; DP_RET and IN_DN are adjacent because DO_PRINT (semicolon suppress path) and
+; INSLINE both want a plain RTS and this is the nearest one.
+DP_RET:
+IN_DN:   RTS
+
+; =============================================================================
+; DO_PRINT  --  PRINT [item [; item] ...]
+;
+;   In:  IP -> first character after "PRINT" keyword
+;   Out: output written to terminal; IP advanced past statement
+;   Clobbers: A X Y T0 T1 T2 IP
+;
+;   Items: string literals ("..."), CHR$(expr), or numeric expressions.
+;   Items separated by ';' suppress the inter-item space.
+;   A trailing ';' suppresses the final CR/LF.
+;   At end of items (or with no items) falls through into PUTSTR to emit CR/LF.
+; =============================================================================
+DO_PRINT:
+DP_TOP:  JSR WPEEK
+         CMP #CR
+         BEQ DP_NL
+         CMP #0
+         BEQ DP_NL
+         CMP #'"'
+         BNE DP_EXPR
+         JSR GETCI            ; consume opening '"'
+DP_STR:  JSR GETCI            ; read string body char by char
+         CMP #'"'
+         BEQ DP_AFT           ; closing '"' -- go check for ';'
+         CMP #CR
+         BEQ DP_NL            ; unterminated string -- print CR/LF and stop
+         JSR PUTCH
+         JMP DP_STR
+DP_EXPR: LDA #<KW_CHRS
+         JSR MTCHKW           ; matched "CHR$"?
+         BCS DP_NORM
+         JSR EAT_EXPR         ; consume '(' and evaluate argument
+         JSR WEAT             ; consume ')'
+         LDA T0
+         JSR PUTCH
+         JMP DP_AFT
+DP_NORM: JSR EXPR             ; numeric expression
+         JSR PRT16
+DP_AFT:  JSR WPEEK
+         CMP #';'
+         BNE DP_NL
+         JSR GETCI            ; consume ';'
+         JSR WPEEK
+         CMP #CR
+         BEQ DP_RET           ; trailing ';': suppress CR/LF (DP_RET = IN_DN = RTS above)
+         CMP #0
+         BEQ DP_RET
+         BNE DP_TOP           ; always taken (non-CR/non-NUL path)
+
+; (DO_PRINT falls through into PRNL/PUTSTR at DP_NL when no items remain)
+; =============================================================================
+; PRNL / PUTSTR / PUTSTRZP  --  print a bit-7-terminated string
+;
+;   Three entry points sharing one body:
+;     PRNL      -- prints STR_CRLF (CR+LF); no argument needed
+;     DP_NL     -- alias for PRNL used by DO_PRINT fall-through
+;     PUTSTR    -- In: A = lo-byte of string address (hi-byte = STR_PAGE)
+;     PUTSTRZP  -- In: T2 = lo-byte of string address (hi-byte set here)
+;
+;   Out: characters written to terminal; T2 left pointing at last character
+;   Clobbers: A Y T2
+;
+;   All strings must reside on STR_PAGE.  A single lo-byte pointer suffices
+;   because the hi-byte is always STR_PAGE.
+;
+;   Termination: bit 7 of the last character is set.  BMI detects it, AND #$7F
+;   strips it, PUTCH prints it, then the routine returns.
+;
+;   Co-located labels:
+;     LS_DONE (end of DO_LIST) and PS_DN (end of PUTSTR) share one RTS.
+;     DO_PRINT falls into DP_NL / PRNL rather than using JSR+RTS.
+; =============================================================================
+PRNL:
+DP_NL:   LDA #<STR_CRLF       ; load CR+LF string address, then fall into PUTSTR
+PUTSTR:  STA T2               ; store lo-byte; hi-byte set below
+PUTSTRZP:
+         LDA #STR_PAGE
+         STA T2+1             ; hi-byte is always STR_PAGE
+         LDY #0
+PS_LP:   LDA (T2),Y           ; fetch next character
+         BMI PS_LAST          ; bit 7 set: this is the last character
+         JSR PUTCH            ; print character
+         INC T2               ; advance string pointer (lo-byte only; page never wraps)
+         BNE PS_LP            ; always taken: string table constrained to one page
+PS_LAST: AND #$7F             ; strip bit 7 from last character
+         JSR PUTCH            ; print last character
+; LS_DONE and PS_DN are adjacent because DO_LIST (end-of-program path) and
+; PUTSTR (end-of-string path) both want a plain RTS here.
+LS_DONE:
+PS_DN:   RTS
+
+; =============================================================================
+; DO_LIST  --  LIST  :  print all program lines in source form
+;
+;   In:  PE = current program end
+;   Out: all lines printed as "<linenum> <body>"
+;   Clobbers: A X Y T0 LP
+;
+;   v1.1: Added LP>=PE safety guard inside LS_BODY to prevent infinite loop
+;         if a line is missing its CR terminator (corrupted program store).
+; =============================================================================
+DO_LIST:
+         LDA #<PROG
+         STA LP
+         LDA #>PROG
+         STA LP+1
+LS_LN:   LDA LP               ; test LP == PE (end of program)
+         CMP PE
+         BNE LS_GO
+         LDA LP+1
+         CMP PE+1
+         BEQ LS_DONE          ; end of program: branches to shared RTS above
+LS_GO:   LDY #0
+         LDA (LP),Y           ; read line number lo
+         STA T0
+         INY                  ; Y=1
+         LDA (LP),Y           ; read line number hi
+         STA T0+1
+         JSR PRT16            ; print line number
+         LDA #' '
+         JSR PUTCH
+         LDA LP               ; advance LP past 2-byte header
+         CLC
+         ADC #2
+         STA LP
+         BCC LS_BODY
+         INC LP+1
+LS_BODY: LDY #0
+         LDA LP               ; v1.1: safety guard -- if LP reaches PE before CR,
+         CMP PE               ; stop listing cleanly (guards against corrupted store)
+         BNE LS_CHR
+         LDA LP+1
+         CMP PE+1
+         BEQ LS_DONE          ; LP==PE: end cleanly rather than overrunning
+LS_CHR:
+         LDA (LP),Y
+         CMP #CR
+         BEQ LS_EOL
+         JSR PUTCH
+         INC LP
+         BNE LS_BODY
+         INC LP+1
+         BNE LS_BODY          ; always taken here (listing walks RAM pages, never wraps to $00)
+LS_EOL:  JSR PRNL              ; print CR+LF at end of each listed line
+         INC LP               ; skip CR byte
+         BNE LS_LN
+         INC LP+1
+         BNE LS_LN            ; always taken here
+
+; =============================================================================
+; DO_GOTO  --  GOTO <linenum>
+;
+;   In:  IP -> line number digits
+;   Out: IP = body of target line; stack unwound to RUNSP; continues at RUNGO
+;   Clobbers: A X T0 IP SP
+; =============================================================================
+DO_GOTO:
+         JSR PNUM             ; parse target line number -> T0
+         JSR GOTOL            ; find line: C=0 found (IP at body), C=1 not found
+         BCC DG_OK
+         LDA #ERR_UL
+         JMP DO_ERROR
+DG_OK:   LDX RUNSP
+         TXS                  ; restore SP to pre-statement state (unwinds call stack)
+         JMP RUNGO            ; jump into run loop at statement-execute point
+
+; =============================================================================
+; DO_RUN  --  RUN  :  execute program starting from the first line
+;
+;   In:  PE = current program end
+;   Out: program executes; returns to MAIN on END/error/STOP
+;   Clobbers: everything
+;
+;   RUNLP: top of the per-line execution loop.  Saves SP so GOTO can unwind.
+;   RUNGO: mid-loop entry used by GOTO (after IP is already set to body).
+; =============================================================================
+DO_RUN:
+         LDA #<PROG
+         STA IP
+         LDA #>PROG
+         STA IP+1
+         LDA #$FF
+         STA RUN              ; set run flag ($FF = running)
+RUNLP:   TSX
+         STX RUNSP            ; snapshot SP for GOTO / error recovery
+         LDA IP               ; test IP >= PE (16-bit unsigned)
+         CMP PE
+         LDA IP+1
+         SBC PE+1
+         BCS RUNEND           ; IP >= PE: end of program
+         JSR GETCI            ; read line-number lo
+         STA CURLN
+         JSR GETCI            ; read line-number hi
+         STA CURLN+1
+RUNGO:   JSR STMT_LINE         ; execute statement(s) on this line (honouring ':')
+         LDA RUN
+         BEQ RUNEND           ; RUN cleared by END/error -- stop
+SK_LP:   JSR GETCI            ; advance IP past CR (SKIPEOL inlined)
+         CMP #CR
+         BNE SK_LP
+         ; JMP RUNLP
+	BEQ RUNLP		; always taken
+	
+; =============================================================================
+; DO_END  --  END  :  halt program execution and return to immediate mode
+;
+;   In:  --
+;   Out: RUN cleared; returns to STMT caller, which returns to RUNLP/MAIN
+;   Clobbers: RUN
+;
+;   DO_END is the STMT dispatch handler.  RUNEND is the internal label reached
+;   when the program runs off the end of the store, or when RUN is cleared by
+;   another path.  Both converge here: LDA #0 / STA RUN then RTS.
+; =============================================================================
+DO_END:
+RUNEND:  LDA #0
+         STA RUN
+         RTS
+
+; =============================================================================
+; DO_NEW  --  NEW  :  clear program store and all variables
+;
+;   In:  --
+;   Out: PE = PROG; VARS cleared
+;   Clobbers: A X PE VARS
+; =============================================================================
+DO_NEW:
+         LDA #<PROG
+         STA PE
+         LDA #>PROG
+         STA PE+1
+         LDX #VARS_MAX
+         LDA #0
+DO_NWZ:  STA VARS,X
+         DEX
+         BPL DO_NWZ
+         RTS
+
+; =============================================================================
+; DO_POKE  --  POKE addr, value  :  write one byte to memory
+;
+;   Syntax: POKE <expr>, <expr>
+;   In:  IP -> address expression
+;   Out: byte written; IP advanced past statement
+;   Clobbers: A Y T0 T1 IP
+; =============================================================================
+DO_POKE:
+         JSR EXPR              ; evaluate address -> T0
+         LDA T0+1              ; push address hi byte  (T1 clobbered by MTCHKW
+         PHA                   ;   in the second EXPR call, so use hardware stack)
+         LDA T0                ; push address lo byte
+         PHA
+         JSR WEAT              ; skip spaces, consume ','
+         JSR EXPR              ; evaluate value -> T0
+         LDA T0                ; value byte
+         PLA
+         TAX                   ; pull address lo -> X
+         STX T1
+         PLA
+         TAX                   ; pull address hi -> X
+         STX T1+1
+         LDY #0
+         STA (T1),Y            ; write value to address
+         RTS
+
+; =============================================================================
+; GOTOL  --  find line by number in program store
+;
+;   In:  T0 = 16-bit target line number
+;   Out: C=0  found -- IP points to body (past 2-byte header)
+;        C=1  not found -- IP = PE
+;   Clobbers: A Y IP
+; =============================================================================
+GOTOL:
+         LDA #<PROG
+         STA IP
+         LDA #>PROG
+         STA IP+1
+GT_SC:   LDA IP               ; test IP == PE (end of store)
+         CMP PE
+         BNE GT_GO
+         LDA IP+1
+         CMP PE+1
+         BEQ GT_ERR           ; not found
+GT_GO:   LDY #0
+         LDA (IP),Y           ; read line-number lo
+         CMP T0               ; compare line-number lo
+         BNE GT_NX
+         LDY #1
+         LDA (IP),Y
+         CMP T0+1             ; compare line-number hi
+         BEQ GT_OK
+GT_NX:   LDY #2               ; skip line: scan for CR from body start
+GT_SK:   LDA (IP),Y
+         INY
+         CMP #CR
+         BNE GT_SK
+         TYA
+         CLC
+         ADC IP               ; IP += line length
+         STA IP
+         BCC GT_SC
+         INC IP+1
+         BNE GT_SC            ; always taken here (program store never wraps to page $00)
+GT_OK:   LDA IP
+         CLC
+         ADC #2               ; advance IP past 2-byte header
+         STA IP
+         BCC GT_R
+         INC IP+1
+GT_R:    CLC
+         RTS
+GT_ERR:  SEC
+         RTS
+
+; =============================================================================
+; EAT_EXPR  --  skip spaces, consume one char (e.g. '('), evaluate expression
+;
+;   In:  IP -> char to consume (leading spaces skipped first)
+;   Out: T0 = expression result; IP advanced past expression
+;   Clobbers: A X Y T0 T1 T2 IP
+;
+;   Falls through into EXPR after consuming the opening char.
+; =============================================================================
+EAT_EXPR:
+         JSR WEAT             ; skip spaces then consume one char
+         ; fall through into EXPR
+
+; =============================================================================
+; EXPR  --  evaluate a full expression including relational operators
+;
+;   In:  IP -> expression text
+;   Out: T0 = signed 16-bit result; true=$FFFF, false=$0000
+;        IP advanced past expression
+;   Clobbers: A X Y T0 T1 T2 IP
+;
+;   Precedence (lowest to highest): relational < additive < multiplicative < unary/atom
+;   Relational operators: = < > <= >= <>
+;   Evaluates left operand via EXPR_ADD, then checks for one relational op.
+; =============================================================================
+EXPR:
+         JSR EXPR_ADD
+         JSR WPEEK
+         CMP #'='
+         BEQ EQ_OP
+         CMP #'<'
+         BEQ LT_OP
+         CMP #'>'
+         BEQ GT_OP
+; EXPR_RT: nearest RTS -- EXPR falls here when no relational operator is found.
+EXPR_RT: RTS
+
+; --- REL_SETUP  --  shared preamble for all relational operators ---------------
+;
+;   In:  T0 = left operand (already evaluated)
+;        IP -> start of right operand (operator char already consumed by caller)
+;   Out: T0 = right operand; T1 = left operand (swapped for easy comparison)
+;   Clobbers: A T0 T1
+; -----------------------------------------------------------------------------
+REL_SETUP:
+         LDA T0               ; push left operand
+         PHA
+         LDA T0+1
+         PHA
+         JSR EXPR_ADD         ; evaluate right operand -> T0
+         PLA
+         STA T1+1             ; pop left operand into T1 (hi first -- stack order)
+         PLA
+         STA T1
+         RTS
+
+; --- EQ_OP  ( = ) ---
+EQ_OP:   JSR GETCI            ; consume '='
+         JSR REL_SETUP
+         LDA T1
+         CMP T0
+         BNE EQ_F
+         LDA T1+1
+         CMP T0+1
+         BEQ REL_T
+EQ_F:    ; JMP REL_F
+	BNE REL_F		; always taken
+	
+; --- LT_OP  ( <  also entry for <=  <> ) ---
+LT_OP:   JSR GETCI            ; consume '<'
+         LDY #0
+         LDA (IP),Y           ; peek next char without consuming
+         CMP #'>'
+         BEQ NE_OP            ; '<>' sequence
+         CMP #'='
+         BEQ LE_OP            ; '<=' sequence
+         JSR REL_SETUP        ; plain '<': T1 - T0; negative means T1 < T0
+         LDA T1
+         SEC
+         SBC T0
+         LDA T1+1
+         SBC T0+1
+         BMI REL_T
+         ; JMP REL_F
+	 BPL REL_F	; always taken
+	 
+; --- NE_OP  ( <> ) ---
+NE_OP:   JSR GETCI            ; consume '>'
+         JSR REL_SETUP
+         LDA T1
+         CMP T0
+         BNE REL_T
+         LDA T1+1
+         CMP T0+1
+         BNE REL_T
+         ; JMP REL_F
+	BPL REL_F	; always taken
+	 
+; --- LE_OP  ( <= ) ---
+LE_OP:   JSR GETCI            ; consume '='
+         JSR REL_SETUP        ; T0 - T1; negative means T0 < T1, i.e. NOT <=
+         LDA T0
+         SEC
+         SBC T1
+         LDA T0+1
+         SBC T1+1
+         BMI REL_F
+
+; --- REL_T / REL_F  --  common true / false returns ---------------------------
+REL_T:   LDA #$FF
+         STA T0
+         STA T0+1
+         RTS
+REL_F:   LDA #0
+         STA T0
+         STA T0+1
+         RTS
+
+; --- GT_OP  ( >  also entry for >= ) ---
+GT_OP:   JSR GETCI            ; consume '>'
+         LDY #0
+         LDA (IP),Y           ; peek next char without consuming
+         CMP #'='
+         BEQ GE_OP            ; '>=' sequence
+         JSR REL_SETUP        ; plain '>': T0 - T1; negative means T0 < T1 => false
+         LDA T0
+         SEC
+         SBC T1
+         LDA T0+1
+         SBC T1+1
+         BMI REL_T
+         ; JMP REL_F
+	BPL REL_F	; always taken
+	 
+; --- GE_OP  ( >= ) ---
+GE_OP:   JSR GETCI            ; consume '='
+         JSR REL_SETUP        ; T1 - T0; negative means T1 < T0, i.e. NOT >=
+         LDA T1
+         SEC
+         SBC T0
+         LDA T1+1
+         SBC T0+1
+         BMI REL_F
+        ; JMP REL_T
+	BPL REL_T	; always taken
+	 
+; =============================================================================
+; EXPR_ADD  --  additive level: + and -
+;
+;   In:  IP -> expression text
+;   Out: T0 = result; IP advanced
+;   Clobbers: A X T0 T1 IP
+;
+;   v1.1 BUG FIX: EA_DO now saves operator via TAX before loading T0 bytes.
+;   v1.0 used LDX T0+1/TXA/PHA then LDX T0/TXA/PHA then PHA -- but after
+;   "LDX T0 / TXA", A = T0-lo, so the final PHA pushed T0-lo a second time
+;   and the operator character was never saved.  This caused wrong results
+;   for any subtraction expression (e.g. 10-3 returned garbage).
+; =============================================================================
+EXPR_ADD:
+         JSR EXPR1            ; evaluate first term -> T0
+EA_LP:   JSR WPEEK
+         CMP #'+'
+         BEQ EA_DO
+         CMP #'-'
+         BNE EA_RTS           ; not + or -: done
+EA_DO:   TAX                  ; v1.1 FIX: save operator in X BEFORE clobbering A
+         LDA T0+1
+         PHA                  ; push T0 hi
+         LDA T0
+         PHA                  ; push T0 lo
+         TXA
+         PHA                  ; push operator (recovered from X)
+         JSR GETCI            ; consume operator
+         JSR EXPR1            ; evaluate next term -> T0
+         PLA                  ; pull operator
+         CMP #'-'
+         BNE EA_SUM
+         JSR NEG16            ; subtraction: negate the right operand
+EA_SUM:  CLC
+         PLA                  ; pull old T0 lo
+         ADC T0
+         STA T0
+         PLA                  ; pull old T0 hi
+         ADC T0+1
+         STA T0+1
+         JMP EA_LP
+
+; =============================================================================
+; EXPR1  --  multiplicative level: * / %  (merged MUL/DIV/MOD kernel)
+;
+;   In:  IP -> expression text
+;   Out: T0 = result; IP advanced
+;   Clobbers: A X Y T0 T1 T2 IP OP
+;
+;   The operator ('*', '/', or '%') is saved in OP so a single sign-correction
+;   preamble and postamble serves all three operations.  '/' and '%' both use
+;   the DIV kernel; they differ only in which of quotient (T1) or remainder
+;   (T2) is copied to T0 as the result.
+;
+;   EA_RTS and E1_RET share the same physical RTS byte: EXPR_ADD's loop exit
+;   (EA_RTS) and EXPR1's loop exit (E1_RET) both branch here when no matching
+;   operator is found.
+; =============================================================================
+EXPR1:
+         JSR EXPR2
+E1_LP:   JSR WPEEK
+         CMP #'*'
+         BEQ E1_MD
+         CMP #'/'
+         BEQ E1_MD
+         CMP #'%'
+         BEQ E1_MD
+; EA_RTS and E1_RET are the same physical RTS byte, shared by EXPR_ADD and EXPR1.
+EA_RTS:
+E1_RET:  RTS
+
+; --- DIV kernel ---------------------------------------------------------------
+;   In:  T1 = dividend (positive), T0 = divisor (positive), Y = 16, T2 = 0
+;   Out: T1 = quotient, T2 = remainder  (caller selects which to return in T0)
+; -----------------------------------------------------------------------------
+E1_DO_DIV:
+E1_DB:   ASL T1               ; shift dividend left into T2 (shift-subtract method)
+         ROL T1+1
+         ROL T2
+         ROL T2+1
+         LDA T2
+         SEC
+         SBC T0
+         TAX
+         LDA T2+1
+         SBC T0+1
+         BCC E1_DS            ; remainder < divisor: quotient bit = 0
+         STX T2
+         STA T2+1
+         INC T1               ; quotient bit = 1
+E1_DS:   DEY
+         BNE E1_DB
+         LDA OP               ; MOD ('%'): use remainder in T2; else quotient T1
+         CMP #'%'
+         BEQ E1_MOD
+         LDA T1               ; copy quotient to T0
+         STA T0
+         LDA T1+1
+         STA T0+1
+         JMP E1_SIGN
+E1_MOD:  LDA T2               ; '%': copy remainder (T2) to T0
+         STA T0
+         LDA T2+1
+         STA T0+1
+         JMP E1_SIGN
+
+; --- MUL/DIV dispatch (operator fetch, sign determination, kernel select) ----
+E1_MD:   STA OP               ; save operator ('*', '/', or '%')
+         JSR GETCI            ; consume operator
+         LDA T0               ; push left operand (will become T1)
+         PHA
+         LDA T0+1
+         PHA
+         JSR EXPR2            ; right operand -> T0
+         PLA
+         STA T1+1
+         PLA
+         STA T1
+         LDA OP
+         CMP #'*'             ; zero-div check for '/' and '%' (not '*')
+         BEQ E1_NOCHK
+         LDA T0               ; division/mod: check for zero divisor
+         ORA T0+1
+         BEQ E1_OVFL
+E1_NOCHK:
+         LDA T1+1
+         EOR T0+1
+         PHA                  ; push result sign (XOR of hi-bytes)
+         LDA T1+1             ; make T1 positive
+         BPL E1_P1
+         JSR NEG_T1
+E1_P1:   LDA T0+1             ; make T0 positive
+         BPL E1_P2
+         JSR NEG16
+E1_P2:   LDA #0
+         STA T2
+         STA T2+1
+         LDY #16
+         LDA OP
+         CMP #'*'             ; dispatch: '*' -> MUL; '/' or '%' -> DIV
+         BNE E1_DO_DIV
+         ; --- MUL kernel: T2 = T1 * T0 (shift-and-add) ----------------------
+E1_MB:   LSR T1+1
+         ROR T1
+         BCC E1_MS
+         LDA T2
+         CLC
+         ADC T0
+         STA T2
+         LDA T2+1
+         ADC T0+1
+         STA T2+1
+E1_MS:   ASL T0
+         ROL T0+1
+         DEY
+         BNE E1_MB
+         LDA T2               ; copy product to T0
+         STA T0
+         LDA T2+1
+         STA T0+1
+         ; fall through into E1_SIGN
+
+; --- sign postamble: apply XOR sign to T0 ------------------------------------
+E1_SIGN: PLA                  ; pull result sign
+         BPL E1_POS           ; positive: done
+         JSR NEG16            ; negative: negate T0
+E1_POS:  JMP E1_LP            ; loop: check for another * or /
+
+E1_OVFL: LDA #ERR_OV          ; division or modulo by zero
+         ; fall through into DO_ERROR
+
+; =============================================================================
+; EXPR2  --  atom level: parentheses, unary +/-, CHR$, number literals, variables
+;
+;   In:  IP -> atom text
+;   Out: T0 = atom value; IP advanced past atom
+;   Clobbers: A X Y T0 T1 T2 IP
+;
+;   E2_POS: entry for unary '+' -- consumes the '+' then falls into EXPR2.
+;   E2_NEG: entry for unary '-' -- evaluates atom then negates it.
+; =============================================================================
+E2_POS:  JSR GETCI            ; consume unary '+', then fall through
+
+EXPR2:
+         JSR WPEEK
+         CMP #'('
+         BNE E2_NOT_PAR
+         JMP E2_PAR
+         
+E2_NOT_PAR:
+         CMP #'-'
+         BEQ E2_NEG
+         CMP #'+'
+         BEQ E2_POS
+         LDA #<KW_CHRS
+         JSR MTCHKW           ; matched "CHR$"?
+         BCS E2_NOTCHRS
+         JSR EAT_EXPR         ; consume '(' and evaluate argument -> T0
+         JMP WEAT             ; tail call: consume ')' and return
+E2_NOTCHRS:
+         LDA #<KW_PEEK
+         JSR MTCHKW           ; matched "PEEK"?
+         BCS E2_NOT_PEEK
+         JSR EAT_EXPR         ; consume '(' and evaluate address -> T0
+         JSR WEAT             ; consume ')'
+         LDY #0
+         LDA (T0),Y           ; read byte at address
+         STA T0
+         LDA #0
+         STA T0+1
+         RTS
+
+E2_NOT_PEEK:
+         LDA #<KW_USR
+         JSR MTCHKW           ; matched "USR"?
+         BCS E2_NOT_USR
+         JSR EAT_EXPR         ; consume '(' and evaluate address -> T0
+         JSR WEAT             ; consume ')'
+         LDA T0               ; copy address to T2
+         STA T2
+         LDA T0+1
+         STA T2+1
+         JMP USR_CALL         ; tail-call; JMP(T2), user RTS -> USR_RET
+
+E2_NOT_USR:
+         LDY #0
+         LDA (IP),Y           ; peek next char without consuming
+         CMP #'0'
+         BCC E2_VAR
+         CMP #'9'+1
+         BCS E2_VAR
+         JMP PNUM             ; tail call: parse decimal literal -> T0
+	
+E2_BAD:  LDA #0               ; unrecognised atom: return 0 (no error)
+         STA T0
+         STA T0+1
+         RTS
+
+E2_VAR:  JSR UC               ; variable name (single letter A-Z)?
+         CMP #'A'
+         BCC E2_BAD
+         CMP #'Z'+1
+         BCS E2_BAD
+         JSR GETCI            ; consume the letter
+         JSR UC
+         SEC
+         SBC #'A'
+         ASL                  ; -> VARS byte offset (0, 2, 4 ...)
+         TAX
+         LDA VARS,X
+         STA T0
+         LDA VARS+1,X
+         STA T0+1
+         RTS
+
+E2_NEG:  JSR E2_POS           ; consume '-', evaluate atom
+         JMP NEG16            ; tail call: negate result
+
+E2_PAR:  JSR GETCI            ; consume '('
+         JSR EXPR             ; evaluate sub-expression
+         ; fall through into WEAT to consume ')'
+
+; =============================================================================
+; WEAT  --  skip spaces then consume one char from IP; return char in A
+;
+;   In:  IP -> char (with possible leading spaces)
+;   Out: A = char consumed; IP advanced past it
+;   Clobbers: A IP
+;
+;   Falls through into GETCI after skipping spaces.
+; =============================================================================
+WEAT:    JSR WSKIP            ; skip spaces, then fall through
+
+; =============================================================================
+; GETCI  --  fetch char at IP and advance IP
+;
+;   In:  IP -> char to fetch
+;   Out: A = char; IP incremented (16-bit)
+;   Clobbers: A IP
+; =============================================================================
+GETCI:   LDY #0
+         LDA (IP),Y
+         INC IP               ; 16-bit increment
+         BNE GETCI_SK
+         INC IP+1
+; DO_IF_F and GETCI_SK are adjacent because DO_IF (condition-false path)
+; and GETCI both want a plain RTS and this is the nearest one.
+DO_IF_F:
+STLN_RTS:
+GETCI_SK: RTS
+
+; =============================================================================
+; DO_IF  --  IF <expr> THEN <stmt>  (THEN keyword is optional)
+;
+;   In:  IP -> expression text
+;   Out: if true, statement executed; if false, returns (STMT will SKIPEOL)
+;   Clobbers: A X Y T0 T1 T2 IP
+;
+;   Falls through into STMT to execute the consequent.
+;   On false, branches to DO_IF_F (= GETCI_SK = nearest preceding RTS).
+; =============================================================================
+DO_IF:
+         JSR EXPR             ; evaluate condition -> T0
+         LDA T0
+         ORA T0+1
+         BEQ DO_IF_F          ; false: return
+         LDA #<KW_THEN
+         JSR MTCHKW           ; consume optional THEN keyword
+         ; fall through into STMT to execute the consequent
+
+; =============================================================================
+; STMT_LINE  --  execute one or more statements separated by ':' on a line
+;
+;   In:  IP -> statement text
+;   Out: all colon-separated statements on this line executed; IP advanced
+;   Clobbers: A X Y T0 T1 T2 IP
+;
+;   After each statement, peeks the next character.  If it is ':', consumes
+;   it and loops to execute the next statement.  Otherwise returns.
+;   MAIN and RUNGO call this instead of STMT directly.
+; =============================================================================
+STMT_LINE:
+         JSR STMT              ; execute one statement
+STLN_CHK:
+         JSR WPEEK             ; peek next char (skips spaces)
+         CMP #':'
+         BNE STLN_RTS          ; not ':', done
+         JSR GETCI             ; consume ':'
+         BNE STMT_LINE         ; always taken here (':' = $3A, nonzero)
+
+; =============================================================================
+; STMT  --  execute one statement from IP
+;
+;   In:  IP -> statement text (spaces will be skipped)
+;   Out: statement executed; IP advanced
+;   Clobbers: A X Y T0 T1 T2 IP
+;
+;   Walks ST_TAB trying MTCHKW for each keyword.  On match, loads handler
+;   address into T2 and jumps indirect.  Falls through to DO_LET when the
+;   $FF sentinel is reached (implicit variable assignment).
+; =============================================================================
+STMT:
+         JSR WPEEK
+         CMP #' '             ; anything below space (CR, NUL) means empty line
+         BCC GETCI_SK         ; return via nearest preceding RTS
+         LDX #0
+ST_LP:   LDA ST_TAB,X         ; read keyword lo-byte from table
+         BMI ST_LET            ; $FF sentinel: nothing matched
+         JSR MTCHKW            ; try to match keyword at IP
+         BCS ST_NX             ; no match: advance to next entry
+         LDA ST_TAB+1,X       ; matched: load handler lo
+         STA T2
+         LDA ST_TAB+2,X       ; load handler hi
+         STA T2+1
+         JMP (T2)             ; dispatch to handler
+
+ST_NX:   INX
+         INX
+         INX
+         BNE ST_LP            ; always taken before $FF sentinel
+ST_LET:  ; fall through into DO_LET
+
+; =============================================================================
+; DO_LET  --  LET <var> = <expr>  or implicit  <var> = <expr>
+;
+;   In:  IP -> variable name (with optional leading spaces)
+;   Out: variable assigned; IP advanced
+;   Clobbers: A X T0 IP
+;
+;   DL_DN: nearest following RTS -- shared with NEG16/NEG_T1 below.
+; =============================================================================
+DO_LET:
+         JSR WPEEK_UC         ; skip spaces, peek var name, uppercase
+         CMP #'A'
+         BCC DL_DN            ; not a letter: bail
+         CMP #'Z'+1
+         BCS DL_DN
+         JSR GETCI            ; consume variable letter
+         JSR UC
+         SEC
+         SBC #'A'
+         ASL                  ; -> VARS byte offset
+         PHA
+         JSR WPEEK
+         CMP #'='
+         BNE DL_POP           ; no '=': bad assignment
+         JSR GETCI            ; consume '='
+         JSR EXPR             ; evaluate RHS -> T0
+         PLA
+         TAX
+         LDA T0
+         STA VARS,X
+         LDA T0+1
+         STA VARS+1,X
+         RTS
+DL_POP:  PLA
+         LDA #ERR_UK
+         JMP DO_ERROR
+
+; =============================================================================
+; NEG_T1 / NEG16  --  two's-complement negate
+;
+;   NEG_T1:  negate T1 ($08/$09) -- enter here from EXPR1 sign correction
+;   NEG16:   negate T0 ($06/$07) -- enter here from all other callers
+;
+;   In:  T0 or T1 = value to negate (selected by entry point)
+;   Out: value negated in-place
+;   Clobbers: A X
+;
+;   Trick: NEG_T1 loads X=2 (offset to T1 relative to T0), then uses a
+;   BIT abs opcode ($2C) to consume the LDX #0 as a 2-byte operand,
+;   skipping into the shared body with X=2 intact.
+;
+;   DL_DN is the nearest RTS and is shared by DO_LET and NEG16.
+; =============================================================================
+NEG_T1:  LDX #2
+         .DB $2C              ; BIT abs: skips next 2 bytes (the LDX #0)
+NEG16:   LDX #0
+         LDA #0
+         SEC
+         SBC T0,X
+         STA T0,X
+         LDA #0
+         SBC T0+1,X
+         STA T0+1,X
+; DL_DN: shared RTS for DO_LET (bad-variable bail) and NEG16 (fall-through)
+DL_DN:   RTS
+
+; =============================================================================
+; WPEEK_UC  --  skip spaces at IP, peek first non-space char, convert to UC
+;
+;   In:  IP -> text (may have leading spaces)
+;   Out: A = first non-space char, uppercased; IP unchanged (char not consumed)
+;   Clobbers: A
+; =============================================================================
+WPEEK_UC:
+         JSR WSKIP            ; skip spaces; A = first non-space char
+         ; fall through into UC
+
+; =============================================================================
+; UC  --  convert A to uppercase
+;
+;   In:  A = any ASCII char
+;   Out: A = uppercase if a-z, otherwise unchanged
+;   Clobbers: A
+; =============================================================================
+UC:      CMP #'a'
+         BCC RTS_1
+         CMP #'{'             ; '{' = 'z' + 1
+         BCS RTS_1
+         AND #$DF             ; clear bit 5: a-z -> A-Z
+RTS_1:   RTS
+
+; =============================================================================
+; UCIP  --  uppercase peek at current IP character (without consuming)
+;
+;   In:  IP -> current input character
+;   Out: A = uppercased *(IP)
+;   Clobbers: A Y
+; =============================================================================
+UCIP:    LDY #0
+         LDA (IP),Y
+         JMP UC
+
+; =============================================================================
+; WSKIP_NS / WSKIP / WPEEK  --  skip spaces; return first non-space in A
+;
+;   In:  IP -> text (may start with spaces)
+;   Out: A = first non-space char; IP advanced past any leading spaces
+;        (char is NOT consumed -- IP still points to it)
+;   Clobbers: A
+;
+;   Three labels for the same entry point (names document caller intent):
+;     WSKIP_NS  -- "no side-effects" alias used by MTCHKW
+;     WSKIP     -- skip side-effect is desired
+;     WPEEK     -- intent is to inspect without consuming
+; =============================================================================
+WSKIP_NS:
+WSKIP:
+WPEEK:   LDY #0
+         LDA (IP),Y
+         CMP #' '
+         BNE RTS_1            ; non-space: return
+         JSR GETCI            ; consume space and loop
+         BNE WSKIP            ; always taken (' ' = $20, nonzero)
+
+; =============================================================================
+; PRT16  --  print T0 as a signed decimal integer
+;
+;   In:  T0 = signed 16-bit value
+;   Out: decimal digits printed to terminal; T0 destroyed
+;   Clobbers: A Y T0
+;
+;   Algorithm: 16-bit shift-and-subtract BCD extraction; recursive so digits
+;   print highest-first without a digit buffer.
+;   Falls through into PUTCH to print the final (lowest) digit.
+; =============================================================================
+PRT16:
+         LDA T0+1
+         BPL PRT16GO          ; positive: skip sign handling
+         LDA #'-'
+         JSR PUTCH
+         JSR NEG16
+PRT16GO:
+         LDY #16
+         LDA #0
+PRT16DIV:
+         ASL T0
+         ROL T0+1
+         ROL                  ; shift MSB of T0 into remainder (in A)
+         CMP #10
+         BCC PRT16SKP
+         SBC #10
+         INC T0
+PRT16SKP:
+         DEY
+         BNE PRT16DIV
+         PHA                  ; push remainder digit
+         LDA T0
+         ORA T0+1
+         BEQ PRT16PRNT        ; quotient zero: most-significant digit
+         JSR PRT16GO          ; recurse to print more-significant digits first
+PRT16PRNT:
+         PLA
+         ORA #'0'             ; convert 0-9 to ASCII '0'-'9'
+         ; fall through into PUTCH
+
+; =============================================================================
+; PUTCH  --  write one character to the terminal (Kowalski UART)
+;
+;   In:  A = character to output
+;   Out: --
+;   Clobbers: --  (flags may change)
+;
+;   Note: Kowalski UART at IO_OUT ($E001) accepts a write immediately with no
+;   busy-wait required.  For hardware with a status register, replace with a
+;   poll-then-write loop (see mango_one repo for Apple I PIA variant).
+; =============================================================================
+PUTCH:   STA IO_OUT
+         RTS
+
+; =============================================================================
+; GETCH  --  read one character from the terminal (blocking); echo it
+;
+;   In:  --
+;   Out: A = character read
+;   Clobbers: A
+;
+;   Spins on IO_IN ($E004) until non-zero, then echoes via PUTCH (tail call).
+;   Note: for hardware with a separate status register, replace with a
+;   poll-on-status variant (see mango_one repo for Apple I PIA variant).
+; =============================================================================
+GETCH:   LDA IO_IN
+         BEQ GETCH            ; spin until a char is available
+         BNE PUTCH            ; Always taken - echo it, then return (tail call)
+                              ; Shoudl never get here
+; =============================================================================
+; USR_CALL / USR_RET  --  machine-code call helper for USR(addr) atom
+;
+;   In:  T2 = address of user routine
+;   Out: T0 = value in A when user routine executes RTS (zero-extended to 16-bit)
+;   Clobbers: A (user routine may clobber anything)
+;
+;   USR_CALL performs JMP(T2).  Because EXPR2 called USR_CALL via JMP (tail
+;   call), the user routine's RTS returns directly to EXPR2's caller.
+;   USR_RET stores A into T0 and clears T0+1 for a zero-extended 16-bit result.
+;
+;   Placement note: USR_CALL must be after GETCH so it does not intercept
+;   PRT16's fall-through into PUTCH.
+; =============================================================================
+USR_CALL:
+         JMP (T2)              ; indirect jump to user code
+USR_RET: STA T0                ; save return value lo-byte
+         LDA #0
+         STA T0+1              ; zero-extend to 16-bit
+         RTS
+
+; =============================================================================
+; STMT DISPATCH TABLE
+;
+; Each 3-byte entry:  <kw_lo_byte, <handler_lo, >handler_hi
+; STMT walks the table calling MTCHKW on each keyword.
+; $FF sentinel causes STMT to fall through to DO_LET (implicit assignment).
+; =============================================================================
+ST_TAB:
+         .DB <KW_PRINT, <DO_PRINT, >DO_PRINT
+         .DB <KW_IF,    <DO_IF,    >DO_IF
+         .DB <KW_GOTO,  <DO_GOTO,  >DO_GOTO
+         .DB <KW_LIST,  <DO_LIST,  >DO_LIST
+         .DB <KW_RUN,   <DO_RUN,   >DO_RUN
+         .DB <KW_NEW,   <DO_NEW,   >DO_NEW
+         .DB <KW_INPUT, <DO_INPUT, >DO_INPUT
+         .DB <KW_REM,   <ST_NOP,   >ST_NOP
+         .DB <KW_END,   <DO_END,   >DO_END
+         .DB <KW_LET,   <DO_LET,   >DO_LET
+         .DB <KW_POKE,  <DO_POKE,  >DO_POKE
+         .DB $FF                             ; sentinel: fall through to implicit assign
+
+; =============================================================================
+; MTCHKW  --  case-insensitive keyword match at IP
+;
+;   In:  A = lo-byte of keyword string (hi-byte = STR_PAGE, always)
+;   Out: C=0  matched -- IP advanced past the keyword
+;        C=1  no match -- IP restored to entry value
+;   Clobbers: A Y T1  (T2 is NOT clobbered -- caller may hold STMT jump addr)
+;
+;   IP is saved in LP on entry and restored on failure.
+;   Leading spaces at IP are skipped before attempting the match.
+;   Keyword entries are 2-byte uppercase prefixes; MTCHKW then skips any
+;   remaining trailing alphabetic characters so full BASIC keywords work.
+; =============================================================================
+MTCHKW:
+         STA T1               ; keyword address lo
+         LDA #STR_PAGE
+         STA T1+1             ; keyword address hi (always STR_PAGE)
+         LDA IP
+         STA LP               ; save IP in LP for restore on failure
+         LDA IP+1
+         STA LP+1
+         JSR WSKIP_NS         ; skip leading spaces
+         ; compare first keyword character
+         JSR UCIP
+         LDY #0
+         CMP (T1),Y
+         BNE MK_FAIL
+         JSR GETCI
+         ; compare second keyword character
+         LDY #1
+         LDA (T1),Y
+         STA T2
+         JSR UCIP
+         CMP T2
+         BNE MK_FAIL
+         JSR GETCI
+         ; matched prefix: skip remaining letters for full BASIC keywords
+MK_SKIP: JSR UCIP
+         CMP #'A'
+         BCC MK_OK
+         CMP #'Z'+1
+         BCS MK_OK
+         JSR GETCI
+         BNE MK_SKIP           ; always taken (token chars are nonzero)
+MK_OK:   LDY #0
+         LDA (IP),Y
+         CMP #'$'              ; allow full CHR$ spelling after 2-char CH prefix
+         BNE MK_OK_RET
+         JSR GETCI
+MK_OK_RET:
+         CLC                  ; C=0: match
+         RTS
+MK_FAIL_LAST:
+MK_FAIL: LDA LP               ; restore IP to saved position
+         STA IP
+         LDA LP+1
+         STA IP+1
+         SEC                  ; C=1: no match
+         RTS
+
+; =============================================================================
+; Pre-loaded showcase program  ($0200)
+;
+;   Stored as raw ASCII.  Line format: <lineno_lo> <lineno_hi> <body> <CR>
+;
+;   Lines  10-260: feature demos (PRINT, CHR$, arithmetic, comparisons, loops)
+;   Lines 270-480: Mandelbrot set renderer
+;
+;   v1.1: Mandelbrot column scan adjusted from -128..16 to -120..4 for a
+;         better-centred render.
+; =============================================================================
+         .ORG $0200
+
+         .DB $0A,$00,$52,$45,$4D,$20,$75,$42,$41,$53,$49,$43,$20,$76,$31,$33,$20,$2D,$20,$53,$48,$4F,$57,$43,$41,$53,$45,$0D  ; 10 REM uBASIC v13 - SHOWCASE
+         .DB $14,$00,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$20,$75,$42,$41,$53,$49,$43,$20,$76,$31,$33,$20,$53,$48,$4F,$57,$43,$41,$53,$45,$20,$2D,$2D,$22,$0D  ; 20 PRINT "-- uBASIC v13 SHOWCASE --"
+         .DB $1E,$00,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$50,$52,$49,$4E,$54,$20,$2F,$20,$43,$48,$52,$24,$20,$2D,$2D,$2D,$22,$0D  ; 30 PRINT "--- PRINT / CHR$ ---"
+         .DB $28,$00,$50,$52,$49,$4E,$54,$20,$43,$48,$52,$24,$28,$36,$35,$29,$3B,$43,$48,$52,$24,$28,$36,$36,$29,$3B,$43,$48,$52,$24,$28,$36,$37,$29,$0D  ; 40 PRINT CHR$(65);CHR$(66);CHR$(67)
+         .DB $32,$00,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$41,$52,$49,$54,$48,$4D,$45,$54,$49,$43,$20,$2D,$2D,$2D,$22,$0D  ; 50 PRINT "--- ARITHMETIC ---"
+         .DB $3C,$00,$50,$52,$49,$4E,$54,$20,$22,$33,$2B,$34,$3D,$22,$3B,$33,$2B,$34,$3B,$22,$20,$20,$31,$30,$2D,$33,$3D,$22,$3B,$31,$30,$2D,$33,$3B,$22,$20,$20,$36,$2A,$37,$3D,$22,$3B,$36,$2A,$37,$0D  ; 60 PRINT "3+4=";3+4;"  10-3=";10-3;"  6*7=";6*7
+         .DB $46,$00,$50,$52,$49,$4E,$54,$20,$22,$32,$30,$2F,$34,$3D,$22,$3B,$32,$30,$2F,$34,$3B,$22,$20,$20,$31,$37,$25,$35,$3D,$22,$3B,$31,$37,$25,$35,$0D  ; 70 PRINT "20/4=";20/4;"  17%5=";17%5
+         .DB $50,$00,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$43,$4F,$4D,$50,$41,$52,$49,$53,$4F,$4E,$53,$20,$2D,$2D,$2D,$22,$0D  ; 80 PRINT "--- COMPARISONS ---"
+         .DB $5A,$00,$49,$46,$20,$35,$3E,$33,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$35,$3E,$33,$20,$6F,$6B,$22,$0D  ; 90 IF 5>3 THEN PRINT "5>3 ok"
+         .DB $64,$00,$49,$46,$20,$33,$3C,$35,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$33,$3C,$35,$20,$6F,$6B,$22,$0D  ; 100 IF 3<5 THEN PRINT "3<5 ok"
+         .DB $6E,$00,$49,$46,$20,$33,$3E,$3D,$33,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$33,$3E,$3D,$33,$20,$6F,$6B,$22,$0D  ; 110 IF 3>=3 THEN PRINT "3>=3 ok"
+         .DB $78,$00,$49,$46,$20,$34,$3C,$3E,$33,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$34,$3C,$3E,$33,$20,$6F,$6B,$22,$0D  ; 120 IF 4<>3 THEN PRINT "4<>3 ok"
+         .DB $82,$00,$49,$46,$20,$33,$3D,$33,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$33,$3D,$33,$20,$6F,$6B,$22,$0D  ; 130 IF 3=3 THEN PRINT "3=3 ok"
+         .DB $8C,$00,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$4C,$4F,$4F,$50,$20,$76,$69,$61,$20,$47,$4F,$54,$4F,$20,$2D,$2D,$2D,$22,$0D  ; 140 PRINT "--- LOOP via GOTO ---"
+         .DB $96,$00,$49,$3D,$31,$0D  ; 150 I=1
+         .DB $A0,$00,$49,$46,$20,$49,$3E,$35,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$31,$39,$30,$0D  ; 160 IF I>5 THEN GOTO 190
+         .DB $AA,$00,$50,$52,$49,$4E,$54,$20,$49,$3B,$0D  ; 170 PRINT I;
+         .DB $B4,$00,$49,$3D,$49,$2B,$31,$3A,$47,$4F,$54,$4F,$20,$31,$36,$30,$0D  ; 180 I=I+1:GOTO 160
+         .DB $BE,$00,$50,$52,$49,$4E,$54,$20,$22,$22,$0D  ; 190 PRINT ""
+         .DB $C8,$00,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$4E,$45,$53,$54,$45,$44,$20,$4C,$4F,$4F,$50,$20,$2D,$2D,$2D,$22,$0D  ; 200 PRINT "--- NESTED LOOP ---"
+         .DB $D2,$00,$49,$3D,$31,$0D  ; 210 I=1
+         .DB $DC,$00,$49,$46,$20,$49,$3E,$33,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$32,$37,$30,$0D  ; 220 IF I>3 THEN GOTO 270
+         .DB $E6,$00,$4A,$3D,$31,$0D  ; 230 J=1
+         .DB $F0,$00,$49,$46,$20,$4A,$3E,$33,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$32,$36,$30,$0D  ; 240 IF J>3 THEN GOTO 260
+         .DB $FA,$00,$50,$52,$49,$4E,$54,$20,$4A,$3B,$0D  ; 250 PRINT J;
+         .DB $FF,$00,$4A,$3D,$4A,$2B,$31,$3A,$47,$4F,$54,$4F,$20,$32,$34,$30,$0D  ; 255 J=J+1:GOTO 240
+         .DB $04,$01,$50,$52,$49,$4E,$54,$20,$22,$22,$3A,$49,$3D,$49,$2B,$31,$3A,$47,$4F,$54,$4F,$20,$32,$32,$30,$0D  ; 260 PRINT "":I=I+1:GOTO 220
+         .DB $0E,$01,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$4D,$41,$4E,$44,$45,$4C,$42,$52,$4F,$54,$20,$2D,$2D,$2D,$22,$0D  ; 270 PRINT "--- MANDELBROT ---"
+         .DB $18,$01,$49,$3D,$2D,$36,$34,$0D  ; 280 I=-64
+         .DB $22,$01,$49,$46,$20,$49,$3E,$35,$36,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$34,$38,$30,$0D  ; 290 IF I>56 THEN GOTO 480
+         .DB $2C,$01,$44,$3D,$49,$0D  ; 300 D=I
+; v1.1: line 310 C=-120 (was -128), line 320 C>4 (was C>16) — better-centred render
+         .DB $36,$01,$43,$3D,$2D,$31,$32,$30,$0D  ; 310 C=-120
+         .DB $40,$01,$49,$46,$20,$43,$3E,$34,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$34,$35,$30,$0D  ; 320 IF C>4 THEN GOTO 450
+         .DB $4A,$01,$41,$3D,$43,$3A,$42,$3D,$44,$3A,$45,$3D,$30,$3A,$4E,$3D,$31,$0D  ; 330 A=C:B=D:E=0:N=1
+         .DB $54,$01,$49,$46,$20,$4E,$3E,$31,$36,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$33,$39,$30,$0D  ; 340 IF N>16 THEN GOTO 390
+         .DB $5E,$01,$49,$46,$20,$45,$3E,$30,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$33,$38,$30,$0D  ; 350 IF E>0 THEN GOTO 380
+         .DB $68,$01,$54,$3D,$41,$2A,$41,$2F,$36,$34,$2D,$42,$2A,$42,$2F,$36,$34,$2B,$43,$0D  ; 360 T=A*A/64-B*B/64+C
+         .DB $72,$01,$42,$3D,$32,$2A,$41,$2A,$42,$2F,$36,$34,$2B,$44,$3A,$41,$3D,$54,$0D  ; 370 B=2*A*B/64+D:A=T
+         .DB $7C,$01,$49,$46,$20,$41,$2A,$41,$2F,$36,$34,$2B,$42,$2A,$42,$2F,$36,$34,$3E,$32,$35,$36,$20,$54,$48,$45,$4E,$20,$49,$46,$20,$45,$3D,$30,$20,$54,$48,$45,$4E,$20,$45,$3D,$4E,$0D  ; 380 IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N
+         .DB $86,$01,$4E,$3D,$4E,$2B,$31,$3A,$49,$46,$20,$4E,$3C,$3D,$31,$36,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$33,$34,$30,$0D  ; 390 N=N+1:IF N<=16 THEN GOTO 340
+         .DB $90,$01,$49,$46,$20,$45,$3E,$30,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$43,$48,$52,$24,$28,$45,$2B,$33,$32,$29,$3B,$0D  ; 400 IF E>0 THEN PRINT CHR$(E+32);
+         .DB $9A,$01,$49,$46,$20,$45,$3D,$30,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$43,$48,$52,$24,$28,$33,$32,$29,$3B,$0D  ; 410 IF E=0 THEN PRINT CHR$(32);
+         .DB $A4,$01,$43,$3D,$43,$2B,$34,$0D  ; 420 C=C+4
+         .DB $AE,$01,$47,$4F,$54,$4F,$20,$33,$32,$30,$0D  ; 430 GOTO 320
+         .DB $C2,$01,$50,$52,$49,$4E,$54,$20,$22,$22,$0D  ; 450 PRINT ""
+         .DB $CC,$01,$49,$3D,$49,$2B,$36,$0D  ; 460 I=I+6
+         .DB $D6,$01,$47,$4F,$54,$4F,$20,$32,$39,$30,$0D  ; 470 GOTO 290
+         .DB $E0,$01,$45,$4E,$44,$0D  ; 480 END
+SHOWCASE_END:
+
+; =============================================================================
+; Reset / IRQ vectors
+; =============================================================================
+         .ORG $FFFC
+         .DW ROMSTART         ; $FFFC: reset vector
+         .DW IRQ_HANDLER      ; $FFFE: IRQ vector
