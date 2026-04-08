@@ -2,7 +2,7 @@
 
 **Small Functional BASICs for Nostalgic 6502ers**
 
-This repository contains two Tiny BASIC interpreters for 6502/65C02 systems, along with a pure-C assembler and C simulator used to build and test them. Tiny BASICs are minimal BASIC interpreters from the dawn of home computing — see the original 1976 [Dr. Dobb's Journal Vol. 1](https://archive.org/details/dr_dobbs_journal_vol_01) for the history.
+This repository contains Tiny BASIC interpreters for 6502/65C02 systems, along with a pure-C assembler and C simulator used to build and test them. Tiny BASICs are minimal BASIC interpreters from the dawn of home computing — see the original 1976 [Dr. Dobb's Journal Vol. 1](https://archive.org/details/dr_dobbs_journal_vol_01) for the history.
 
 As per Dr Dobbs, the classic approach was to use an Intermediate Language (IL) between the host CPU and the BASIC parser, which eased porting but cost speed. A hand-assembled 6502 IL version was written by Tom Pittman and is documented at [ittybittycomputers.com](http://www.ittybittycomputers.com/IttyBitty/TinyBasic/index.htm). 
 
@@ -18,7 +18,7 @@ Both interpreters have been tested on the [Kowalski 65C02 Simulator](https://git
 
 ---
 
-## The Two Interpreters
+## The Interpreters
 
 ### uBASIC — fits in a 2716 EPROM (<2 KByte)
 
