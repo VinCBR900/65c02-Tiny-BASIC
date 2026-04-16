@@ -17,13 +17,13 @@ tools-win:
 
 roms: $(ROMS)
 
-uBASIC.bin: uBASIC.asm | $(ASM)
+uBASIC.bin: uBASIC.asm $(ASM)
 	$(ASM) $< -o $@ -r '$$F800-$$FFFF'
 
-uBASIC6502.bin: uBASIC6502.asm | $(ASM)
+uBASIC6502.bin: uBASIC6502.asm $(ASM)
 	$(ASM) $< -o $@ -r '$$F800-$$FFFF'
 
-4kBASIC.bin: 4kBASIC.asm | $(ASM)
+4kBASIC.bin: 4kBASIC.asm $(ASM)
 	$(ASM) $< -o $@ -r '$$F000-$$FFFF'
 
 clean:

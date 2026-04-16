@@ -2,6 +2,7 @@ CC ?= gcc
 CFLAGS ?= -O2
 WINCC ?= x86_64-w64-mingw32-gcc
 WIN_CFLAGS ?= -O2
+NCURSES_LIBS ?= -lncurses
 
 .PHONY: all windows clean
 
@@ -16,7 +17,7 @@ sim65c02: sim65c02.c asm65c02.c
 	$(CC) $(CFLAGS) -o $@ sim65c02.c
 
 sim65c02_interactive: sim65c02_interactive.c asm65c02.c
-	$(CC) $(CFLAGS) -o $@ sim65c02_interactive.c
+	$(CC) $(CFLAGS) -o $@ sim65c02_interactive.c $(NCURSES_LIBS)
 
 asm65c02.exe: asm65c02.c
 	$(WINCC) $(WIN_CFLAGS) -DASM65C02_MAIN -o $@ $<
