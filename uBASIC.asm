@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC v17.0  --  2 KB Tiny BASIC for the 65C02
+; uBASIC v18.0  --  2 KB Tiny BASIC for the 65C02
 ;    
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -64,6 +64,7 @@
 ;     LDA #>SHOWCASE_END  ->  LDA #>PROG
 ;
 ; ---- version history --------------------------------------------------------
+; v18.0 (Apr 2026)  Refactor Relop to reduce code size.
 ; v17.0 (Mar 2026)  Comment cleanup for public release.  No code changes.
 ; v16.0 (Mar 2026)  Size optimisations; 15 bytes saved, 6->21 bytes free.
 ;   GL_DONE: JSR PUTCH/LDA #LF/JSR PUTCH (8 bytes) -> JSR PRNL (3 bytes).
@@ -174,7 +175,7 @@ T_DS  = 164              ; $24 + $80  ('$' -- CHR$)
 
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
-STR_BANNER: .DB "uBASIC v15.0"  ; startup banner; falls into STR_CRLF for CR+LF
+STR_BANNER: .DB "uBASIC v18.0"  ; startup banner; falls into STR_CRLF for CR+LF
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
 STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
@@ -1054,92 +1055,104 @@ EAT_EXPR:
 ;   In:  IP -> expression text
 ;   Out: T0 = signed 16-bit result; true=$FFFF, false=$0000
 ;        IP advanced past expression
-;   Clobbers: A X Y T0 T1 T2 IP
+;   Clobbers: A X T0 T1 T2 IP
 ;
 ;   Precedence (lowest to highest): relational < additive < multiplicative < unary/atom
 ;   Relational operators: = < > <= >= <>
-;   Evaluates left operand via EXPR_ADD, then checks for one relational op.
+;
+;   Algorithm (ported from 8088 BootBASIC bitmask method):
+;     1. Evaluate left operand via EXPR_ADD.
+;     2. Scan operator chars, accumulating a bitmask: LT=1, EQ=2, GT=4.
+;        Handles multi-char operators (<= >= <>) by looping until a
+;        non-relop char is seen.  IP is NOT advanced past that char.
+;     3. If no relop chars found, return T0 unchanged.
+;     4. Evaluate right operand via EXPR_ADD.
+;     5. 16-bit signed compare left vs right -> one result bit (LT/EQ/GT).
+;     6. AND result bit with mask: non-zero -> T0=$FFFF (true), zero -> T0=$0000.
+;
+;   Saves ~70 bytes vs the previous six-handler implementation.
 ; =============================================================================
 EXPR:
-         JSR EXPR_ADD
-         JSR WPEEK
-         CMP #'='
-         BEQ EQ_OP
-         CMP #'<'
-         BEQ LT_OP
-         CMP #'>'
-         BEQ GT_OP            ; branch into GT_OP (and thence to EXPR_RT's RTS)
-; EXPR_RT: nearest RTS -- EXPR falls here when no relational operator is found.
-EXPR_RT: RTS
-
-; --- REL_SETUP  --  shared preamble for all relational operators ---------------
-;
-;   In:  T0 = left operand (already evaluated)
-;        IP -> start of right operand (operator char already consumed by caller)
-;   Out: T0 = right operand; T1 = left operand (swapped for easy comparison)
-;   Clobbers: A T0 T1
-; -----------------------------------------------------------------------------
-REL_SETUP:
-         LDA T0               ; push left operand
+         JSR EXPR_ADD         ; left -> T0
+         LDA T0               ; push left operand lo
          PHA
-         LDA T0+1
+         LDA T0+1             ; push left operand hi
          PHA
-         JSR EXPR_ADD         ; evaluate right operand -> T0
-         PLA
-         STA T1+1             ; pop left operand into T1 (hi first -- stack order)
-         PLA
+         LDX #0               ; X = operator mask  (LT=1, EQ=2, GT=4)
+         JSR WPEEK            ; skip spaces; A = first non-space char (not consumed)
+; --- operator scan loop: accumulate mask bits for each relop char seen -------
+RL_OP:   CMP #'<'
+         BNE RL_NLT
+         TXA
+         ORA #1               ; set LT bit
+         TAX
+         JSR GETCI            ; consume '<'
+         LDA (IP)             ; 65C02: peek next char without consuming
+         BRA RL_OP            ; loop: may be '=' (<=) or '>' (<>)
+RL_NLT:  CMP #'='
+         BNE RL_NEQ
+         TXA
+         ORA #2               ; set EQ bit
+         TAX
+         JSR GETCI            ; consume '='
+         LDA (IP)             ; peek next char
+         BRA RL_OP
+RL_NEQ:  CMP #'>'
+         BNE RL_NREL          ; non-relop char: exit scan
+         TXA
+         ORA #4               ; set GT bit
+         TAX
+         JSR GETCI            ; consume '>'
+         LDA (IP)             ; peek next char
+         BRA RL_OP
+; --- no relop found: T0 still holds left value; discard pushed left ----------
+RL_NREL: TXA                  ; mask -> A
+         BNE RL_HAS_REL       ; any bits set: go evaluate right operand
+EXPR_RT: PLA                  ; discard pushed left hi  (also: EXPR early-exit RTS path)
+         PLA                  ; discard pushed left lo
+         RTS                  ; T0 unchanged = left value
+; --- has relop: evaluate right, restore left into T1, compare ----------------
+RL_HAS_REL:
+         PHA                  ; push mask  (stack top: mask, left_hi, left_lo)
+         JSR EXPR_ADD         ; right -> T0
+         PLA                  ; pull mask
+         STA T2               ; stash mask in T2 (lo byte)
+         PLA                  ; pull left hi
+         STA T1+1
+         PLA                  ; pull left lo
          STA T1
-         RTS
-
-; --- EQ_OP  ( = ) ---
-EQ_OP:   JSR GETCI            ; consume '='
-         JSR REL_SETUP
-         LDA T1
-         CMP T0
-         BNE EQ_F
-         LDA T1+1
-         CMP T0+1
-         BEQ REL_T            ; equal: true
-EQ_F:    BRA REL_F
-
-; --- LT_OP  ( <  also entry for <=  <> ) ---
-LT_OP:   JSR GETCI            ; consume '<'
-         LDA (IP)             ; peek next char without consuming (65C02 zp-indirect)
-         CMP #'>'
-         BEQ NE_OP            ; '<>' sequence
-         CMP #'='
-         BEQ LE_OP            ; '<=' sequence
-         JSR REL_SETUP        ; plain '<': T1 - T0; negative means T1 < T0
+; --- 16-bit signed compare: T1 (left) vs T0 (right) -------------------------
+;   Compute T1 - T0.  Keep hi-byte result in A (N and V flags intact) and
+;   lo-byte in X so we can test for exact equality without touching N/V.
          LDA T1
          SEC
-         SBC T0
+         SBC T0               ; lo: T1lo - T0lo
+         TAX                  ; X = lo diff (zero check later)
          LDA T1+1
-         SBC T0+1
-         BMI REL_T
-         BRA REL_F
-
-; --- NE_OP  ( <> ) ---
-NE_OP:   JSR GETCI            ; consume '>'
-         JSR REL_SETUP
-         LDA T1
-         CMP T0
-         BNE REL_T            ; any difference: true
-         LDA T1+1
-         CMP T0+1
-         BNE REL_T
-         BRA REL_F
-
-; --- LE_OP  ( <= ) ---
-LE_OP:   JSR GETCI            ; consume '='
-         JSR REL_SETUP        ; T0 - T1; negative means T0 < T1, i.e. NOT <=
-         LDA T0
-         SEC
-         SBC T1
-         LDA T0+1
-         SBC T1+1
-         BMI REL_F
-
-; --- REL_T / REL_F  --  common true / false returns ---------------------------
+         SBC T0+1             ; hi: T1hi - T0hi - borrow  (N and V now valid)
+; --- classify result: EQ=2, LT=1, GT=4 --------------------------------------
+         BNE RL_NONZERO       ; hi != 0 -> not equal
+         TXA
+         BNE RL_NONZERO       ; lo != 0 -> not equal
+         LDA #2               ; both zero -> EQ
+         BRA RL_CHECK
+RL_NONZERO:
+; Signed less-than iff N XOR V = 1  (result negative accounting for overflow).
+;   V=0, N=1 -> truly negative   -> LT (XOR=1)
+;   V=1, N=0 -> positive overflowed, was actually negative -> LT (XOR=1)
+;   V=0, N=0 -> truly positive   -> GT (XOR=0)
+;   V=1, N=1 -> negative overflowed, was actually positive -> GT (XOR=0)
+         BVC RL_NO_OVF        ; V=0: N alone decides
+         BMI RL_GT            ; V=1, N=1 -> XOR=0 -> GT
+         BRA RL_LT            ; V=1, N=0 -> XOR=1 -> LT
+RL_NO_OVF:
+         BPL RL_GT            ; V=0, N=0 -> XOR=0 -> GT
+RL_LT:   LDA #1               ; LT
+         BRA RL_CHECK
+RL_GT:   LDA #4               ; GT
+RL_CHECK:
+         AND T2               ; result_bit & operator_mask
+         BEQ REL_F            ; zero -> false
 REL_T:   LDA #$FF
          STA T0
          STA T0+1
@@ -1147,31 +1160,6 @@ REL_T:   LDA #$FF
 REL_F:   STZ T0
          STZ T0+1
          RTS
-
-; --- GT_OP  ( >  also entry for >= ) ---
-GT_OP:   JSR GETCI            ; consume '>'
-         LDA (IP)             ; peek next char without consuming (65C02 zp-indirect)
-         CMP #'='
-         BEQ GE_OP            ; '>=' sequence
-         JSR REL_SETUP        ; plain '>': T0 - T1; negative means T0 < T1 => false
-         LDA T0
-         SEC
-         SBC T1
-         LDA T0+1
-         SBC T1+1
-         BMI REL_T
-         BRA REL_F
-
-; --- GE_OP  ( >= ) ---
-GE_OP:   JSR GETCI            ; consume '='
-         JSR REL_SETUP        ; T1 - T0; negative means T1 < T0, i.e. NOT >=
-         LDA T1
-         SEC
-         SBC T0
-         LDA T1+1
-         SBC T0+1
-         BMI REL_F
-         BRA REL_T
 
 ; =============================================================================
 ; EXPR_ADD  --  additive level: + and -
