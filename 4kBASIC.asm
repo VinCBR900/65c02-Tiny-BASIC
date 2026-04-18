@@ -1,5 +1,5 @@
 ; =============================================================================
-; 4K Integer BASIC v14.0 for the 65C02
+; 4K Integer BASIC v14.1 for the 65C02
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -83,9 +83,22 @@
 ;   $F021-$F0F5  KW_TABLE  keyword strings        (213 bytes, 38 keywords)
 ;   $F0F7-$F106  ERR_TABLE 9 x 2-char error codes
 ;   $F107+       interpreter code  (INIT, MAIN, GETLINE, STMT, EXPR ...)
-;   $FF26+       string literals   (all on same ROM page ? PUTSTR constraint)
+;   $FF16+       string literals   (all on same ROM page -- PUTSTR constraint)
 ;   $FFFA-$FFFF  vectors  (all point to INIT)
 ;
+; v14.1 changes vs v14.0 (size optimisation):
+;   - EXPR relational evaluator redesigned: bitmask algorithm.
+;     Replaces six per-operator handlers (EQ_op, LT_op, GT_op, LE_op, GE_op,
+;     NE_op) with a single unified scan loop that accumulates an operator
+;     bitmask (LT=1, EQ=2, GT=4) in X, evaluates the right operand once via
+;     EXPR_ADD, then performs one 16-bit signed comparison.  Signed less-than
+;     detection uses the N XOR V trick (BVC / EOR #$80 / BMI) -- the 65C02
+;     equivalent of the 8088 JL/JG signed-branch instructions, requiring no
+;     extra ZP scratch beyond T2-lo (which is free at evaluation time).
+;     REL_SETUP is retained unchanged for the AND/OR/XOR boolean operators.
+;     All six relational operators (= < > <= >= <>) remain correct including
+;     signed negative operands.  65C02 opcodes used: LDA (IP), STZ, BRA.
+;     Saves 42 bytes: 3905 -> 3863, free space before vectors 185 -> 227 bytes.
 ; v14.0 changes vs v13.0 (size optimisations):
 ;   - Token reordering: all statement-tokens moved to a contiguous block
 ;     ($80..$95, 22 entries).  STMT_JT expanded from 15 to 22 entries.
@@ -291,7 +304,7 @@ ROMSTART:
 ; STRING TABLE (all strings on same page)
 ; =============================================================================
 STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string/kw addresses
-STR_BANNER: .DB "4K BASIC v14."      ; drop through
+STR_BANNER: .DB "4K BASIC v14.1"      ; drop through
 STR_CRLF:   .DB $0D,$8A             ; CR, LF|$80 = $8A
 STR_BYTES:  .DB " BYTES FREE",$0D,$8A  ; last LF has high-bit
 STR_ERROR:  .DB " ER",$D2           ; 'R'|$80 = $D2
@@ -2167,13 +2180,107 @@ EXPR:
         CMP #'>'
         BEQ EB_rel
         BRA EB_bool
-EB_rel: JSR WPEEK            ; dispatch relational operator
-        CMP #'='
-        BEQ EQ_op
+EB_rel:
+; =============================================================================
+; Relational operator evaluator -- bitmask algorithm
+;
+;   Operator bitmask accumulated in X:  LT=1  EQ=2  GT=4
+;   Left operand (already in T0) saved on hardware stack before scanning.
+;   Mask pushed on stack above the left operand after scanning.
+;   Right operand evaluated via EXPR_ADD (which is safe: EXPR_ADD/EXPR1/EXPR2
+;   do not use the hardware stack for inter-level saves, only local PHA/PLAs
+;   that are balanced within each call -- so our saved values are preserved).
+;   Signed comparison: N XOR V trick (BVC / EOR #$80 / BMI) -- same technique
+;   as the 8088 JL/JG signed branches, no extra scratch storage needed.
+;   65C02 opcodes used: LDA (IP) for zero-overhead peek, STZ for REL_F, BRA.
+; =============================================================================
+        ; Save left operand on stack
+        LDA T0
+        PHA
+        LDA T0+1
+        PHA
+
+        ; Scan relational operator chars, building bitmask in X
+        LDX #0               ; mask = 0
+RL_LOOP:
+        LDA (IP)             ; peek next char without consuming (65C02 zp-indirect)
         CMP #'<'
-        BEQ LT_op
+        BNE RL_CK_EQ
+        TXA
+        ORA #1               ; set LT bit
+        TAX
+        JSR GETCI            ; consume '<'
+        BRA RL_LOOP
+RL_CK_EQ:
+        CMP #'='
+        BNE RL_CK_GT
+        TXA
+        ORA #2               ; set EQ bit
+        TAX
+        JSR GETCI            ; consume '='
+        BRA RL_LOOP
+RL_CK_GT:
         CMP #'>'
-        JMP GT_op
+        BNE RL_DONE
+        TXA
+        ORA #4               ; set GT bit
+        TAX
+        JSR GETCI            ; consume '>'
+        BRA RL_LOOP
+
+RL_DONE:
+        ; Push mask; evaluate right operand; restore left into T1
+        TXA                  ; mask -> A
+        PHA                  ; stack: mask | left-hi | left-lo | ...
+        JSR EXPR_ADD         ; right operand -> T0
+        PLA                  ; pop mask -> A
+        STA T2               ; stash mask in T2-lo (T2 is free at this point)
+        PLA                  ; left hi
+        STA T1+1
+        PLA                  ; left lo
+        STA T1               ; T1=left, T0=right, T2=mask
+
+        ; --- Classify T1 vs T0: produce result bit LT(1)/EQ(2)/GT(4) in A ---
+
+        ; Equality check first (cheaper: two CMPs, no subtract)
+        LDA T1
+        CMP T0
+        BNE RL_NOT_EQ
+        LDA T1+1
+        CMP T0+1
+        BNE RL_NOT_EQ
+        LDA #2               ; EQ
+        BRA RL_TEST
+
+RL_NOT_EQ:
+        ; 16-bit signed T1 - T0.  N XOR V = 1 means T1 < T0 (signed less-than).
+        ; Trick: if V is set, EOR #$80 flips bit 7 (the N source), so that
+        ; BMI always correctly indicates signed less-than regardless of overflow.
+        LDA T1
+        SEC
+        SBC T0
+        LDA T1+1
+        SBC T0+1
+        BVC RL_NO_FLIP
+        EOR #$80             ; flip N when V set -> N=1 now reliably means LT
+RL_NO_FLIP:
+        BMI RL_IS_LT
+        LDA #4               ; GT
+        BRA RL_TEST
+RL_IS_LT:
+        LDA #1               ; LT
+
+RL_TEST:
+        AND T2               ; result bit AND operator mask
+        BEQ REL_F            ; no overlap -> false
+REL_T:  LDA #$FF
+        STA T0
+        STA T0+1
+        RTS
+REL_F:  STZ T0               ; 65C02: STZ zeroes without needing LDA #0
+        STZ T0+1
+        RTS
+
 EB_bool:                     ; boolean/bitwise operator loop
         JSR WPEEK
         CMP #TOK_AND
@@ -2211,12 +2318,13 @@ EB_xor: JSR GETCI            ; XOR: bitwise exclusive-or
         STA T0+1
         BRA EB_bool
 ; =============================================================================
-; REL_SETUP ? shared prologue for relational, AND, OR, XOR operators
-;   Saves left operand (T0), evaluates right operand, restores left into T1.
+; REL_SETUP -- shared prologue for AND / OR / XOR operators
+;   (Relational operators no longer use REL_SETUP; it is retained for the
+;    bitwise boolean operators which call it via EB_and / EB_or / EB_xor.)
 ;   In:  T0   left operand; IP points at right-operand expression
 ;        (caller must have consumed the operator token before calling)
 ;   Out: T1   left operand;  T0   right operand
-;   Clobbers: A T1 T2  (hardware stack)
+;   Clobbers: A T1  (hardware stack)
 ; =============================================================================
 REL_SETUP:
         LDA T0
@@ -2229,80 +2337,6 @@ REL_SETUP:
         PLA
         STA T1
         RTS
-; Relational operators  ?  all use REL_SETUP then compare T1 vs T0
-; Result: REL_T = $FFFF (-1 / true),  REL_F = $0000 (0 / false)
-EQ_op:  JSR GETCI
-        JSR REL_SETUP
-        LDA T1
-        CMP T0
-        BNE EQ_op_f
-        LDA T1+1
-        CMP T0+1
-        BEQ REL_T
-EQ_op_f:
-        BRA REL_F
-LT_op:  JSR GETCI
-        LDA (IP)             ; peek: '<>' or '<=' ?
-        CMP #'>'
-        BEQ NE_op
-        CMP #'='
-        BEQ LE_op
-        JSR REL_SETUP
-        LDA T1
-        SEC
-        SBC T0
-        LDA T1+1
-        SBC T0+1
-        BMI REL_T
-        BRA REL_F
-NE_op:  JSR GETCI
-        JSR REL_SETUP
-        LDA T1
-        CMP T0
-        BNE REL_T
-        LDA T1+1
-        CMP T0+1
-        BNE REL_T
-        BRA REL_F
-LE_op:  JSR GETCI
-        JSR REL_SETUP
-        LDA T0
-        SEC
-        SBC T1
-        LDA T0+1
-        SBC T1+1
-        BMI REL_F
-        ; *** FALL THROUGH to REL_T ***
-; Two adjacent labels: LE_op falls through here when T0 >= T1 (i.e. T1 <= T0 is true).
-; REL_T is also the shared true-result target for all other relational ops.
-REL_T:  LDA #$FF
-        STA T0
-        STA T0+1
-        RTS
-REL_F:  STZ T0
-        STZ T0+1
-        RTS
-GT_op:  JSR GETCI
-        LDA (IP)             ; peek: '>=' ?
-        CMP #'='
-        BEQ GE_op
-        JSR REL_SETUP
-        LDA T0
-        SEC
-        SBC T1
-        LDA T0+1
-        SBC T1+1
-        BMI REL_T
-        BRA REL_F
-GE_op:  JSR GETCI
-        JSR REL_SETUP
-        LDA T1
-        SEC
-        SBC T0
-        LDA T1+1
-        SBC T0+1
-        BMI REL_F
-        BRA REL_T
 ; =============================================================================
 ; EXPR_ADD ? Tier 2: addition, subtraction  (also relational dispatch above)
 ; =============================================================================
