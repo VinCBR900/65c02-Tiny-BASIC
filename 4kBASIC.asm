@@ -1,5 +1,5 @@
 ; =============================================================================
-; 4K Integer BASIC v14.1 for the 65C02
+; 4K Integer BASIC v14.2 for the 65C02
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -83,9 +83,17 @@
 ;   $F021-$F0F5  KW_TABLE  keyword strings        (213 bytes, 38 keywords)
 ;   $F0F7-$F106  ERR_TABLE 9 x 2-char error codes
 ;   $F107+       interpreter code  (INIT, MAIN, GETLINE, STMT, EXPR ...)
-;   $FF16+       string literals   (all on same ROM page -- PUTSTR constraint)
+;   $FF11+       string literals   (all on same ROM page -- PUTSTR constraint)
 ;   $FFFA-$FFFF  vectors  (all point to INIT)
 ;
+; v14.2 changes vs v14.1 (size optimisation):
+;   - T2DEC subroutine factored from DELINE and INSLINE.
+;     Both copy loops contained an identical 14-byte sequence:
+;     16-bit decrement of T2 followed by ORA zero-test and conditional branch.
+;     Extracted as T2DEC (13 bytes + RTS): decrements T2 and returns Z=1
+;     when the result reaches zero, Z=0 otherwise.  Each call site replaced
+;     with JSR T2DEC(3) + BNE(2) = 5 bytes.
+;     Net saving: 5 bytes (3863 -> 3858); free space before vectors 227 -> 232.
 ; v14.1 changes vs v14.0 (size optimisation):
 ;   - EXPR relational evaluator redesigned: bitmask algorithm.
 ;     Replaces six per-operator handlers (EQ_op, LT_op, GT_op, LE_op, GE_op,
@@ -304,7 +312,7 @@ ROMSTART:
 ; STRING TABLE (all strings on same page)
 ; =============================================================================
 STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string/kw addresses
-STR_BANNER: .DB "4K BASIC v14.1"      ; drop through
+STR_BANNER: .DB "4K BASIC v14.2"      ; drop through
 STR_CRLF:   .DB $0D,$8A             ; CR, LF|$80 = $8A
 STR_BYTES:  .DB " BYTES FREE",$0D,$8A  ; last LF has high-bit
 STR_ERROR:  .DB " ER",$D2           ; 'R'|$80 = $D2
@@ -723,6 +731,21 @@ PNUM:   JSR WEAT             ; skip whitespace, consume $FF token
         STA T0+1
         JMP GETCI            ; advance IP and return  (tail call)
 ; =============================================================================
+; T2DEC ? decrement 16-bit counter T2; return Z=1 when result reaches zero
+;   In:  T2 = 16-bit counter
+;   Out: T2 decremented; Z=1 if T2==0, Z=0 otherwise
+;   Clobbers: A
+;   Shared by DELINE and INSLINE to avoid duplicating the 14-byte
+;   decrement-and-zero-test sequence in each copy loop.
+; =============================================================================
+T2DEC:  LDA T2
+        BNE T2D_lo
+        DEC T2+1
+T2D_lo: DEC T2
+        LDA T2
+        ORA T2+1
+        RTS                  ; Z=1 if zero, Z=0 if not
+; =============================================================================
 ; DELINE ? remove the program line whose 2-byte header starts at LP
 ;   In:  LP   points at <lo> <hi> of line to delete
 ;        PE   program end pointer
@@ -761,12 +784,7 @@ DL_cp:  LDA (T0),y           ; shift bytes down
         BNE DL_nhi
         INC T0+1
         INC LP+1
-DL_nhi: LDA T2
-        BNE DL_dc
-        DEC T2+1
-DL_dc:  DEC T2
-        LDA T2
-        ORA T2+1
+DL_nhi: JSR T2DEC            ; decrement T2; Z=1 when zero
         BNE DL_cp
 DL_upd: LDA PE               ; update PE
         SEC
@@ -862,13 +880,7 @@ IN_bk_d0:
         DEC T1+1
 IN_bk_d1:
         DEC T1
-        LDA T2               ; decrement T2 (byte counter)
-        BNE IN_bk_d2
-        DEC T2+1
-IN_bk_d2:
-        DEC T2
-        LDA T2
-        ORA T2+1
+        JSR T2DEC            ; decrement T2; Z=1 when zero
         BNE IN_bk
 IN_shift:
         PLA                  ; recover total byte count
