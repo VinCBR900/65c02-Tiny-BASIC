@@ -1810,6 +1810,7 @@ MK_FAIL: LDA LP               ; restore IP to saved position
          STA IP+1
          SEC                  ; C=1: no match
          RTS
+LAST_ROM_CODE = *            ; first byte after executable ROM code 
 
 ; Pre-loaded Mandelbrot program  ($0200)
 ;
