@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC v18.0  --  2 KB Tiny BASIC for the 65C02
+; uBASIC v18.1  --  2 KB Tiny BASIC for the 65C02
 ;    
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -28,8 +28,8 @@
 ; ---- ROM memory map ---------------------------------------------------------
 ;   $F800          BRA INIT  (2-byte Kowalski trampoline; see note below)
 ;   $F802..$F859   string / keyword table  (all on page $F8)
-;   $F85A..$FFE6   interpreter code  (2023 bytes)
-;   $FFE7..$FFFB   free (21 bytes)
+;   $F85A..$FFA7   interpreter code  (1960 bytes)
+;   $FFA8..$FFFB   free (82 bytes)
 ;   $FFFC..$FFFF   reset / IRQ vectors
 ;
 ; ---- zero-page layout -------------------------------------------------------
@@ -64,6 +64,13 @@
 ;     LDA #>SHOWCASE_END  ->  LDA #>PROG
 ;
 ; ---- version history --------------------------------------------------------
+; v18.1 (Apr 2026)  T2DEC subroutine factored from DELINE and INSLINE.
+;   Both copy loops contained an identical 14-byte 16-bit decrement and
+;   ORA zero-test sequence on T2.  Extracted as T2DEC (13 bytes + RTS):
+;   decrements T2, returns Z=1 when zero.  Each call site: JSR T2DEC(3) +
+;   BNE(2) = 5 bytes replacing 14.  Note: all opcodes are NMOS-compatible;
+;   no 65C02 instruction shortens the kernel despite proc65c02 mode.
+;   Net saving: 5 bytes (1965 -> 1960); free space 77 -> 82 bytes.
 ; v18.0 (Apr 2026)  Refactor Relop to reduce code size.
 ; v17.0 (Mar 2026)  Comment cleanup for public release.  No code changes.
 ; v16.0 (Mar 2026)  Size optimisations; 15 bytes saved, 6->21 bytes free.
@@ -175,7 +182,7 @@ T_DS  = 164              ; $24 + $80  ('$' -- CHR$)
 
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
-STR_BANNER: .DB "uBASIC v18.0"  ; startup banner; falls into STR_CRLF for CR+LF
+STR_BANNER: .DB "uBASIC v18.1"  ; startup banner; falls into STR_CRLF for CR+LF
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
 STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
@@ -457,6 +464,26 @@ PN_SK:   ASL T0               ; T0 = T0 * 2
          BRA PN_LP
 
 ; =============================================================================
+; T2DEC  --  decrement 16-bit counter T2; return Z=1 when result reaches zero
+;
+;   In:  T2 = 16-bit counter (lo/hi)
+;   Out: T2 decremented; Z=1 if T2==0, Z=0 otherwise
+;   Clobbers: A
+;
+;   Shared by DELINE and INSLINE to avoid duplicating the 14-byte
+;   decrement-and-zero-test sequence in each copy loop.
+;   Note: all opcodes are NMOS 6502 compatible; no 65C02 instruction
+;   shortens a 16-bit ZP decrement + ORA zero-test.
+; =============================================================================
+T2DEC:   LDA T2               ; guard hi byte before decrementing lo
+         BNE T2D_LO
+         DEC T2+1
+T2D_LO:  DEC T2
+         LDA T2               ; zero test
+         ORA T2+1
+         RTS                  ; Z=1 if zero, Z=0 if not
+
+; =============================================================================
 ; DELINE  --  remove the line at LP from the program store; adjust PE
 ;
 ;   In:  LP -> start of line to delete (the line-number lo byte)
@@ -498,12 +525,7 @@ DL_CP:   LDA (T0),Y           ; forward copy: (T0),Y -> (LP),Y
          BNE DL_NHI
          INC T0+1             ; Y wrapped -- advance both hi-bytes
          INC LP+1
-DL_NHI:  LDA T2               ; decrement 16-bit counter T2
-         BNE DL_DC
-         DEC T2+1
-DL_DC:   DEC T2
-         LDA T2
-         ORA T2+1
+DL_NHI:  JSR T2DEC            ; decrement T2; Z=1 when zero
          BNE DL_CP
 DL_UPD:  LDA PE               ; PE -= line length
          SEC
@@ -647,12 +669,7 @@ IN_D0:   DEC T0
          BNE IN_D1
          DEC T1+1
 IN_D1:   DEC T1
-         LDA T2               ; decrement shift counter T2 (16-bit)
-         BNE IN_D2
-         DEC T2+1
-IN_D2:   DEC T2
-         LDA T2
-         ORA T2+1
+         JSR T2DEC            ; decrement T2; Z=1 when zero
          BNE IN_BK
 IN_SHIFT:
          PLX                  ; restore line size
