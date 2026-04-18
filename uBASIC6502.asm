@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC6502 v1.1  --  2 KB Tiny BASIC (NMOS 6502)
+; uBASIC6502 v1.2  --  2 KB Tiny BASIC (NMOS 6502)
 ;
 ; Derived from uBASIC 65C02 v17.0, refactored for NMOS 6502 mnemonics and
 ; 2-byte keyword-prefix matching while retaining support for conventional
@@ -28,8 +28,8 @@
 ; ---- ROM memory map ---------------------------------------------------------
 ;   $F800          JMP INIT trampoline (Kowalski compatibility)
 ;   $F803..$F85B   string / keyword table  (all on page $F8)
-;   $F85C..$FFE0   interpreter code  (2017 bytes in current build)
-;   $FFE1..$FFF9   free (25 bytes)
+;   $F85C..$FFAE   interpreter code  (1967 bytes in current build)
+;   $FFAF..$FFF9   free (75 bytes)
 ;   $FFFC..$FFFF   reset / IRQ vectors
 ;
 ; ---- zero-page layout -------------------------------------------------------
@@ -41,7 +41,8 @@
 ;   $0A-$0B  T2     tertiary scratch word / STMT indirect-jump target
 ;   $0C-$0D  CURLN  currently-executing line number
 ;   $0E      RUN    run flag: $00 = immediate mode, $FF = program running
-;   $0F      OP     saved operator for MUL/DIV/MOD kernel ('*', '/', '%')
+;   $0F      OP     MUL/DIV/MOD operator save ('*'/'/'/'%');
+;                   also used as relop bitmask scratch during EXPR evaluation
 ;   $10-$2F  IBUF   input line buffer (32 bytes)
 ;   $30-$4F  --     free RAM
 ;   $50-$8B  VARS   A-Z variable store (2 bytes each, 52 bytes total)
@@ -84,6 +85,18 @@
 ;                     (C) Showcase Mandelbrot: column scan range narrowed from
 ;                         -128..16 to -120..4 for a better-centred render.
 ;                     (D) STR_BANNER updated to "uBASIC6502 v1.1".
+;   v1.2  (Apr 2026)  EXPR relational evaluator redesigned: bitmask algorithm.
+;                     Replaces six per-operator handlers (EQ_OP, LT_OP, GT_OP,
+;                     LE_OP, GE_OP, NE_OP) and the REL_SETUP subroutine with a
+;                     single unified loop that accumulates an operator bitmask
+;                     (LT=1, EQ=2, GT=4) in X, evaluates the right operand once,
+;                     then performs one 16-bit signed comparison using the NMOS
+;                     6502 N XOR V trick (BVC / EOR #$80 / BMI) -- the direct
+;                     equivalent of the 8088 JL/JG signed-branch instructions.
+;                     All six relational operators (= < > <= >= <>) are handled
+;                     correctly including signed negative operands.  No 65C02
+;                     opcodes used.  Saves 54 bytes: 2021 -> 1967, free space
+;                     before vectors grows from 21 to 75 bytes.
 ; =============================================================================
 ;
 ; ---- assembler mode ---------------------------------------------------------
@@ -180,8 +193,8 @@ T_DS  = 164              ; $24 + $80  ('$' -- CHR$)
 
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
-; v1.1: STR_BANNER updated from "uBASIC6502 v1.0" to "uBASIC6502 v1.1"
-STR_BANNER: .DB "uBASIC6502 v1.1"  ; startup banner; falls into STR_CRLF for CR+LF
+; v1.2: STR_BANNER updated from "uBASIC6502 v1.1" to "uBASIC6502 v1.2"
+STR_BANNER: .DB "uBASIC6502 v1.2"  ; startup banner; falls into STR_CRLF for CR+LF
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
 STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
@@ -1038,90 +1051,102 @@ EAT_EXPR:
 ;   Relational operators: = < > <= >= <>
 ;   Evaluates left operand via EXPR_ADD, then checks for one relational op.
 ; =============================================================================
-EXPR:
-         JSR EXPR_ADD
-         JSR WPEEK
-         CMP #'='
-         BEQ EQ_OP
-         CMP #'<'
-         BEQ LT_OP
-         CMP #'>'
-         BEQ GT_OP
-; EXPR_RT: nearest RTS -- EXPR falls here when no relational operator is found.
-EXPR_RT: RTS
-
-; --- REL_SETUP  --  shared preamble for all relational operators ---------------
+; =============================================================================
+; EXPR  --  evaluate expression including relational operators (bitmask design)
 ;
-;   In:  T0 = left operand (already evaluated)
-;        IP -> start of right operand (operator char already consumed by caller)
-;   Out: T0 = right operand; T1 = left operand (swapped for easy comparison)
-;   Clobbers: A T0 T1
-; -----------------------------------------------------------------------------
-REL_SETUP:
-         LDA T0               ; push left operand
+;   In:  IP -> expression text
+;   Out: T0 = signed 16-bit result; true=$FFFF, false=$0000
+;        IP advanced past expression
+;   Clobbers: A X Y T0 T1 OP IP
+;
+;   Operator bitmask built in X: LT=1  EQ=2  GT=4
+;   Signed comparison uses the N XOR V trick (BVC / EOR #$80 / BMI) so no
+;   65C02 opcodes are needed and the NMOS 6502 target is fully respected.
+; =============================================================================
+EXPR:
+         JSR EXPR_ADD         ; evaluate left operand -> T0
+
+         ; Save left on hardware stack
+         LDA T0
          PHA
          LDA T0+1
          PHA
-         JSR EXPR_ADD         ; evaluate right operand -> T0
-         PLA
-         STA T1+1             ; pop left operand into T1 (hi first -- stack order)
-         PLA
-         STA T1
-         RTS
 
-; --- EQ_OP  ( = ) ---
-EQ_OP:   JSR GETCI            ; consume '='
-         JSR REL_SETUP
+         ; Scan relational operator chars, building bitmask in X
+         LDX #0               ; mask = 0 (no relop seen yet)
+
+RL_LOOP: JSR WPEEK            ; A = next char at IP (no consume)
+         CMP #'<'
+         BNE RL_CK_EQ
+         TXA
+         ORA #1               ; set LT bit
+         TAX
+         JSR GETCI            ; consume '<'
+         BNE RL_LOOP          ; always taken (',' != 0)
+RL_CK_EQ:
+         CMP #'='
+         BNE RL_CK_GT
+         TXA
+         ORA #2               ; set EQ bit
+         TAX
+         JSR GETCI            ; consume '='
+         BNE RL_LOOP          ; always taken
+RL_CK_GT:
+         CMP #'>'
+         BNE RL_DONE
+         TXA
+         ORA #4               ; set GT bit
+         TAX
+         JSR GETCI            ; consume '>'
+         BNE RL_LOOP          ; always taken
+
+RL_DONE: CPX #0               ; any relational operator found?
+         BEQ RL_NONE          ; no: return left operand as-is
+
+         ; Push mask, evaluate right operand, restore everything
+         TXA                  ; mask -> A
+         PHA                  ; push mask onto stack
+         JSR EXPR_ADD         ; right operand -> T0
+         PLA                  ; pop mask
+         STA OP               ; stash in OP (ZP $0F, idle during eval)
+         PLA                  ; left hi (pushed second, pops first)
+         STA T1+1
+         PLA                  ; left lo
+         STA T1               ; T1 = left operand, T0 = right operand
+
+         ; --- Classify T1 vs T0 as LT(1) / EQ(2) / GT(4) into A ---
+
+         ; Check equality first (cheaper than subtract)
          LDA T1
          CMP T0
-         BNE EQ_F
+         BNE RL_NOT_EQ
          LDA T1+1
          CMP T0+1
-         BEQ REL_T
-EQ_F:    ; JMP REL_F
-	BNE REL_F		; always taken
-	
-; --- LT_OP  ( <  also entry for <=  <> ) ---
-LT_OP:   JSR GETCI            ; consume '<'
-         LDY #0
-         LDA (IP),Y           ; peek next char without consuming
-         CMP #'>'
-         BEQ NE_OP            ; '<>' sequence
-         CMP #'='
-         BEQ LE_OP            ; '<=' sequence
-         JSR REL_SETUP        ; plain '<': T1 - T0; negative means T1 < T0
+         BNE RL_NOT_EQ
+         LDA #2               ; EQ
+         BNE RL_TEST          ; always taken (A=2 != 0)
+
+RL_NOT_EQ:
+         ; 16-bit signed subtract T1 - T0; use N XOR V to detect less-than
+         ; (NMOS 6502 safe: no 65C02 opcodes)
          LDA T1
          SEC
          SBC T0
          LDA T1+1
-         SBC T0+1
-         BMI REL_T
-         ; JMP REL_F
-	 BPL REL_F	; always taken
-	 
-; --- NE_OP  ( <> ) ---
-NE_OP:   JSR GETCI            ; consume '>'
-         JSR REL_SETUP
-         LDA T1
-         CMP T0
-         BNE REL_T
-         LDA T1+1
-         CMP T0+1
-         BNE REL_T
-         ; JMP REL_F
-	BPL REL_F	; always taken
-	 
-; --- LE_OP  ( <= ) ---
-LE_OP:   JSR GETCI            ; consume '='
-         JSR REL_SETUP        ; T0 - T1; negative means T0 < T1, i.e. NOT <=
-         LDA T0
-         SEC
-         SBC T1
-         LDA T0+1
-         SBC T1+1
-         BMI REL_F
+         SBC T0+1             ; N and V now reflect signed T1 - T0
+         ; N XOR V = 1 means T1 < T0 (signed).
+         ; Trick: if V set, flip bit 7 of result so BMI always means "less-than".
+         BVC RL_NO_FLIP
+         EOR #$80             ; flip N when V set
+RL_NO_FLIP:
+         BMI RL_IS_LT
+         LDA #4               ; GT
+         BNE RL_TEST          ; always taken
+RL_IS_LT:
+         LDA #1               ; LT
 
-; --- REL_T / REL_F  --  common true / false returns ---------------------------
+RL_TEST: AND OP               ; result bit AND operator mask
+         BEQ REL_F            ; no overlap -> false
 REL_T:   LDA #$FF
          STA T0
          STA T0+1
@@ -1131,34 +1156,10 @@ REL_F:   LDA #0
          STA T0+1
          RTS
 
-; --- GT_OP  ( >  also entry for >= ) ---
-GT_OP:   JSR GETCI            ; consume '>'
-         LDY #0
-         LDA (IP),Y           ; peek next char without consuming
-         CMP #'='
-         BEQ GE_OP            ; '>=' sequence
-         JSR REL_SETUP        ; plain '>': T0 - T1; negative means T0 < T1 => false
-         LDA T0
-         SEC
-         SBC T1
-         LDA T0+1
-         SBC T1+1
-         BMI REL_T
-         ; JMP REL_F
-	BPL REL_F	; always taken
-	 
-; --- GE_OP  ( >= ) ---
-GE_OP:   JSR GETCI            ; consume '='
-         JSR REL_SETUP        ; T1 - T0; negative means T1 < T0, i.e. NOT >=
-         LDA T1
-         SEC
-         SBC T0
-         LDA T1+1
-         SBC T0+1
-         BMI REL_F
-        ; JMP REL_T
-	BPL REL_T	; always taken
-	 
+RL_NONE: ; No relop found: discard the stacked copy of left (T0 already correct)
+         PLA                  ; discard saved T0+1
+         PLA                  ; discard saved T0
+EXPR_RT: RTS
 ; =============================================================================
 ; EXPR_ADD  --  additive level: + and -
 ;
