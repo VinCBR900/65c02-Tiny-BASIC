@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC6502 v1.2  --  2 KB Tiny BASIC (NMOS 6502)
+; uBASIC6502 v1.3  --  2 KB Tiny BASIC (NMOS 6502)
 ;
 ; Derived from uBASIC 65C02 v17.0, refactored for NMOS 6502 mnemonics and
 ; 2-byte keyword-prefix matching while retaining support for conventional
@@ -28,8 +28,8 @@
 ; ---- ROM memory map ---------------------------------------------------------
 ;   $F800          JMP INIT trampoline (Kowalski compatibility)
 ;   $F803..$F85B   string / keyword table  (all on page $F8)
-;   $F85C..$FFAE   interpreter code  (1967 bytes in current build)
-;   $FFAF..$FFF9   free (75 bytes)
+;   $F85C..$FFA9   interpreter code  (1962 bytes in current build)
+;   $FFAA..$FFF9   free (80 bytes)
 ;   $FFFC..$FFFF   reset / IRQ vectors
 ;
 ; ---- zero-page layout -------------------------------------------------------
@@ -85,6 +85,13 @@
 ;                     (C) Showcase Mandelbrot: column scan range narrowed from
 ;                         -128..16 to -120..4 for a better-centred render.
 ;                     (D) STR_BANNER updated to "uBASIC6502 v1.1".
+; v1.3  (Apr 2026)  T2DEC subroutine factored from DELINE and INSLINE.
+;                     Both copy loops ended with an identical 14-byte sequence
+;                     (16-bit decrement of T2 + ORA zero-test).  Extracted as
+;                     T2DEC: returns Z=1 when T2 reaches zero, Z=0 otherwise.
+;                     Each call site: JSR T2DEC(3) + BNE(2) = 5 bytes replacing
+;                     14.  Subroutine: 13 bytes + shared by 2 sites.
+;                     Net saving: 5 bytes (1967 -> 1962); free space 75 -> 80.
 ;   v1.2  (Apr 2026)  EXPR relational evaluator redesigned: bitmask algorithm.
 ;                     Replaces six per-operator handlers (EQ_OP, LT_OP, GT_OP,
 ;                     LE_OP, GE_OP, NE_OP) and the REL_SETUP subroutine with a
@@ -193,8 +200,8 @@ T_DS  = 164              ; $24 + $80  ('$' -- CHR$)
 
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
-; v1.2: STR_BANNER updated from "uBASIC6502 v1.1" to "uBASIC6502 v1.2"
-STR_BANNER: .DB "uBASIC6502 v1.2"  ; startup banner; falls into STR_CRLF for CR+LF
+; v1.3: STR_BANNER updated from "uBASIC6502 v1.2" to "uBASIC6502 v1.3"
+STR_BANNER: .DB "uBASIC6502 v1.3"  ; startup banner; falls into STR_CRLF for CR+LF
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
 STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
@@ -476,6 +483,24 @@ PN_SK:   ASL T0               ; T0 = T0 * 2
          JMP PN_LP
 
 ; =============================================================================
+; T2DEC  --  decrement 16-bit counter T2; set Z=1 when result is zero
+;
+;   In:  T2 = 16-bit counter (lo/hi)
+;   Out: T2 decremented; Z=1 if T2==0, Z=0 otherwise
+;   Clobbers: A
+;
+;   Shared by DELINE and INSLINE to avoid duplicating the 14-byte
+;   decrement-and-zero-test sequence in each copy loop.
+; =============================================================================
+T2DEC:   LDA T2               ; 16-bit decrement: guard hi byte
+         BNE T2D_LO
+         DEC T2+1
+T2D_LO:  DEC T2
+         LDA T2               ; zero test
+         ORA T2+1
+         RTS                  ; Z=1 if zero, Z=0 if not
+
+; =============================================================================
 ; DELINE  --  remove the line at LP from the program store; adjust PE
 ;
 ;   In:  LP -> start of line to delete (the line-number lo byte)
@@ -517,12 +542,7 @@ DL_CP:   LDA (T0),Y           ; forward copy: (T0),Y -> (LP),Y
          BNE DL_NHI
          INC T0+1             ; Y wrapped -- advance both hi-bytes
          INC LP+1
-DL_NHI:  LDA T2               ; decrement 16-bit counter T2
-         BNE DL_DC
-         DEC T2+1
-DL_DC:   DEC T2
-         LDA T2
-         ORA T2+1
+DL_NHI:  JSR T2DEC            ; decrement T2; Z=1 when zero
          BNE DL_CP
 DL_UPD:  LDA PE               ; PE -= line length
          SEC
@@ -670,12 +690,7 @@ IN_D0:   DEC T0
          BNE IN_D1
          DEC T1+1
 IN_D1:   DEC T1
-         LDA T2               ; decrement shift counter T2 (16-bit)
-         BNE IN_D2
-         DEC T2+1
-IN_D2:   DEC T2
-         LDA T2
-         ORA T2+1
+         JSR T2DEC            ; decrement T2; Z=1 when zero
          BNE IN_BK
 IN_SHIFT:
          PLA
@@ -1817,7 +1832,6 @@ MK_FAIL: LDA LP               ; restore IP to saved position
          STA IP+1
          SEC                  ; C=1: no match
          RTS
-LAST_ROM_CODE = *            ; first byte after executable ROM code 
 
 ; =============================================================================
 ; Pre-loaded showcase program  ($0200)
