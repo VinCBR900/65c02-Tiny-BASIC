@@ -883,7 +883,7 @@ LS_EOL:  JSR PRNL              ; print CR+LF at end of each listed line
 ;   Clobbers: A X T0 IP SP
 ; =============================================================================
 DO_GOTO:
-         JSR PNUM             ; parse target line number -> T0
+         JSR EXPR             ; parse target line number -> T0
          JSR GOTOL            ; find line: C=0 found (IP at body), C=1 not found
          BCC DG_OK
          LDA #ERR_UL
