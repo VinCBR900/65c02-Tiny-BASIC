@@ -11,12 +11,12 @@
 ;
 ; =============================================================================
 ;
-; Statements   : PRINT  IF..THEN  GOTO  LIST  RUN  NEW  INPUT  REM  END  LET
-;                POKE   FREE   HELP
+; Statements   : END  FREE  GOTO  HELP  IF..THEN INPUT  LET  LIST  NEW  REM  RUN
+;                POKE  PRINT     
 ; Expressions  : + - * / %   = < > <= >= <>   unary -
-;                CHR$(n)   PEEK(addr)   USR(addr)   A-Z variables
+;                PEEK(addr)   USR(addr)   A-Z variables
 ; Numbers      : signed 16-bit  (-32768 .. 32767)
-; String print : "literals" and CHR$() only; no string variables
+; String print : "literals", `;`, TAB(n) and CHR$(n) only; no string variables
 ;
 ; Error codes (printed as "?N"):
 ;   ?0  syntax / bad expression
