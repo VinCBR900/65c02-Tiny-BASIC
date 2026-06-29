@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC6502 v1.3  --  2 KB Tiny BASIC (NMOS 6502)
+; uBASIC6502 v1.4  --  2 KB Tiny BASIC (NMOS 6502)
 ;
 ; Derived from uBASIC 65C02 v17.0, refactored for NMOS 6502 mnemonics and
 ; 2-byte keyword-prefix matching while retaining support for conventional
@@ -13,10 +13,10 @@
 ;
 ; Expressions:
 ;   + - * / %   = < > <= >= <>   unary -
-;   CHR$(n)   PEEK(addr)   USR(addr)   A-Z variables
+;   PEEK(addr)   USR(addr)   A-Z variables
 ;
 ; Numbers      : signed 16-bit  (-32768 .. 32767)
-; String print : "literals" and CHR$() only; no string variables
+; String print : "literals", `;`, TAB(n) and CHR$() only; no string variables
 ;
 ; Error codes (printed as "?N"):
 ;   ?0  syntax / bad expression
@@ -85,13 +85,6 @@
 ;                     (C) Showcase Mandelbrot: column scan range narrowed from
 ;                         -128..16 to -120..4 for a better-centred render.
 ;                     (D) STR_BANNER updated to "uBASIC6502 v1.1".
-; v1.3  (Apr 2026)  T2DEC subroutine factored from DELINE and INSLINE.
-;                     Both copy loops ended with an identical 14-byte sequence
-;                     (16-bit decrement of T2 + ORA zero-test).  Extracted as
-;                     T2DEC: returns Z=1 when T2 reaches zero, Z=0 otherwise.
-;                     Each call site: JSR T2DEC(3) + BNE(2) = 5 bytes replacing
-;                     14.  Subroutine: 13 bytes + shared by 2 sites.
-;                     Net saving: 5 bytes (1967 -> 1962); free space 75 -> 80.
 ;   v1.2  (Apr 2026)  EXPR relational evaluator redesigned: bitmask algorithm.
 ;                     Replaces six per-operator handlers (EQ_OP, LT_OP, GT_OP,
 ;                     LE_OP, GE_OP, NE_OP) and the REL_SETUP subroutine with a
@@ -100,10 +93,17 @@
 ;                     then performs one 16-bit signed comparison using the NMOS
 ;                     6502 N XOR V trick (BVC / EOR #$80 / BMI) -- the direct
 ;                     equivalent of the 8088 JL/JG signed-branch instructions.
-;                     All six relational operators (= < > <= >= <>) are handled
-;                     correctly including signed negative operands.  No 65C02
-;                     opcodes used.  Saves 54 bytes: 2021 -> 1967, free space
-;                     before vectors grows from 21 to 75 bytes.
+;                     All six relational operators (= < > <= >= <>) handled
+;                     correctly including signed negative operands. 
+;   v1.3  (Apr 2026)  T2DEC subroutine factored from DELINE and INSLINE.
+;                     Both copy loops ended with an identical 14-byte sequence
+;                     (16-bit decrement of T2 + ORA zero-test).  Extracted as
+;                     T2DEC: returns Z=1 when T2 reaches zero, Z=0 otherwise.
+;                     Each call site: JSR T2DEC(3) + BNE(2) = 5 bytes replacing
+;                     14.  Subroutine: 13 bytes + shared by 2 sites.
+;                     Net saving: 5 bytes (1967 -> 1962); free space 75 -> 80.
+;   v1.4  (Jun 2026)  Added TAB(n) ro DO_PRINT, 35 bytes free before vectors
+;
 ; =============================================================================
 ;
 ; ---- assembler mode ---------------------------------------------------------
@@ -200,8 +200,7 @@ T_DS  = 164              ; $24 + $80  ('$' -- CHR$)
 
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
-; v1.3: STR_BANNER updated from "uBASIC6502 v1.2" to "uBASIC6502 v1.3"
-STR_BANNER: .DB "uBASIC6502 v1.3"  ; startup banner; falls into STR_CRLF for CR+LF
+STR_BANNER: .DB "uBASIC6502 v1.4"  ; startup banner; falls into STR_CRLF for CR+LF
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
 STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
@@ -209,7 +208,7 @@ STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
 ; ---- keyword strings --------------------------------------------------------
 ; Two uppercase ASCII bytes per keyword (no bit-7 terminator).
 ; MTCHKW compares a 16-bit prefix and then skips trailing letters in input.
-KW_TAB:
+KW_TABLE:
 KW_PRINT:   .DB 'P','R'
 KW_IF:      .DB 'I','F'
 KW_GOTO:    .DB 'G','O'
@@ -225,6 +224,7 @@ KW_CHRS:    .DB 'C','H'      ; opening '(' consumed separately by EAT_EXPR
 KW_POKE:    .DB 'P','O'
 KW_PEEK:    .DB 'P','E'
 KW_USR:     .DB 'U','S'
+KW_TAB:     .DB 'T','A'	     ; opening '(' consumed separately by EAT_EXPR
 
 ; =============================================================================
 ; INIT  --  cold start
@@ -745,7 +745,7 @@ DP_TOP:  JSR WPEEK
          CMP #0
          BEQ DP_NL
          CMP #'"'
-         BNE DP_EXPR
+         BNE DP_CHR
          JSR GETCI            ; consume opening '"'
 DP_STR:  JSR GETCI            ; read string body char by char
          CMP #'"'
@@ -754,14 +754,27 @@ DP_STR:  JSR GETCI            ; read string body char by char
          BEQ DP_NL            ; unterminated string -- print CR/LF and stop
          JSR PUTCH
          JMP DP_STR
-DP_EXPR: LDA #<KW_CHRS
+DP_CHR: LDA #<KW_CHRS
          JSR MTCHKW           ; matched "CHR$"?
-         BCS DP_NORM
+         BCS DP_TAB
          JSR EAT_EXPR         ; consume '(' and evaluate argument
          JSR WEAT             ; consume ')'
          LDA T0
          JSR PUTCH
          JMP DP_AFT
+DP_TAB:  LDA #<KW_TAB
+         JSR MTCHKW           ; matched "CHR$"?
+         BCS DP_NORM
+         JSR EAT_EXPR         ; consume '(' and evaluate argument
+         JSR WEAT             ; consume ')'
+	 LDX T0
+	 BEQ DP_AFT           ; If TAB(0), skip printing spaces entirely
+         LDA #' '
+DP_TLOOP:	 
+         JSR PUTCH 
+         DEX
+         BNE DP_TLOOP       
+         BEQ DP_AFT
 DP_NORM: JSR EXPR             ; numeric expression
          JSR PRT16
 DP_AFT:  JSR WPEEK
@@ -773,7 +786,7 @@ DP_AFT:  JSR WPEEK
          BEQ DP_RET           ; trailing ';': suppress CR/LF (DP_RET = IN_DN = RTS above)
          CMP #0
          BEQ DP_RET
-         BNE DP_TOP           ; always taken (non-CR/non-NUL path)
+         JMP DP_TOP
 
 ; (DO_PRINT falls through into PRNL/PUTSTR at DP_NL when no items remain)
 ; =============================================================================
