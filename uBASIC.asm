@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC v18.1  --  2 KB Tiny BASIC for the 65C02
+; uBASIC v18.2  --  2 KB Tiny BASIC for the 65C02
 ;    
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -64,6 +64,7 @@
 ;     LDA #>SHOWCASE_END  ->  LDA #>PROG
 ;
 ; ---- version history --------------------------------------------------------
+; v18.2 (Jun 2026)  Added TAB(n) support to PRINT, 35 bytes free to vectors.
 ; v18.1 (Apr 2026)  T2DEC subroutine factored from DELINE and INSLINE.
 ;   Both copy loops contained an identical 14-byte 16-bit decrement and
 ;   ORA zero-test sequence on T2.  Extracted as T2DEC (13 bytes + RTS):
@@ -167,6 +168,7 @@ STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string and keyword addresse
 ; Naming: T_<char>  where <char> is the ASCII letter or symbol.
 T_LF  = 138              ; $0A + $80  (LF  -- final byte of STR_CRLF)
 T_SP  = 160              ; $20 + $80  (' ' -- final byte of STR_IN)
+T_B   = 194		
 T_D   = 196              ; $44 + $80  ('D' -- END)
 T_E   = 197              ; $45 + $80  ('E' -- POKE, FREE)
 T_F   = 198              ; $46 + $80  ('F' -- IF)
@@ -182,7 +184,7 @@ T_DS  = 164              ; $24 + $80  ('$' -- CHR$)
 
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
-STR_BANNER: .DB "uBASIC v18.1"  ; startup banner; falls into STR_CRLF for CR+LF
+STR_BANNER: .DB "uBASIC v18.2"  ; startup banner; falls into STR_CRLF for CR+LF
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
 STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
@@ -190,7 +192,7 @@ STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
 ; ---- keyword strings --------------------------------------------------------
 ; Last character of each keyword has bit 7 set (T_x constant).
 ; MTCHKW masks bit 7 before comparing against uppercased input.
-KW_TAB:
+KW_TABLE:
 KW_PRINT:   .DB "PRIN", T_T
 KW_IF:      .DB "I", T_F
 KW_GOTO:    .DB "GOT", T_O
@@ -208,6 +210,7 @@ KW_FREE:    .DB "FRE", T_E    ; also used as display string "FREE" by DO_FREE
 KW_PEEK:    .DB "PEE", T_K
 KW_USR:     .DB "US", T_R
 KW_HELP:    .DB "HEL", T_P
+KW_TAB:	    .DB "TA", T_B
 KW_LIST_END:.DB 0             ; $00 end-of-table sentinel for DO_HELP (not a string terminator)
 
 ; =============================================================================
@@ -699,9 +702,7 @@ IN_CP:   LDA (IP),Y           ; copy body + CR from IBUF to store
          BEQ IN_DN
          INY
          BRA IN_CP
-; DP_RET and IN_DN are adjacent because DO_PRINT (semicolon suppress path) and
 ; INSLINE both want a plain RTS and this is the nearest one.
-DP_RET:
 IN_DN:   RTS
 
 ; =============================================================================
@@ -728,7 +729,7 @@ DO_FREE:
          JSR PUTCH            ; space before "FREE"
          LDA #<KW_FREE
          JSR PUTSTR           ; print "FREE" (reuses keyword string)
-         BRA PRNL             ; print CR+LF and return (tail call)
+         JMP PRNL             ; print CR+LF and return (tail call)
          
 ; =============================================================================
 ; DO_PRINT  --  PRINT [item [; item] ...]
@@ -749,7 +750,7 @@ DP_TOP:  JSR WPEEK
          CMP #0
          BEQ DP_NL
          CMP #'"'
-         BNE DP_EXPR
+         BNE DP_CHR
          JSR GETCI            ; consume opening '"'
 DP_STR:  JSR GETCI            ; read string body char by char
          CMP #'"'
@@ -758,13 +759,27 @@ DP_STR:  JSR GETCI            ; read string body char by char
          BEQ DP_NL            ; unterminated string -- print CR/LF and stop
          JSR PUTCH
          BRA DP_STR
-DP_EXPR: LDA #<KW_CHRS
+DP_CHR: LDA #<KW_CHRS
          JSR MTCHKW           ; matched "CHR$"?
-         BCS DP_NORM
+         BCS DP_TAB
          JSR EAT_EXPR         ; consume '(' and evaluate argument
          JSR WEAT             ; consume ')'
          LDA T0
          JSR PUTCH
+         BRA DP_AFT
+DP_TAB:  LDA #<KW_TAB
+         JSR MTCHKW           ; matched "CHR$"?
+         BCS DP_NORM
+         JSR EAT_EXPR         ; consume '(' and evaluate argument
+         JSR WEAT             ; consume ')'
+	 LDX T0
+	 BEQ DP_AFT           ; If TAB(0), skip printing spaces entirely
+	 ; TAX			; X has loop counter
+         LDA #' '
+DP_TLOOP:	 
+         JSR PUTCH 
+         DEX
+         BNE DP_TLOOP       
          BRA DP_AFT
 DP_NORM: JSR EXPR             ; numeric expression
          JSR PRT16
@@ -794,7 +809,7 @@ DP_AFT:  JSR WPEEK
 ;   entry.  LDA (T2),Y (Y=0 on return) reads that byte; $00 means end of table.
 ; =============================================================================
 DO_HELP:
-         LDA #<KW_TAB         ; T2 = start of keyword table
+         LDA #<KW_TABLE         ; T2 = start of keyword table
          STA T2
 DH_LP:   JSR PUTSTRZP         ; print keyword; T2 left at last (bit-7) byte
          INC T2               ; step past last char to first byte of next entry
@@ -844,6 +859,7 @@ PS_LAST: AND #$7F             ; strip bit 7 from last character
          JSR PUTCH            ; print last character
 ; LS_DONE and PS_DN are adjacent because DO_LIST (end-of-program path) and
 ; PUTSTR (end-of-string path) both want a plain RTS here.
+DP_RET:
 LS_DONE:
 PS_DN:   RTS
 
