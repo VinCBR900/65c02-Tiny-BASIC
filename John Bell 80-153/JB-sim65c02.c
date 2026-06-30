@@ -1,5 +1,5 @@
 /*
- * sim65c02.c  —  Toy 65C02 simulator  (v8, Jun 2026)
+ * J Bell Sumulator JB-sim65c02.c  —  Toy 6502 simulator  (v8, Jun 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
