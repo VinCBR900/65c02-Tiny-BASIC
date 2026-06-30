@@ -133,14 +133,6 @@ BS       = $08               ; ASCII backspace
 ; when reading keyword bytes by (T1),Y.
 ;
 ; TERMINATION: the last byte of every string has bit 7 set (value |= $80).
-;   PUTSTR strips bit 7 with AND #$7F before printing the final character.
-;   All string content is 7-bit ASCII so bit 7 never occurs naturally --
-;   the scheme is unambiguous.
-;
-; Named T_x constants are used for bit-7-set final characters because the
-; Kowalski assembler cannot evaluate "ch"|$80 inside a .DB argument.  Each
-; constant is simply the ASCII value plus 128 (addition equals OR here since
-; all base characters are below $80).
 ; =============================================================================
 STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string and keyword addresses
 
@@ -738,12 +730,13 @@ DP_TAB:  LDA #<KW_TAB
          BCS DP_NORM
          JSR EAT_EXPR         ; consume '(' and evaluate argument
          JSR WEAT             ; consume ')'
-	 LDX T0
+	 LDA T0
 	 BEQ DP_AFT           ; If TAB(0), skip printing spaces entirely
-         LDA #' '
+         STA GCHRX            ; counter in ZP: PUTCH clobbers X, can't loop on X
 DP_TLOOP:	 
+         LDA #' '              ; reload each iteration: PUTCH clobbers A too
          JSR PUTCH 
-         DEX
+         DEC GCHRX
          BNE DP_TLOOP       
          BEQ DP_AFT
 DP_NORM: JSR EXPR             ; numeric expression
@@ -1882,10 +1875,6 @@ MK_FAIL: LDA LP               ; restore IP to saved position
 ; Reset / IRQ / NMI vectors
 ;
 ;   $FFFA-$FFFB  NMI vector  -> ROMSTART (NMI pin unused; safe dead-end)
-;                               NOTE: MK_FAIL code (SEC/RTS) physically occupies
-;                               $FFF7/$FFF8 and completes before $FFFA. The NMI
-;                               vector bytes at $FFFA/$FFFB are never executed as
-;                               code since NMI is never asserted on this board.
 ;   $FFFC-$FFFD  Reset vector -> ROMSTART
 ;   $FFFE-$FFFF  IRQ vector   -> IRQ_HANDLER (Break pushbutton)
 ; =============================================================================
