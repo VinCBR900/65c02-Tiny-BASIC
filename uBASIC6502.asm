@@ -59,50 +59,34 @@
 ;   string table so both Kowalski and real hardware work identically.
 ;
 ; ---- ROM / no-showcase note -------------------------------------------------
-;   To start with an empty program store (no pre-loaded showcase), change
-;   the two lines in INIT that load SHOWCASE_END into PE to instead load PROG:
-;     LDA #<SHOWCASE_END  ->  LDA #<PROG
-;     LDA #>SHOWCASE_END  ->  LDA #>PROG
+;   To start with an empty program store (no pre-loaded showcase), Delete 
+;   the two lines in INIT that load SHOWCASE_END instead to JSR DO_NEW
 ;
 ; ---- version lineage --------------------------------------------------------
 ; 65C02 base:
 ;   v17.0 (Mar 2026)  comment cleanup/public release baseline.
 ;
 ; NMOS 6502 branch:
-;   v1.0  (Mar 2026)  6502-mnemonic port + 2-byte keyword-prefix matcher.
-;                     Full BASIC keywords remain accepted because MTCHKW
-;                     matches first two letters then consumes trailing
-;                     alphabetic characters in the token.
+;   v1.4  (Jun 2026)  Refactor for size, Added FREE & TAB(n), 75 bytes free for IO
+;   v1.3  (Apr 2026)  T2DEC subroutine factored from DELINE and INSLINE.
+;   v1.2  (Apr 2026)  EXPR relational evaluator redesigned: bitmask algorithm.
+;                     with a single unified loop that accumulates an operator bitmask
+;                     (LT=1, EQ=2, GT=4) in X, evaluates the right operand once,
+;                     then performs one 16-bit signed comparison using the NMOS
+;                     6502 N XOR V trick (BVC / EOR #$80 / BMI).
+;                     All six relational operators (= < > <= >= <>) handled
+;                     correctly including signed negative operands. 
 ;   v1.1  (Mar 2026)  Three fixes ported from mango_one repo:
 ;                     (A) BUG FIX: EXPR_ADD EA_DO operator-save corrected.
 ;                         v1.0 pushed T0-lo twice and lost the operator char,
 ;                         causing wrong results for multi-term subtraction.
 ;                         Fixed: TAX saves operator before A is clobbered.
-;                         Also saves 1 byte (9->8 bytes in EA_DO preamble).
 ;                     (B) DO_LIST: added LP>=PE safety guard inside LS_BODY
 ;                         loop; prevents infinite listing if a line is missing
 ;                         its CR terminator (corrupted program store).
 ;                     (C) Showcase Mandelbrot: column scan range narrowed from
 ;                         -128..16 to -120..4 for a better-centred render.
-;                     (D) STR_BANNER updated to "uBASIC6502 v1.1".
-;   v1.2  (Apr 2026)  EXPR relational evaluator redesigned: bitmask algorithm.
-;                     Replaces six per-operator handlers (EQ_OP, LT_OP, GT_OP,
-;                     LE_OP, GE_OP, NE_OP) and the REL_SETUP subroutine with a
-;                     single unified loop that accumulates an operator bitmask
-;                     (LT=1, EQ=2, GT=4) in X, evaluates the right operand once,
-;                     then performs one 16-bit signed comparison using the NMOS
-;                     6502 N XOR V trick (BVC / EOR #$80 / BMI) -- the direct
-;                     equivalent of the 8088 JL/JG signed-branch instructions.
-;                     All six relational operators (= < > <= >= <>) handled
-;                     correctly including signed negative operands. 
-;   v1.3  (Apr 2026)  T2DEC subroutine factored from DELINE and INSLINE.
-;                     Both copy loops ended with an identical 14-byte sequence
-;                     (16-bit decrement of T2 + ORA zero-test).  Extracted as
-;                     T2DEC: returns Z=1 when T2 reaches zero, Z=0 otherwise.
-;                     Each call site: JSR T2DEC(3) + BNE(2) = 5 bytes replacing
-;                     14.  Subroutine: 13 bytes + shared by 2 sites.
-;                     Net saving: 5 bytes (1967 -> 1962); free space 75 -> 80.
-;   v1.4  (Jun 2026)  Added TAB(n) ro DO_PRINT, 35 bytes free before vectors
+;   v1.0  (Mar 2026)  6502-mnemonic port + 2-byte keyword-prefix matcher.
 ;
 ; =============================================================================
 ;
@@ -200,7 +184,8 @@ T_DS  = 164              ; $24 + $80  ('$' -- CHR$)
 
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
-STR_BANNER: .DB "uBASIC6502 v1.4"  ; startup banner; falls into STR_CRLF for CR+LF
+STR_BANNER: .DB "uBASIC6502 v1.4 "  ; startup banner, rolls into free
+STR_FREE:   .DB "Free", T_SP
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
 STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
@@ -225,6 +210,7 @@ KW_POKE:    .DB 'P','O'
 KW_PEEK:    .DB 'P','E'
 KW_USR:     .DB 'U','S'
 KW_TAB:     .DB 'T','A'	     ; opening '(' consumed separately by EAT_EXPR
+KW_FREE:    .DB 'F','R'
 
 ; =============================================================================
 ; INIT  --  cold start
@@ -245,13 +231,16 @@ INIT:
          LDA #0
 INIT_Z:  STA 0,X              ; clear zero-page byte at X
          DEX
-         BPL INIT_Z
+         BNE INIT_Z
+         ; --- 
          LDA #<SHOWCASE_END   ; point PE at end of pre-loaded showcase program
-         STA PE               ; (change to PROG/PROG for no pre-loaded program)
+         STA PE               ; Replace with JSR DO_NEW for clean program (ROM)
          LDA #>SHOWCASE_END
          STA PE+1
          LDA #<STR_BANNER
-         JSR PUTSTR           ; print banner + CR+LF (STR_CRLF follows immediately)
+         ; ---
+         JSR PUTSTR           ; print banner + Free + CR+LF (STR_CRLF follows )
+         JSR DO_FREE
          ; fall through into MAIN
 
 ; =============================================================================
@@ -266,6 +255,8 @@ INIT_Z:  STA 0,X              ; clear zero-page byte at X
 ;   immediately via STMT_LINE.
 ; =============================================================================
 MAIN:
+         LDX #$FF
+         TXS                  ; set stack to top of page 1
          LDA #0
          STA RUN              ; clear run flag (immediate mode)
          JSR GETLINE_M        ; print "> "; read line; set IP = IBUF
@@ -283,38 +274,43 @@ MAIN_DIR:
          JMP MAIN
 
 ; =============================================================================
-; DO_ERROR  --  print error message and return to immediate mode
+; DO_FREE  --  FREE  :  print free program-store bytes
 ;
-;   In:  A = ERR_xx code (0-4)
-;   Out: never returns to caller; jumps to MAIN
-;   Clobbers: everything
+;   In:  PE = current program end pointer
+;   Out: "<N>\r\n" printed to terminal
+;   Clobbers: A T0
 ;
-;   Prints:  CR+LF  "?N"  [" IN <linenum>"]  CR+LF  then jumps to MAIN.
-;   The " IN <linenum>" annotation is only printed when RUN != 0.
-;   DO_break_in is a mid-function entry used by IRQ_HANDLER (BREAK interrupt).
+;   Computes RAM_TOP - PE (16-bit), prints the count via PRT16, emits a
+;   space followed by PRNL
 ; =============================================================================
-DO_ERROR:
-         PHA                  ; save error code
-         JSR PRNL             ; CR+LF before error message
-         LDA #'?'
-         JSR PUTCH
-         PLA
-         CLC
-         ADC #'0'
-         JSR PUTCH            ; print "?N"
-         LDA RUN
-         BEQ DO_ERR_NL        ; not running: omit " IN <line>" annotation
-DO_break_in:
-         LDA #<STR_IN
-         JSR PUTSTR           ; print " IN "
-         LDA CURLN
+DO_FREE:
+         SEC
+         LDA #<RAM_TOP
+         SBC PE
          STA T0
-         LDA CURLN+1
+         LDA #>RAM_TOP
+         SBC PE+1
          STA T0+1
-         JSR PRT16            ; print line number
-DO_ERR_NL:
-         JSR PRNL             ; CR+LF after error message
-         JMP MAIN
+         JSR PRT16            ; print free count
+         JMP PRNL             ; print CR+LF and return (tail call)
+
+; =============================================================================
+; Check for proper variable access
+PARSE_VAR:
+         JSR WPEEK_UC         ; Skips spaces, peeks char, converts to uppercase
+         CMP #'A'
+         BCC PV_FAIL
+         CMP #'Z'+1
+         BCS PV_FAIL
+         JSR GETCI            ; Consume the variable char
+         JSR UC               ; Uppercase it again (since GETCI fetched raw)
+         SEC
+         SBC #'A'
+         ASL                  ; Convert to VARS offset
+         CLC
+         RTS
+PV_FAIL: SEC
+         RTS
 
 ; =============================================================================
 ; IRQ_HANDLER  --  maskable interrupt handler ($FFFE vector)
@@ -349,16 +345,8 @@ IRQ_idle:
 ;   Clobbers: A X Y T0 T1 T2 IP
 ; =============================================================================
 DO_INPUT:
-         JSR WPEEK_UC         ; skip spaces; peek var name uppercased
-         CMP #'A'
-         BCC DO_IN_DN         ; not a letter -- nothing to do
-         CMP #'Z'+1
-         BCS DO_IN_DN
-         JSR GETCI            ; consume the variable letter
-         JSR UC               ; ensure uppercase
-         SEC
-         SBC #'A'
-         ASL                  ; -> VARS byte offset (0, 2, 4 ...)
+         JSR PARSE_VAR         ; skip spaces; peek var name uppercased
+	 BCS DO_IN_DN
          PHA                  ; [S: var_offset]
          LDA IP+1
          PHA                  ; [S: var_offset, IP_hi]
@@ -396,9 +384,6 @@ ST_NOP:  RTS
 ;   Supports backspace (BS) to delete the last character.
 ;   Overflow characters (beyond IBUF_MAX) are silently discarded.
 ;   After CR is received, outputs CR+LF via PRNL before returning.
-;
-;   Trick: GETLINE_M loads '>' then uses a .DB $2C (BIT abs opcode) as a
-;   2-byte skip to fall past the LDA #'?' in GETLINE_I.
 ; =============================================================================
 GETLINE_M:
          LDA #'>'
@@ -742,7 +727,7 @@ DO_PRINT:
 DP_TOP:  JSR WPEEK
          CMP #CR
          BEQ DP_NL
-         CMP #0
+         TAX			; Check for NUL - Transfer sets EQ flag for free
          BEQ DP_NL
          CMP #'"'
          BNE DP_CHR
@@ -784,11 +769,10 @@ DP_AFT:  JSR WPEEK
          JSR WPEEK
          CMP #CR
          BEQ DP_RET           ; trailing ';': suppress CR/LF (DP_RET = IN_DN = RTS above)
-         CMP #0
+         TAX			; check for NUL
          BEQ DP_RET
-         JMP DP_TOP
+         BNE DP_TOP		; always taken
 
-; (DO_PRINT falls through into PRNL/PUTSTR at DP_NL when no items remain)
 ; =============================================================================
 ; PRNL / PUTSTR / PUTSTRZP  --  print a bit-7-terminated string
 ;
@@ -830,6 +814,33 @@ PS_LAST: AND #$7F             ; strip bit 7 from last character
 LS_DONE:
 PS_DN:   RTS
 
+; =============================================================================
+; DO_POKE  --  POKE addr, value  :  write one byte to memory
+;
+;   Syntax: POKE <expr>, <expr>
+;   In:  IP -> address expression
+;   Out: byte written; IP advanced past statement
+;   Clobbers: A Y T0 T1 IP
+; =============================================================================
+DO_POKE:
+         JSR EXPR              ; evaluate address -> T0
+         LDA T0+1              ; push address hi byte  (T1 clobbered by MTCHKW
+         PHA                   ;   in the second EXPR call, so use hardware stack)
+         LDA T0                ; push address lo byte
+         PHA
+         JSR WEAT              ; skip spaces, consume ','
+         JSR EXPR              ; evaluate value -> T0
+         LDA T0                ; value byte
+         PLA
+         TAX                   ; pull address lo -> X
+         STX T1
+         PLA
+         TAX                   ; pull address hi -> X
+         STX T1+1
+         LDY #0
+         STA (T1),Y            ; write value to address
+         RTS
+         
 ; =============================================================================
 ; DO_LIST  --  LIST  :  print all program lines in source form
 ;
@@ -939,8 +950,7 @@ RUNGO:   JSR STMT_LINE         ; execute statement(s) on this line (honouring ':
 SK_LP:   JSR GETCI            ; advance IP past CR (SKIPEOL inlined)
          CMP #CR
          BNE SK_LP
-         ; JMP RUNLP
-	BEQ RUNLP		; always taken
+ 	 BEQ RUNLP		; always taken
 	
 ; =============================================================================
 ; DO_END  --  END  :  halt program execution and return to immediate mode
@@ -975,33 +985,6 @@ DO_NEW:
 DO_NWZ:  STA VARS,X
          DEX
          BPL DO_NWZ
-         RTS
-
-; =============================================================================
-; DO_POKE  --  POKE addr, value  :  write one byte to memory
-;
-;   Syntax: POKE <expr>, <expr>
-;   In:  IP -> address expression
-;   Out: byte written; IP advanced past statement
-;   Clobbers: A Y T0 T1 IP
-; =============================================================================
-DO_POKE:
-         JSR EXPR              ; evaluate address -> T0
-         LDA T0+1              ; push address hi byte  (T1 clobbered by MTCHKW
-         PHA                   ;   in the second EXPR call, so use hardware stack)
-         LDA T0                ; push address lo byte
-         PHA
-         JSR WEAT              ; skip spaces, consume ','
-         JSR EXPR              ; evaluate value -> T0
-         LDA T0                ; value byte
-         PLA
-         TAX                   ; pull address lo -> X
-         STX T1
-         PLA
-         TAX                   ; pull address hi -> X
-         STX T1+1
-         LDY #0
-         STA (T1),Y            ; write value to address
          RTS
 
 ; =============================================================================
@@ -1068,18 +1051,6 @@ EAT_EXPR:
          ; fall through into EXPR
 
 ; =============================================================================
-; EXPR  --  evaluate a full expression including relational operators
-;
-;   In:  IP -> expression text
-;   Out: T0 = signed 16-bit result; true=$FFFF, false=$0000
-;        IP advanced past expression
-;   Clobbers: A X Y T0 T1 T2 IP
-;
-;   Precedence (lowest to highest): relational < additive < multiplicative < unary/atom
-;   Relational operators: = < > <= >= <>
-;   Evaluates left operand via EXPR_ADD, then checks for one relational op.
-; =============================================================================
-; =============================================================================
 ; EXPR  --  evaluate expression including relational operators (bitmask design)
 ;
 ;   In:  IP -> expression text
@@ -1102,31 +1073,17 @@ EXPR:
 
          ; Scan relational operator chars, building bitmask in X
          LDX #0               ; mask = 0 (no relop seen yet)
-
-RL_LOOP: JSR WPEEK            ; A = next char at IP (no consume)
-         CMP #'<'
-         BNE RL_CK_EQ
-         TXA
-         ORA #1               ; set LT bit
+RL_LOOP: JSR WPEEK            ; A = next char
+         SEC
+         SBC #'<'             ; Map <, =, > to 0, 1, 2
+         CMP #3               ; Bounds check (if < 0 or >= 3, Carry will be set!)
+         BCS RL_DONE          ; Not a relational operator -> exit loop
+         TAY                  ; Y = 0, 1, or 2
+         TXA                  ; Pull accumulated mask so far
+         ORA REL_MASK,Y       ; Apply new bit
          TAX
-         JSR GETCI            ; consume '<'
-         BNE RL_LOOP          ; always taken (',' != 0)
-RL_CK_EQ:
-         CMP #'='
-         BNE RL_CK_GT
-         TXA
-         ORA #2               ; set EQ bit
-         TAX
-         JSR GETCI            ; consume '='
-         BNE RL_LOOP          ; always taken
-RL_CK_GT:
-         CMP #'>'
-         BNE RL_DONE
-         TXA
-         ORA #4               ; set GT bit
-         TAX
-         JSR GETCI            ; consume '>'
-         BNE RL_LOOP          ; always taken
+         JSR GETCI            ; Consume operator (always returns A=$3C, $3D, or $3E)
+         BNE RL_LOOP          ; BNE always branches (A is never zero)
 
 RL_DONE: CPX #0               ; any relational operator found?
          BEQ RL_NONE          ; no: return left operand as-is
@@ -1156,7 +1113,6 @@ RL_DONE: CPX #0               ; any relational operator found?
 
 RL_NOT_EQ:
          ; 16-bit signed subtract T1 - T0; use N XOR V to detect less-than
-         ; (NMOS 6502 safe: no 65C02 opcodes)
          LDA T1
          SEC
          SBC T0
@@ -1176,9 +1132,7 @@ RL_IS_LT:
 RL_TEST: AND OP               ; result bit AND operator mask
          BEQ REL_F            ; no overlap -> false
 REL_T:   LDA #$FF
-         STA T0
-         STA T0+1
-         RTS
+	 .DB $2C              ; Executes "BIT $00A9" (swallows LDA #0)
 REL_F:   LDA #0
          STA T0
          STA T0+1
@@ -1188,6 +1142,8 @@ RL_NONE: ; No relop found: discard the stacked copy of left (T0 already correct)
          PLA                  ; discard saved T0+1
          PLA                  ; discard saved T0
 EXPR_RT: RTS
+REL_MASK: .DB 1, 2, 4         ; Tuck this 3-byte table right before EXPR_ADD
+
 ; =============================================================================
 ; EXPR_ADD  --  additive level: + and -
 ;
@@ -1360,6 +1316,40 @@ E1_OVFL: LDA #ERR_OV          ; division or modulo by zero
          ; fall through into DO_ERROR
 
 ; =============================================================================
+; DO_ERROR  --  print error message and return to immediate mode
+;
+;   In:  A = ERR_xx code (0-4)
+;   Out: never returns to caller; jumps to MAIN
+;   Clobbers: everything
+;
+;   Prints:  CR+LF  "?N"  [" IN <linenum>"]  CR+LF  then jumps to MAIN.
+;   The " IN <linenum>" annotation is only printed when RUN != 0.
+;   DO_break_in is a mid-function entry used by IRQ_HANDLER (BREAK interrupt).
+; =============================================================================
+DO_ERROR:
+         PHA                  ; save error code
+         JSR PRNL             ; CR+LF before error message
+         LDA #'?'
+         JSR PUTCH
+         PLA
+         CLC
+         ADC #'0'
+         JSR PUTCH            ; print "?N"
+         LDA RUN
+         BEQ DO_ERR_NL        ; not running: omit " IN <line>" annotation
+DO_break_in:
+         LDA #<STR_IN
+         JSR PUTSTR           ; print " IN "
+         LDA CURLN
+         STA T0
+         LDA CURLN+1
+         STA T0+1
+         JSR PRT16            ; print line number
+DO_ERR_NL:
+         JSR PRNL             ; CR+LF after error message
+         JMP MAIN
+         
+; =============================================================================
 ; EXPR2  --  atom level: parentheses, unary +/-, CHR$, number literals, variables
 ;
 ;   In:  IP -> atom text
@@ -1421,21 +1411,10 @@ E2_NOT_USR:
          BCS E2_VAR
          JMP PNUM             ; tail call: parse decimal literal -> T0
 	
-E2_BAD:  LDA #0               ; unrecognised atom: return 0 (no error)
-         STA T0
-         STA T0+1
-         RTS
+E2_BAD:  JMP REL_F
 
-E2_VAR:  JSR UC               ; variable name (single letter A-Z)?
-         CMP #'A'
-         BCC E2_BAD
-         CMP #'Z'+1
-         BCS E2_BAD
-         JSR GETCI            ; consume the letter
-         JSR UC
-         SEC
-         SBC #'A'
-         ASL                  ; -> VARS byte offset (0, 2, 4 ...)
+E2_VAR:  JSR PARSE_VAR               ; variable name (single letter A-Z)?
+	 BCS E2_BAD
          TAX
          LDA VARS,X
          STA T0
@@ -1479,6 +1458,7 @@ DO_IF_F:
 STLN_RTS:
 GETCI_SK: RTS
 
+         
 ; =============================================================================
 ; DO_IF  --  IF <expr> THEN <stmt>  (THEN keyword is optional)
 ;
@@ -1560,16 +1540,8 @@ ST_LET:  ; fall through into DO_LET
 ;   DL_DN: nearest following RTS -- shared with NEG16/NEG_T1 below.
 ; =============================================================================
 DO_LET:
-         JSR WPEEK_UC         ; skip spaces, peek var name, uppercase
-         CMP #'A'
-         BCC DL_DN            ; not a letter: bail
-         CMP #'Z'+1
+         JSR PARSE_VAR
          BCS DL_DN
-         JSR GETCI            ; consume variable letter
-         JSR UC
-         SEC
-         SBC #'A'
-         ASL                  ; -> VARS byte offset
          PHA
          JSR WPEEK
          CMP #'='
@@ -1607,6 +1579,7 @@ NEG_T1:  LDX #2
          .DB $2C              ; BIT abs: skips next 2 bytes (the LDX #0)
 NEG16:   LDX #0
          LDA #0
+NEGX:
          SEC
          SBC T0,X
          STA T0,X
@@ -1784,6 +1757,7 @@ ST_TAB:
          .DB <KW_END,   <DO_END,   >DO_END
          .DB <KW_LET,   <DO_LET,   >DO_LET
          .DB <KW_POKE,  <DO_POKE,  >DO_POKE
+         .DB <KW_FREE,  <DO_FREE,  >DO_FREE
          .DB $FF                             ; sentinel: fall through to implicit assign
 
 ; =============================================================================
@@ -1807,20 +1781,18 @@ MTCHKW:
          STA LP               ; save IP in LP for restore on failure
          LDA IP+1
          STA LP+1
-         JSR WSKIP_NS         ; skip leading spaces
          ; compare first keyword character
-         JSR UCIP
+         JSR WPEEK_UC
          LDY #0
          CMP (T1),Y
          BNE MK_FAIL
          JSR GETCI
          ; compare second keyword character
-         LDY #1
-         LDA (T1),Y
-         STA T2
          JSR UCIP
-         CMP T2
+         LDY #1
+         CMP (T1),Y
          BNE MK_FAIL
+
          JSR GETCI
          ; matched prefix: skip remaining letters for full BASIC keywords
 MK_SKIP: JSR UCIP
