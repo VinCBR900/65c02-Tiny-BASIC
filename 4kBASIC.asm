@@ -1,5 +1,5 @@
 ; =============================================================================
-; 4K Integer BASIC v14.2 for the 65C02
+; 4K Integer BASIC v15.0 for the 65C02
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -11,13 +11,12 @@
 ; =============================================================================
 ; Statements:
 ;   PRINT [item [; item ...]]
-;            item = "string" | AT(col,row) | CHR$(n) | expression
+;            item = "string" | TAB(n) | CHR$(n) | expression
 ;            ';' between items suppresses newline; trailing ';' suppresses final CR
 ;   IF expr THEN stmt [ELSE stmt2]   single-line; ELSE is optional
 ;   FOR var = start TO end [STEP n]  ...  NEXT var
 ;   GOTO lineno        branch unconditionally
 ;   GOSUB lineno       call subroutine; RETURN to resume
-;   ON expr GOTO line1 [, line2, ...]   computed branch (falls through if out of range)
 ;   INPUT [prompt;] var [, var ...]    read from keyboard
 ;   LET var = expr     explicit assignment (LET keyword optional)
 ;   POKE addr, val     write byte to memory
@@ -31,12 +30,8 @@
 ;   END                stop execution
 ;   RETURN             return from GOSUB
 ;   FREE               print bytes of program RAM remaining
-;   CLS                clear screen, cursor to (0,0)
-;   HELP               show brief command list
 ;   GOTO expr          branch to line (expr may be variable or expression)
 ;   GOSUB expr         call subroutine at line (expr may be variable or expression)
-;   ON expr GOTO line1 [, line2, ...]   computed branch
-;   ON expr GOSUB line1 [, line2, ...]  computed subroutine call
 ;   Multi-statement:   ':' separates statements on one line.
 ;   Don't have FOR/NEXT or GOSUB/RETURN on same line
 ; Expressions  (left-to-right within tier):
@@ -46,9 +41,10 @@
 ;   Tier 4:          *  /  %  MOD       (% and MOD are identical: integer remainder)
 ;   Tier 5 (atoms):  literal  variable  (expr)  -expr  +expr  NOT expr
 ;                    ABS(n)              absolute value
-;                    SGN(n)              sign: -1, 0, or 1
+;                    SIN(deg)            sine   * 1000  (0-360 degrees, CORDIC)
+;                    COS(deg)            cosine * 1000  (0-360 degrees, CORDIC)
+;                    TAB(n)              print n spaces (PRINT only; expr argument)
 ;                    CHR$(n)             character with ASCII code n  (PRINT only)
-;                    HEX$(n)             4-digit uppercase hex of n   (PRINT only)
 ;                    ASC("c")            ASCII code of first char of string
 ;                    PEEK(addr)          read byte from memory address
 ;                    USR(addr)           call machine-code subroutine, A=lo T0
@@ -72,20 +68,145 @@
 ;   $E000  write = TERMINAL_CLS     clear screen, cursor to (0,0)
 ;   $E001  write = character output (PUTCH)
 ;   $E004  read  = character input  (GETCH, non-blocking poll; 0 = no char)
-;   $E005  write = TERMINAL_X_POS  cursor column  (0-based)
-;   $E006  write = TERMINAL_Y_POS  cursor row     (0-based)
 ;
 ; Memory map:
-;   $0000-$00BD  zero page  (see layout below)
+;   $0000-$C8    zero page  (see layout below; $C0-$C9 added in v15.0 for CORDIC)
 ;   $0200-$0FFF  program storage  (RAM_TOP = $1000, ~3.5 KB)
 ;   $F000        JMP INIT  (reset-vector workaround)
-;   $F003-$F02E  STMT_JT   statement jump table  (44 bytes, 22 entries)
-;   $F021-$F0F5  KW_TABLE  keyword strings        (213 bytes, 38 keywords)
-;   $F0F7-$F106  ERR_TABLE 9 x 2-char error codes
-;   $F107+       interpreter code  (INIT, MAIN, GETLINE, STMT, EXPR ...)
-;   $FF11+       string literals   (all on same ROM page -- PUTSTR constraint)
-;   $FFFA-$FFFF  vectors  (all point to INIT)
+;   $F003+       STMT_JT   statement jump table  (44 bytes, 22 entries -- 3 are
+;                no-op slots pointing at DO_DATA/RTS: CLS/HELP/ON removed v15.0)
+;   $F021+       KW_TABLE  keyword strings (shrunk v15.0: CLS/HELP/ON/HEX$/SGN
+;                removed, TAB/SIN/COS added; net smaller than v14.2's 213 bytes)
+;   $F021+       ATAN_TBL  CORDIC atan lookup, 12 x 16-bit entries (24 bytes, new v15.0)
+;   ...          ERR_TABLE 9 x 2-char error codes
+;   ...          interpreter code  (INIT, MAIN, GETLINE, STMT, EXPR, CORDIC_KERN ...)
+;   $FFxx+       string literals   (all on same ROM page -- PUTSTR constraint)
+;   $FFFC-$FFFF  vectors  (RESET -> ROMSTART, IRQ -> IRQ_HANDLER)
 ;
+; v15.0 changes vs v14.2 (CORDIC trig, statement cuts, ROM size rescue):
+;   - BUG FOUND AND FIXED (introduced earlier in v15.0 development, caught by
+;     this version's functional smoke test, NOT present in any released
+;     version): the SI/CO KW_TABLE entries were accidentally dropped during
+;     the HEX$ removal step (the renumber-SIN/COS-down-by-one edit silently
+;     matched and replaced the wrong anchor text, leaving TOK_SIN/TOK_COS
+;     defined but unreachable from source text -- SIN(x) and COS(x) silently
+;     parsed as undefined variables, returning 0). Restored.
+;   - BUG FOUND AND FIXED (same root cause, also introduced and caught this
+;     version): the quadrant-negation step in E2_sin/E2_cos tried to reuse
+;     NEG16 with a custom X offset (LDX #CX-T0 / JSR NEG16) to negate CX/CY
+;     in place. This does not work -- NEG16 hardcodes LDX #0 as its first
+;     instruction (it and NEG_T1 are a matched pair of FIXED entry points
+;     into one shared body via the .BYTE $2C skip trick, at hardcoded offsets
+;     0 and 2 respectively; NEG16 was never designed to take a caller-supplied
+;     offset). The caller's X was silently discarded each time, so CX/CY were
+;     never actually negated -- SIN/COS returned the wrong sign in quadrants
+;     2-4 (e.g. SIN(270) returned +999 instead of -999). Confirmed by isolated
+;     simulator test before and after the fix. Reverted to plain inline
+;     negation for CX and CY (with T1 flags reloaded fresh before the second
+;     LSR test, since the negate code path also clobbers A).
+;   - BUG FOUND AND FIXED (pre-existing in the TAB(n) handler since it was
+;     first written this version, not from AT's original code): TAB(n) used
+;     EAT_EXPR believing it consumed both '(' and ')', but EAT_EXPR only
+;     consumes '(' (it tail-calls EXPR directly, leaving ')' unconsumed --
+;     confirmed by checking CHR$'s handler, which correctly follows EAT_EXPR
+;     with a separate WEAT call). Without the matching WEAT, the next PRINT
+;     item parse saw a stray ')' token, which EXPR silently evaluated as 0
+;     (E2_bad fallback), producing a spurious "0" after every TAB. Fixed by
+;     adding the missing WEAT call.
+;   - BUG FOUND AND FIXED (same area): TAB(n)'s loop-back jumped to DP_top
+;     (restart the whole PRINT item-parser) instead of DP_aft (the semicolon-
+;     separator check used by every other item type: strings, CHR$, plain
+;     expressions). This meant a ';' immediately after TAB(n) was never
+;     recognised as a separator -- it fell through to DP_norm's generic
+;     EXPR/PRT16 path, which evaluated the stray ';' as 0 via the same
+;     E2_bad fallback, then printed it before the next real item. Fixed by
+;     routing TAB's loop-back through DP_aft like every other item.
+;   - All four bugs above were caught by a functional smoke test (SIN/COS in
+;     all four quadrants, TAB alone and chained with ';' and other items, in
+;     both immediate mode and a stored FOR/NEXT program) run specifically
+;     because earlier versions of this changelog entry had been written
+;     before such a test was performed -- a reminder that "assembles cleanly"
+;     and "byte count fits" are necessary but not sufficient.
+;   - NEW: SIN(deg) and COS(deg) -- 16-bit fixed-point CORDIC, 12 iterations,
+;     shared rotation kernel (CORDIC_KERN). Result is integer*1000 in range
+;     -1000..+1000, max error ~2 units vs true value. Full 0-360 degree range
+;     via quadrant folding to 0-90 (4-way fold + sign flags), all comparisons
+;     using 8-bit-safe arithmetic (no CMP #imm > 255, which is illegal on 6502
+;     and was caught during development). New ZP scratch CX/CY/CZ/CX_SAV/CIDX
+;     at $C0-$C8 (9 bytes), plus ATEMP $C9 (quadrant/sign temp, reused by
+;     CORDIC_SCALE). New ATAN_TBL (24 bytes) added to ROM after KW_TABLE.
+;   - NEW: TAB(n) replaces AT(col,row). PRINT-only; prints n spaces via a
+;     simple loop (LDX T0 / DEX / BNE), so no terminal-specific cursor-position
+;     I/O is required -- removes the IO_XPOS/IO_YPOS Kowalski dependency
+;     entirely. High byte of n is ignored (column counts > 255 wrap mod 256).
+;   - REMOVED: CLS, HELP, AT(col,row), ON expr GOTO/GOSUB, HEX$(n), SGN(n).
+;     All freed for CORDIC's ROM footprint. Token slots for CLS/HELP/ON in
+;     STMT_JT now point at DO_DATA (RTS stub); KW_TABLE entries replaced with
+;     1-byte $80 placeholders to keep TKTOK token numbering aligned for the
+;     statement-token block. SIN/COS reuse the vacated HEX$/SGN token values.
+;     Pre-loaded showcase program lines that demonstrated SGN (line 60) and
+;     ON...GOSUB (line 390) replaced with REM stubs in place (same line
+;     numbers, so no other GOTO/GOSUB targets needed renumbering).
+;   - BUG FOUND (pre-existing, not introduced this version): the cold-start
+;     zero-page clear loop in INIT (LDX #$FF / STZ 0,x / DEX / BPL loop)
+;     clears only ONE byte ($FF) before exiting -- DEX from $FF to $FE sets
+;     N=1 immediately, so BPL (branch on N=0) never loops. Confirmed by
+;     simulation. Not fixed in v15.0 (out of scope for this pass): every ZP
+;     variable that matters is explicitly initialised at its point of use
+;     (PE/IP/RUN/FSTK in INIT and MAIN, VARS via DO_NEW-style clear, DATA_PTR
+;     via explicit STZ), so the interpreter is unaffected in practice. The
+;     correct fix (BPL -> BNE, accepting $00 stays unswept since IP overwrites
+;     it immediately) is free and zero-risk whenever someone wants to take it.
+;   - SIZE OPTIMISATION: PARSE_VAR subroutine factored from DO_LET, DO_INPUT,
+;     and EXPR2_tvar -- all three had a near-identical 10-14 instruction
+;     sequence (WPEEK_UC / range-check A-Z / GETCI / UC / SBC #'A' / ASL to
+;     compute a VARS offset). Consolidated into one shared routine (C=0 match
+;     with offset in A, C=1 no match). Saves ~28 bytes net across the 3 sites.
+;   - SIZE OPTIMISATION: five CMP #0 -> TAX substitutions (TOKENIZE, EDITLINE,
+;     STMT, DO_PRINT, DO_IF) where X was confirmed dead at that point -- TAX
+;     sets the Z flag identically to CMP #0 in 1 byte instead of 2.
+;   - SIZE OPTIMISATION: relational operator scanner (RL_LOOP in EXPR)
+;     rewritten. ASCII '<','=','>' are contiguous ($3C-$3E); subtract $3C to
+;     map to 0,1,2 and look up the result bit via a 3-byte REL_MASK table,
+;     replacing three near-identical CMP/BNE/TXA/ORA/TAX/JSR/BRA clauses with
+;     one loop. Bounds check (CMP #3 after the SBC) correctly rejects all
+;     out-of-range characters including the wraparound case for chars below
+;     '<', verified by hand-tracing the carry flag for several edge cases.
+;     Note: this assembler does not support ORA abs,Y or ORA abs,X (confirmed
+;     by isolated test -- LDA abs,Y assembles, ORA abs,Y does not), so the
+;     mask combine uses STX T2 / LDA REL_MASK,y / ORA T2 instead of the more
+;     direct TXA/ORA REL_MASK,y/TAX.
+;   - SIZE OPTIMISATION: REL_T/REL_F merged via the classic 6502 BIT-abs
+;     skip trick (.DB $2C swallows the following LDA #0 as a throwaway
+;     operand address, leaving A=$FF from REL_T intact when falling through
+;     to REL_F's STA T0/STA T0+1/RTS). Verified correct at runtime in
+;     isolation (REL_T -> T0=$FFFF, REL_F -> T0=$0000) before merging into
+;     the main source, not just trusted on the assembler's silence.
+;   - CONSIDERED AND REJECTED: an "OOM check dead code removal" suggestion
+;     (deleting STA T2/STA T2+1 in INSLINE's PE+total overflow check) does
+;     NOT apply here -- those values are read back two lines later for the
+;     RAM_TOP comparison (CMP #<RAM_TOP / SBC #>RAM_TOP operate on T2/T2+1),
+;     so removing the stores would corrupt the out-of-memory check. Likely
+;     valid for a differently-structured routine elsewhere, not this one.
+;   - TOOLING NOTE: the assembler's own "ROM footprint" report becomes
+;     unreliable once total code exceeds 64K during development -- it
+;     silently wraps addresses modulo 65536 rather than erroring, and
+;     different parts of the assembler (footprint message vs "Key symbols"
+;     list vs the resulting .DW vector bytes) can disagree with each other.
+;     Diagnosed by noticing the IRQ vector pointed at $0074 instead of
+;     IRQ_HANDLER. Worked around for the rest of development with a
+;     deliberately out-of-range BRA placed right after LAST_ROM_CODE, which
+;     forces the assembler to print the true unwrapped address in its
+;     "Branch out of range" error message.
+;   Net result: v14.2's 3858 bytes (232 free) -> v15.0 ROM is essentially
+;   FULL: 0 bytes free before vectors, after adding SIN/COS/CORDIC (~470
+;   bytes) and TAB, removing CLS/HELP/AT/ON/HEX$/SGN, the size optimisations
+;   above, and the WEAT-call fix for TAB (which cost the final few bytes of
+;   margin). There is no headroom left in this ROM; any future change needs
+;   to free space elsewhere first. check_size.sh (companion script, not
+;   part of this file) verifies true size reliably -- see the tooling note
+;   above for why the assembler's own footprint report cannot be trusted
+;   blindly once a build has ever overflowed 64K during development.
 ; v14.2 changes vs v14.1 (size optimisation):
 ;   - T2DEC subroutine factored from DELINE and INSLINE.
 ;     Both copy loops contained an identical 14-byte sequence:
@@ -225,8 +346,6 @@ PROG     = $0200             ; program storage base address
 IO_CLS   = $E000             ; write any value to clear screen + home cursor
 IO_PUTCH = $E001             ; write a character  (write only)
 IO_GETCH = $E004             ; read a character   (read, 0 = no char)
-IO_XPOS  = $E005             ; write column number  (0-based, write only)
-IO_YPOS  = $E006             ; write row number     (0-based, write only)
 IO_IRQ   = $E007             ; write any value to fire a maskable IRQ (Break key)
 ; ---- zero-page addresses -----------------------------------------------------
 IP       = $00               ; 16-bit: interpreter pointer
@@ -250,6 +369,13 @@ RUNSP    = $BA               ;  8-bit: saved SP for stack unwind
 OP       = $BB               ;  8-bit: MUL/DIV operator ('*' or '/')
 DATA_PTR = $BC               ; 16-bit: pointer to next DATA value to READ ($BC-$BD)
 RND_SEED = $BE               ; 16-bit: LFSR seed for RND  ($BE-$BF); init to $ACE1
+; CORDIC scratch (zeroed by INIT_z with rest of ZP):
+CX       = $C0               ; 16-bit: CORDIC X accumulator
+CY       = $C2               ; 16-bit: CORDIC Y accumulator
+CZ       = $C4               ; 16-bit: CORDIC Z angle accumulator
+CX_SAV   = $C6               ; 16-bit: saved CX per iteration
+CIDX     = $C8               ;  8-bit: CORDIC iteration counter
+ATEMP    = $C9               ;  8-bit: angle quadrant temp
 ; ---- token codes  ($80-$A8 range; $FF = inline number) ----------------------
 ; Statements: contiguous block $80..$95 (22 entries) -- all dispatched via STMT_JT.
 ; Expr atoms: $96..$A8.  LET ($A1) is also checked by STMT as a fallback.
@@ -270,7 +396,7 @@ TOK_FREE    = $8D            ; FREE  (print free bytes)
 TOK_POKE    = $8E            ; POKE addr, val
 TOK_CLS     = $8F            ; CLS  (was $9C)
 TOK_HELP    = $90            ; HELP  (was $9D)
-TOK_ON      = $91            ; ON expr GOTO/GOSUB ...  (was $9F)
+; TOK_ON ($91) removed v15.0 -- slot is now a KW_TABLE placeholder
 TOK_DATA    = $92            ; DATA val, val, ...  (was $A1)
 TOK_READ    = $93            ; READ var  (was $A2)
 TOK_RESTORE = $94            ; RESTORE  (was $A3)
@@ -289,12 +415,14 @@ TOK_NOT     = $9F            ; NOT expr  (was $98)
 TOK_XOR     = $A0            ; XOR  (was $99)
 TOK_LET     = $A1            ; LET  (was $9A)
 TOK_THEN    = $A2            ; THEN  (was $9B)
-TOK_AT      = $A3            ; AT(col,row)  (was $9E)
+TOK_TAB     = $A3            ; TAB(n)  (replaces AT; same token slot)
 TOK_INKEY   = $A4            ; INKEY  (was $A0)
-TOK_SGN     = $A5            ; SGN(n)   -- unchanged
+TOK_SIN     = $A8            ; SIN(deg) -> deg*1000 (0-360)  (was $A9)
+TOK_COS     = $A9            ; COS(deg) -> deg*1000 (0-360)  (was $AA)
+; TOK_SGN ($A5) removed v15.0
 TOK_MOD     = $A6            ; MOD      -- unchanged
 TOK_RND     = $A7            ; RND      -- unchanged
-TOK_HEXS    = $A8            ; HEX$(n)  -- unchanged
+; TOK_HEXS ($A8) removed v15.0 -- slot reused by TOK_SIN
 TOK_NUM     = $FF            ; inline 16-bit number follows
 ; ---- error codes  (byte index into ERR_TABLE; each entry is 2 chars) --------
 ERR_SN   = 0                 ; syntax error
@@ -312,7 +440,7 @@ ROMSTART:
 ; STRING TABLE (all strings on same page)
 ; =============================================================================
 STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string/kw addresses
-STR_BANNER: .DB "4K BASIC v14.2"      ; drop through
+STR_BANNER: .DB "4K BASIC v15"        ; drop through (trimmed ".0" -- saves 2 bytes)
 STR_CRLF:   .DB $0D,$8A             ; CR, LF|$80 = $8A
 STR_BYTES:  .DB " BYTES FREE",$0D,$8A  ; last LF has high-bit
 STR_ERROR:  .DB " ER",$D2           ; 'R'|$80 = $D2
@@ -424,7 +552,7 @@ TOKENIZE:
 TK_TOP: LDA (T0)             ; 65C02 zp-indirect
         CMP #$0D
         BEQ TK_EOL
-        CMP #0
+        TAX                  ; CMP #0 replacement: TAX sets Z for free (X dead here)
         BEQ TK_EOL
         CMP #' '             ; skip spaces
         BNE TK_NS
@@ -711,7 +839,7 @@ EL_found:
 EL_ins: JSR WPEEK            ; check for empty body (just CR/sentinel)
         CMP #$0D
         BEQ EL_done
-        CMP #0
+        TAX                  ; CMP #0 replacement: TAX sets Z for free (X dead here)
         BEQ EL_done
         JSR INSLINE          ; insert the new line
 EL_done:
@@ -931,7 +1059,7 @@ STMT:
         JSR WPEEK
         CMP #$0D             ; empty / end-of-line
         BEQ ST_nop
-        CMP #0
+        TAX                  ; CMP #0 replacement: TAX sets Z for free (X dead here)
         BEQ ST_nop
         BMI ST_tok           ; $80+ = keyword token (checked FIRST, before colon)
         CMP #':'             ; colon separator: skip and loop
@@ -995,33 +1123,29 @@ DP_str: JSR GETCI
 DP_nl_near: JMP PRNL         ; trampoline: forward jump to PRNL (out of BEQ range)
 DP_expr:
         JSR WPEEK
-        CMP #TOK_AT          ; AT(col,row): position cursor, then loop back to print what follows
+        CMP #TOK_TAB         ; TAB(n): print n spaces to advance cursor column
         BNE DP_chk_chrs
-        JSR GETCI            ; consume AT token
-        JSR EAT_EXPR         ; col -> T0  (EAT_EXPR consumes the '(' first)
-        LDA T0
-        STA IO_XPOS          ; set cursor column ($E005)
-        JSR EAT_EXPR         ; consume ',' then row -> T0
-        LDA T0
-        STA IO_YPOS          ; set cursor row ($E006)
+        JSR GETCI            ; consume TAB token
+        JSR EAT_EXPR         ; n -> T0  (EAT_EXPR consumes '(' only, NOT ')')
         JSR WEAT             ; consume ')'
-        JMP DP_top           ; loop back (too far for BRA)
+        ; Print T0 spaces; T0 hi byte ignored (col counts > 255 wrap, harmless)
+        LDX T0                ; loop count; sets Z for free (no CMP needed)
+        BEQ DP_tab_skip      ; zero: nothing to print
+DP_tab_lp:
+        LDA #' '
+        JSR PUTCH
+        DEX
+        BNE DP_tab_lp
+DP_tab_skip:
+        JMP DP_aft           ; check for ';' separator like every other item
 DP_chk_chrs:
         CMP #TOK_CHRS        ; CHR$(n): emit char directly without conversion
-        BNE DP_chk_hexs
+        BNE DP_norm
         JSR GETCI            ; consume TOK_CHRS
         JSR EAT_EXPR
         JSR WEAT             ; consume ')'
         LDA T0
         JSR PUTCH
-        BRA DP_aft
-DP_chk_hexs:
-        CMP #TOK_HEXS        ; HEX$(n): print 4-digit uppercase hex
-        BNE DP_norm
-        JSR GETCI            ; consume TOK_HEXS
-        JSR EAT_EXPR         ; evaluate n -> T0  (EAT_EXPR consumes '(' first)
-        JSR WEAT             ; consume ')'
-        JSR PRT_HEX          ; print 4-digit uppercase hex
         BRA DP_aft
 DP_norm:
         JSR EXPR
@@ -1034,7 +1158,7 @@ DP_semi:        JSR GETCI
         JSR WPEEK
         CMP #$0D             ; trailing semicolon at EOL: suppress newline
         BEQ DP_semi_dn
-        CMP #0
+        TAX                  ; CMP #0 replacement: TAX sets Z for free (X dead here)
         BEQ DP_semi_dn
         CMP #TOK_ELSE        ; semicolon before ELSE: stop printing (IF handles ELSE)
         BEQ DP_semi_dn
@@ -1071,7 +1195,7 @@ DO_IF_f:
         JSR WPEEK
         CMP #$0D             ; EOL with no ELSE: done
         BEQ DO_IF_done
-        CMP #0
+        TAX                  ; CMP #0 replacement: TAX sets Z for free (X dead here)
         BEQ DO_IF_done
         CMP #TOK_ELSE
         BNE DO_IF_f_skip
@@ -1155,16 +1279,8 @@ DO_return_ok:
 ;   Clobbers: A X Y T0 T1 T2
 ; =============================================================================
 DO_INPUT:
-        JSR WPEEK_UC
-        CMP #'A'
-        BCC DO_input_dn
-        CMP #'Z'+1
+        JSR PARSE_VAR
         BCS DO_input_dn
-        JSR GETCI
-        JSR UC
-        SEC
-        SBC #'A'
-        ASL                  ; x2: byte offset into VARS
         PHA                  ; save slot
         LDA #'?'
         JSR PUTCH
@@ -1371,36 +1487,6 @@ DO_FREE:
         JSR PRT16
         LDA #<STR_BYTES
         JMP PUTSTR           ; print " BYTES FREE\r\n" and return  (tail call)
-; =============================================================================
-; DO_HELP ? HELP: list available keywords one per line
-; Assumptions:
-; 1. KW_TABLE is a list of null-terminated strings, ending with a double-null or a length byte of 0.
-; 2. KW_NEXT simply adds the length of the current string to T2.
-;   Clobbers: A X Y T2
-; =============================================================================
-DO_HELP:
-        LDA #<KW_TABLE
-        STA T2
-        LDA #>KW_TABLE
-        STA T2+1
-HLP_kw: LDA (T2)             ; peek first byte: $00 = end of table
-        BEQ HLP_done
-        LDY #0
-HLP_pl: LDA (T2),y           ; read char (may have bit 7 set = last)
-        BPL HLP_norm         ; bit 7 clear: normal char, print and continue
-        AND #$7F             ; strip high-bit before printing last char
-        JSR PUTCH
-        LDA #' '             ; space separator after keyword
-        JSR PUTCH
-        JSR KW_NEXT          ; advance T2 to next entry
-        BRA HLP_kw
-HLP_norm:
-        JSR PUTCH
-        INY
-        BRA HLP_pl
-HLP_done:
-        ; drop through
-
 ; =============================================================================
 ; PUTSTR  -  print a NUL-terminated string from the string table
 ;   In:  A = lo-byte of string address; hi-byte is always STR_PAGE
@@ -1688,104 +1774,11 @@ DO_POKE:
         LDY #0
         STA (T1),y           ; POKE the value  (STA (zp),y with Y=0)
         RTS
-; =============================================================================
-; DO_CLS ? CLS: clear terminal screen and home the cursor
-;   Clobbers: A
-; =============================================================================
-DO_CLS:
-        STA IO_CLS           ; write any value to $E000 ? clear screen
-DO_on_skip:                  ; fall through to DO_DATA ? RTS
+; DO_CLS removed (v15.0). DO_on_skip retained for DO_ON out-of-range path.
+DO_on_skip:
         RTS
 ; =============================================================================
-; DO_ON ? ON expr GOTO line1 [, line2, ...]
-;   Evaluates expr. If result is 1, GOTOs line1; if 2, line2; etc.
-;   Out-of-range or 0: falls through to next statement silently.
-;   Clobbers: A X T0 T1
-; =============================================================================
-DO_ON:
-        JSR EXPR             ; selector value -> T0
-        LDA T0+1
-        BEQ DO_on_hi_ok      ; hi byte zero: value fits in lo byte
-DO_on_skip_tr:
-        RTS                  ; hi byte set (>255 or negative): skip
-DO_on_hi_ok:
-        LDA T0               ; lo byte = countdown (1-based); 0 = skip
-        BEQ DO_on_skip_tr    ; 0: out of range, skip  (trampoline to JMP below)
-DO_on_cnt_ok:
-        STA T1
-        JSR WPEEK            ; expect GOTO or GOSUB token
-        CMP #TOK_GOTO
-        BEQ DO_on_got_verb
-        CMP #TOK_GOSUB
-        BEQ DO_on_got_verb
-        JMP DO_on_skip
-DO_on_got_verb:
-        STA OP               ; save verb (TOK_GOTO or TOK_GOSUB)
-        JSR GETCI            ; consume verb
-DO_on_lp:
-        LDA T1               ; EXPR clobbers T1 ? save countdown
-        PHA
-        JSR EXPR             ; parse line number -> T0
-        PLA
-        STA T1
-        DEC T1
-        BEQ DO_on_go         ; this is our target
-        JSR WPEEK
-        CMP #','
-        BEQ DO_on_more       ; comma: more entries to scan
-        RTS                  ; no comma: index out of range, fall through
-DO_on_more:
-        JSR GETCI            ; consume ','
-        BRA DO_on_lp         ; loop (JMP; BRA out of range)
-DO_on_go:
-        ; T0 = target line.  For GOSUB: skip remaining entries (to get IP past
-        ; the whole ON stmt) and save IP before GOTOL moves it.
-        ; T0 and IP must both survive ? push T0 onto hw stack now.
-        LDA T0               ; push target line number (skip_rest EXPR clobbers T0)
-        PHA
-        LDA T0+1
-        PHA
-        LDA OP
-        CMP #TOK_GOSUB
-        BNE DO_on_go_seek
-DO_on_skip_rest:
-        JSR WPEEK
-        CMP #','
-        BNE DO_on_save_ip
-        JSR GETCI
-        JSR EXPR             ; discard remaining entry
-        BRA DO_on_skip_rest
-DO_on_save_ip:
-        LDA IP               ; save return IP (past ON stmt) before GOTOL
-        STA T2
-        LDA IP+1
-        STA T2+1
-DO_on_go_seek:
-        PLA                  ; restore target line number
-        STA T0+1
-        PLA
-        STA T0
-        JSR GOTOL
-        BCC DO_on_found
-        JMP DO_ERR_UL
-DO_on_found:
-        LDA OP
-        CMP #TOK_GOSUB
-        BNE DO_on_goto
-        LDA GRET
-        CMP #8
-        BCC DO_on_gosub_ok
-        JMP DO_ERR_NR
-DO_on_gosub_ok:
-        ASL
-        TAX
-        LDA T2
-        STA GORET,x
-        LDA T2+1
-        STA GORET+1,x
-        INC GRET
-DO_on_goto:
-        JMP RUN_LINE         ; restore S and jump to target line
+; DO_ON removed (v15.0, space for CORDIC). Token slot $91 -> RTS stub.
 ; =============================================================================
 ; DATA TABLES  (no page constraint ? placed here after main code)
 ; =============================================================================
@@ -1800,6 +1793,8 @@ DO_on_goto:
 ; Order MUST match token values: entry[0] = TOK_PRINT ($80), entry[1] = TOK_IF ($81) ...
 KW_TABLE:
 ; ---- statement tokens $80..$95 (must appear first in this order) ------------
+; NOTE: $8F (CLS) and $90 (HELP) removed. Placeholder $80 bytes keep TKTOK
+; in sync. STMT_JT entries for those slots point to DO_DATA (RTS stub).
         .DB "PRIN",$D4        ; $80 TOK_PRINT   ('T'|$80=$D4)
         .DB "I",$C6           ; $81 TOK_IF      ('F'|$80=$C6)
         .DB "GOT",$CF         ; $82 TOK_GOTO    ('O'|$80=$CF)
@@ -1815,9 +1810,9 @@ KW_TABLE:
         .DB "NEX",$D4         ; $8C TOK_NEXT    ('T'|$80=$D4)
         .DB "FRE",$C5         ; $8D TOK_FREE    ('E'|$80=$C5)
         .DB "POK",$C5         ; $8E TOK_POKE    ('E'|$80=$C5)
-        .DB "CL",$D3          ; $8F TOK_CLS     ('S'|$80=$D3)  was $9C
-        .DB "HEL",$D0         ; $90 TOK_HELP    ('P'|$80=$D0)  was $9D
-        .DB "O",$CE           ; $91 TOK_ON      ('N'|$80=$CE)  was $9F
+        .DB $80               ; $8F placeholder (CLS removed, STMT_JT -> RTS stub)
+        .DB $80               ; $90 placeholder (HELP removed, STMT_JT -> RTS stub)
+        .DB $80               ; $91 placeholder (ON removed, STMT_JT -> RTS stub)
         .DB "DAT",$C1         ; $92 TOK_DATA    ('A'|$80=$C1)  was $A1
         .DB "REA",$C4         ; $93 TOK_READ    ('D'|$80=$C4)  was $A2
         .DB "RESTOR",$C5      ; $94 TOK_RESTORE ('E'|$80=$C5)  was $A3
@@ -1836,13 +1831,18 @@ KW_TABLE:
         .DB "XO",$D2          ; $A0 TOK_XOR     ('R'|$80=$D2)  was $99
         .DB "LE",$D4          ; $A1 TOK_LET     ('T'|$80=$D4)  was $9A
         .DB "THE",$CE         ; $A2 TOK_THEN    ('N'|$80=$CE)  was $9B
-        .DB "A",$D4           ; $A3 TOK_AT      ('T'|$80=$D4)  was $9E
+        .DB "TA",$C2          ; $A3 TOK_TAB     ('B'|$80=$C2)
         .DB "INKE",$D9        ; $A4 TOK_INKEY   ('Y'|$80=$D9)  was $A0
-        .DB "SG",$CE          ; $A5 TOK_SGN     ('N'|$80=$CE)
+        .DB $80               ; $A5 placeholder (SGN removed, expr atom not statement -- no STMT_JT impact)
         .DB "MO",$C4          ; $A6 TOK_MOD     ('D'|$80=$C4)
         .DB "RN",$C4          ; $A7 TOK_RND     ('D'|$80=$C4)
-        .DB "HEX",$A4         ; $A8 TOK_HEXS    ('$'|$80=$A4)
+        .DB "SI",$CE          ; $A8 TOK_SIN     ('N'|$80=$CE)  (was $A9)
+        .DB "CO",$D3          ; $A9 TOK_COS     ('S'|$80=$D3)  (was $AA)
         .DB 0                 ; end-of-table sentinel
+; CORDIC atan table: atan(2^-i) in units where 16384 = 90 degrees
+; Value[i] = round(16384 * atan(2^-i) / 90).  12 entries x 2 bytes = 24 bytes.
+ATAN_TBL:
+        .DW 8192, 4836, 2555, 1297, 651, 326, 163, 81, 41, 20, 10, 5
 ; Statement dispatch table (used by STMT via JMP (STMT_JT,X))
 ; Entry order must match token values TOK_PRINT ($80) .. TOK_ELSE ($95).
 ; Indices 0..14 = original statements; 15..21 = moved-up statements.
@@ -1851,7 +1851,7 @@ STMT_JT:
         .DW DO_PRINT,   DO_IF,      DO_GOTO,    DO_GOSUB,  DO_RETURN  ; $80-$84
         .DW DO_RUN,     DO_LIST,    DO_NEW,     DO_INPUT,  DO_REM     ; $85-$89
         .DW DO_END,     DO_FOR,     DO_NEXT,    DO_FREE,   DO_POKE    ; $8A-$8E
-        .DW DO_CLS,     DO_HELP,    DO_ON,      DO_DATA,   DO_READ    ; $8F-$93
+        .DW DO_DATA,    DO_DATA,    DO_DATA,    DO_DATA,   DO_READ    ; $8F(nop),$90(nop),$91(nop),$92-$93
         .DW DO_RESTORE, DO_ELSE_SK                                     ; $94-$95
 ;   The tokeniser copies the raw value list verbatim after TOK_DATA.
 ;   At runtime we just return; RUNLP's own SKIPEOL call advances past the body.
@@ -2212,33 +2212,25 @@ EB_rel:
         LDA T0+1
         PHA
 
-        ; Scan relational operator chars, building bitmask in X
+        ; Scan relational operator chars, building bitmask in X.
+        ; ASCII '<','=','>' are contiguous ($3C,$3D,$3E); subtract $3C to map
+        ; to 0,1,2 and look up the bit via REL_MASK. Out-of-range chars (incl.
+        ; wraparound for chars below '<') make SBC/CMP set carry -> BCS exits
+        ; without consuming, since only GETCI (not reached) advances IP.
         LDX #0               ; mask = 0
 RL_LOOP:
         LDA (IP)             ; peek next char without consuming (65C02 zp-indirect)
-        CMP #'<'
-        BNE RL_CK_EQ
-        TXA
-        ORA #1               ; set LT bit
+        SEC
+        SBC #'<'             ; map <,=,> to 0,1,2 (wraps high for chars below '<')
+        CMP #3
+        BCS RL_DONE          ; not a relational operator: exit loop
+        TAY                  ; Y = 0, 1, or 2
+        STX T2                ; stash running mask (T2 free here; assembler lacks ORA abs,x/y)
+        LDA REL_MASK,y       ; new bit
+        ORA T2               ; combine with running mask
         TAX
-        JSR GETCI            ; consume '<'
-        BRA RL_LOOP
-RL_CK_EQ:
-        CMP #'='
-        BNE RL_CK_GT
-        TXA
-        ORA #2               ; set EQ bit
-        TAX
-        JSR GETCI            ; consume '='
-        BRA RL_LOOP
-RL_CK_GT:
-        CMP #'>'
-        BNE RL_DONE
-        TXA
-        ORA #4               ; set GT bit
-        TAX
-        JSR GETCI            ; consume '>'
-        BRA RL_LOOP
+        JSR GETCI            ; consume operator (A = '<'/'='/'>' afterward, never 0)
+        BNE RL_LOOP          ; always taken
 
 RL_DONE:
         ; Push mask; evaluate right operand; restore left into T1
@@ -2286,11 +2278,10 @@ RL_TEST:
         AND T2               ; result bit AND operator mask
         BEQ REL_F            ; no overlap -> false
 REL_T:  LDA #$FF
-        STA T0
+        .DB $2C              ; BIT abs: swallows next 2 bytes (the LDA #0 opcode+operand)
+REL_F:  LDA #0               ; reached directly when false; skipped-over when true falls through
+        STA T0               ; both paths converge here
         STA T0+1
-        RTS
-REL_F:  STZ T0               ; 65C02: STZ zeroes without needing LDA #0
-        STZ T0+1
         RTS
 
 EB_bool:                     ; boolean/bitwise operator loop
@@ -2349,6 +2340,7 @@ REL_SETUP:
         PLA
         STA T1
         RTS
+REL_MASK: .DB 1, 2, 4        ; bit for <,=,> respectively (indexed by RL_LOOP)
 ; =============================================================================
 ; EXPR_ADD ? Tier 2: addition, subtraction  (also relational dispatch above)
 ; =============================================================================
@@ -2561,28 +2553,7 @@ USR_THUNK:
         JMP (T0)
 ; =============================================================================
 ; E2_SGN ? SGN(n): sign of n  ?  -1 (negative), 0 (zero), 1 (positive)
-;   In:  IP  points at SGN token
-;   Out: T0  = -1, 0, or 1  (16-bit signed)
-;        IP  advanced past SGN(expr)
-;   Clobbers: A T0
-; =============================================================================
-E2_sgn: JSR GETCI            ; consume SGN token
-        JSR E2_ARG1          ; evaluate argument -> T0, consume '(...)'
-        LDA T0
-        ORA T0+1
-        BEQ E2_sgn_zero      ; T0 == 0: return 0 (T0 already zero)
-        LDA T0+1
-        BMI E2_sgn_neg       ; hi byte negative: return -1
-        LDA #1               ; positive: return 1
-        STA T0               ;   T0 lo = 1
-        STZ T0+1             ;   T0 hi = 0
-        RTS
-E2_sgn_neg:
-        LDA #$FF             ; -1: both bytes $FF
-        STA T0
-        STA T0+1
-E2_sgn_zero:
-        RTS                  ; T0 already 0 from BEQ path
+; E2_sgn removed (v15.0, space for CORDIC)
 ; =============================================================================
 EXPR2:
         JSR WPEEK
@@ -2603,8 +2574,6 @@ EXPR2:
         BEQ E2_inkey
         CMP #TOK_USR
         BEQ E2_usr
-        CMP #TOK_SGN
-        BEQ E2_sgn
         CMP #TOK_ABS
         BEQ E2_abs
 ; --- remaining tokens: handlers too far for BEQ, use BNE/JMP ---
@@ -2617,10 +2586,18 @@ EXPR2_t1:
         JMP E2_chrs
 EXPR2_t2:
         CMP #TOK_ASC
-        BNE EXPR2_tvar_jmp
+        BNE EXPR2_t3
         JMP E2_asc
+EXPR2_t3:
+        CMP #TOK_SIN
+        BNE EXPR2_t4
+        JMP E2_sin
+EXPR2_t4:
+        CMP #TOK_COS
+        BNE EXPR2_tvar_jmp
+        JMP E2_cos
 EXPR2_tvar_jmp:
-        BRA EXPR2_tvar       ; not a function token: try as variable
+        JMP EXPR2_tvar       ; not a function token: try as variable
 ; --- atom handlers (placed here so preamble BEQs above are in range) ---
 E2_par: JSR GETCI            ; ( expr )
         JSR EXPR
@@ -2653,21 +2630,338 @@ E2_abs: JSR GETCI            ; ABS(n)
         LDA T0+1
         BPL E2_abs_pos
         JMP NEG16            ; tail call: negate if negative
+
+; =============================================================================
+; ASR16 -- arithmetic right shift T0 by X positions (X=0..11)
+;   In : T0 signed 16-bit; X = count
+;   Out: T0 shifted, sign-extended
+;   Clobbers: A X
+; =============================================================================
+ASR16:
+        CPX #0
+        BEQ ASR16_R
+ASR16_L:
+        LDA T0+1
+        CMP #$80            ; sign bit -> C
+        ROR T0+1
+        ROR T0
+        DEX
+        BNE ASR16_L
+ASR16_R:
+        RTS
+; =============================================================================
+; CORDIC_KERN -- rotation-mode CORDIC, 12 iterations
+;   In : CX=6042, CY=0, CZ=angle_in_CORDIC_units (0..16380 = 0..90 deg)
+;   Out: CX = cos*9949, CY = sin*9949  (signed 16-bit)
+;   Clobbers: A X T0 T1 CX_SAV CIDX
+; =============================================================================
+CORDIC_KERN:
+        LDX #0
+CK_IT:  STX CIDX
+        LDA CX
+        STA CX_SAV
+        LDA CX+1
+        STA CX_SAV+1
+        LDA CZ+1
+        BMI CK_NEG
+        ; d=+1
+        LDA CY
+        STA T0
+        LDA CY+1
+        STA T0+1
+        LDX CIDX
+        JSR ASR16
+        LDA CX
+        SEC
+        SBC T0
+        STA CX
+        LDA CX+1
+        SBC T0+1
+        STA CX+1
+        LDA CX_SAV
+        STA T0
+        LDA CX_SAV+1
+        STA T0+1
+        LDX CIDX
+        JSR ASR16
+        LDA CY
+        CLC
+        ADC T0
+        STA CY
+        LDA CY+1
+        ADC T0+1
+        STA CY+1
+        LDX CIDX
+        TXA
+        ASL
+        TAX
+        LDA CZ
+        SEC
+        SBC ATAN_TBL,x
+        STA CZ
+        LDA CZ+1
+        SBC ATAN_TBL+1,x
+        STA CZ+1
+        BRA CK_NX
+CK_NEG: ; d=-1
+        LDA CY
+        STA T0
+        LDA CY+1
+        STA T0+1
+        LDX CIDX
+        JSR ASR16
+        LDA CX
+        CLC
+        ADC T0
+        STA CX
+        LDA CX+1
+        ADC T0+1
+        STA CX+1
+        LDA CX_SAV
+        STA T0
+        LDA CX_SAV+1
+        STA T0+1
+        LDX CIDX
+        JSR ASR16
+        LDA CY
+        SEC
+        SBC T0
+        STA CY
+        LDA CY+1
+        SBC T0+1
+        STA CY+1
+        LDX CIDX
+        TXA
+        ASL
+        TAX
+        LDA CZ
+        CLC
+        ADC ATAN_TBL,x
+        STA CZ
+        LDA CZ+1
+        ADC ATAN_TBL+1,x
+        STA CZ+1
+CK_NX:  LDX CIDX
+        INX
+        CPX #12
+        BEQ CK_DN
+        JMP CK_IT
+CK_DN:  RTS
+; =============================================================================
+; E2_sin / E2_cos  --  SIN(deg)*1000 / COS(deg)*1000
+;   In : token already peeked; A = token
+;   Out: T0 = result (signed 16-bit, -1000..+1000)
+;   Uses ATEMP as SIN=0/COS=1 selector; T1 as quadrant negation flags.
+;   Quadrant folding (all-8-bit compares, no CMP #imm > 255):
+;     Q1  0-90:    fold = angle;       flags=0 (no negs)
+;     Q2  91-180:  fold = 180-angle;   flags=1 (negate CX)
+;     Q3a 181-255: fold = angle-180;   flags=3 (negate CX+CY)
+;     Q3b 256-270: fold = 76+lo;       flags=3
+;     Q4  271-360: fold = 104-lo;      flags=2 (negate CY)
+;   angles > 360 (T0+1 >= 2) return 0.
+;   Clobbers: A X T0 T1 T2 CX CY CZ CX_SAV CIDX ATEMP
+; =============================================================================
+E2_cos:
+        JSR GETCI
+        LDA #1
+        STA ATEMP           ; 1 = want COS
+        BRA SC_GO
+E2_sin:
+        JSR GETCI
+        STZ ATEMP           ; 0 = want SIN
+SC_GO:
+        JSR E2_ARG1         ; angle -> T0, consumes (...)
+        ; Range check: T0+1 must be 0 or 1
+        LDA T0+1
+        BEQ SC_LO           ; hi=0: angle 0-255
+        CMP #2
+        BCC SC_IN           ; hi=1: angle 256-360, valid
+SC_RET0:                    ; hi>=2: out of range -> return 0
+        STZ T0
+        STZ T0+1
+        RTS
+SC_IN:
+        ; hi=1: angle 256-360
+        LDA T0              ; lo byte (0-104 valid, 271-360 = hi:lo = 1:15..1:104)
+        CMP #15             ; split Q3b/Q4: 271-256=15
+        BCS SC_Q4
+        ; Q3b: 256-270: fold = 76+lo
+        CLC
+        ADC #76
+        STA T0
+        STZ T0+1
+        LDA #3
+        BRA SC_FLAGS
+SC_Q4:  ; Q4: 271-360: fold = 104-lo
+        LDA #104
+        SEC
+        SBC T0
+        STA T0
+        STZ T0+1
+        LDA #2
+        BRA SC_FLAGS
+SC_LO:  ; hi=0: angle 0-255
+        LDA T0
+        CMP #91
+        BCC SC_Q1           ; 0-90: Q1
+        CMP #181
+        BCC SC_Q2           ; 91-180: Q2
+        ; Q3a: 181-255: fold = angle-180
+        SEC
+        SBC #180
+        STA T0
+        LDA #3
+        BRA SC_FLAGS
+SC_Q2:  ; 91-180: fold = 180-angle
+        LDA #180
+        SEC
+        SBC T0
+        STA T0
+        LDA #1
+        BRA SC_FLAGS
+SC_Q1:  LDA #0              ; no negations
+SC_FLAGS:
+        STA T1              ; save quadrant flags
+        ; Multiply T0 (0-90) * 182 -> CZ  (182=0b10110110)
+        LDA #182
+        STA T2              ; use T2 as multiplier shift reg (T1 flags already saved)
+        STZ CZ
+        STZ CZ+1
+        LDX #8
+SC_ML:  LSR T2              ; bit -> C
+        BCC SC_MN
+        LDA CZ
+        CLC
+        ADC T0
+        STA CZ
+        LDA CZ+1
+        ADC T0+1
+        STA CZ+1
+SC_MN:  ASL T0
+        ROL T0+1
+        DEX
+        BNE SC_ML
+        ; Init CORDIC
+        LDA #<6042
+        STA CX
+        LDA #>6042
+        STA CX+1
+        STZ CY
+        STZ CY+1
+        JSR CORDIC_KERN     ; -> CX=cos*9949, CY=sin*9949
+        ; Apply quadrant negations from T1
+        ; NOTE: cannot reuse NEG16/NEG_T1 here -- NEG16 hardcodes LDX #0
+        ; internally (it is a fixed T0-only entry point, with NEG_T1 as a
+        ; second fixed entry point via the .BYTE $2C skip trick into the
+        ; same body at a different hardcoded offset). Passing a custom X
+        ; offset into NEG16 does not work: NEG16's own LDX #0 discards it.
+        ; Inline negation used instead for CX/CY (confirmed correct by sim).
+        LDA T1
+        LSR                 ; bit0 -> C: negate CX?
+        BCC SC_NCX
+        LDA #0
+        SEC
+        SBC CX
+        STA CX
+        LDA #0
+        SBC CX+1
+        STA CX+1
+SC_NCX: LDA T1               ; reload flags (A was clobbered above)
+        LSR
+        LSR                 ; bit1 -> C: negate CY?
+        BCC SC_NCY
+        LDA #0
+        SEC
+        SBC CY
+        STA CY
+        LDA #0
+        SBC CY+1
+        STA CY+1
+SC_NCY:
+        ; Select result: ATEMP=0->SIN(CY), ATEMP=1->COS(CX)
+        LDA ATEMP
+        BEQ SC_SIN
+        LDA CX              ; COS
+        STA T0
+        LDA CX+1
+        STA T0+1
+        BRA SC_SCALE
+SC_SIN: LDA CY
+        STA T0
+        LDA CY+1
+        STA T0+1
+SC_SCALE:
+        ; Scale T0 from CORDIC units (0..9949) to *1000 via (|T0|>>4)*103>>6
+        ; All 16-bit: max intermediate = 621*103 = 63963 < 65535.
+        LDA T0+1
+        BPL SC_SPOS
+        LDX #0
+        JSR NEG16           ; negate T0 (X=0 offset)
+        LDA #1
+        STA ATEMP           ; negative flag
+        BRA SC_SDO
+SC_SPOS:
+        STZ ATEMP
+SC_SDO: ; >>4
+        LSR T0+1
+        ROR T0
+        LSR T0+1
+        ROR T0
+        LSR T0+1
+        ROR T0
+        LSR T0+1
+        ROR T0              ; T0 = |val|>>4 (max 621)
+        ; *103 -> T2 (16-bit: max 63963)
+        LDA #103
+        STA T1
+        STZ T2
+        STZ T2+1
+        LDX #8
+SC_SML: LSR T1
+        BCC SC_SMN
+        CLC
+        LDA T2
+        ADC T0
+        STA T2
+        LDA T2+1
+        ADC T0+1
+        STA T2+1
+SC_SMN: ASL T0
+        ROL T0+1
+        DEX
+        BNE SC_SML
+        ; >>6: T0 = T2>>6
+        LDA T2
+        STA T0
+        LDA T2+1
+        STA T0+1
+        LSR T0+1
+        ROR T0
+        LSR T0+1
+        ROR T0
+        LSR T0+1
+        ROR T0
+        LSR T0+1
+        ROR T0
+        LSR T0+1
+        ROR T0
+        LSR T0+1
+        ROR T0
+        ; Apply sign
+        LDA ATEMP
+        BEQ SC_DONE
+        LDX #0
+        JSR NEG16           ; negate T0 (X=0 offset)
+SC_DONE:
+        RTS
 ; =============================================================================
 ; EXPR2_tvar ? variable or unrecognised atom (BRA from dispatch above)
 ; =============================================================================
 EXPR2_tvar:
-        JSR UC
-        CMP #'A'
-        BCC E2_bad
-        CMP #'Z'+1
-        BCS E2_bad
-        JSR GETCI
-        JSR UC
-        SEC
-        SBC #'A'
-        ASL                  ; x2: byte offset into VARS
-        TAX
+        JSR PARSE_VAR        ; harmless redundant WPEEK_UC re-peek (IP unmoved so far)
+        BCC ET_ok            ; C=0: matched
+        JMP E2_bad           ; C=1: no match (E2_bad too far for BCS)
+ET_ok:  TAX
         LDA VARS,x
         STA T0
         LDA VARS+1,x
@@ -2744,16 +3038,8 @@ DO_LET:
         BNE DO_let_var
         JSR GETCI            ; consume optional LET keyword
 DO_let_var:
-        JSR WPEEK_UC
-        CMP #'A'
-        BCC DO_let_dn
-        CMP #'Z'+1
+        JSR PARSE_VAR
         BCS DO_let_dn
-        JSR GETCI
-        JSR UC
-        SEC
-        SBC #'A'
-        ASL
         PHA                  ; save var slot
         JSR WPEEK
         CMP #'='
@@ -2775,31 +3061,7 @@ DO_let_pop:
 DO_let_dn:
         RTS
 
-; =============================================================================
-; PRT_HEX  -  print T0 as 4-digit uppercase hexadecimal  (used by HEX$)
-;   In:  T0  = 16-bit value
-;   Out: 4 hex digits printed (e.g. T0=$FF -> "00FF")
-;   Clobbers: A X Y
-; =============================================================================
-PRT_HEX:
-    LDA T0+1        ; High byte
-    JSR PH_byte
-    LDA T0          ; Low byte (fall through)
-PH_byte:
-    PHA             ; Save byte
-    LSR            ; High nibble to low
-    LSR
-    LSR
-    LSR
-    JSR PH_nib      ; Process high nibble
-    PLA             ; Restore for low nibble (fall through)
-PH_nib:
-    AND #$0F        ; Isolate nibble
-    SED             ; <--- Set Decimal Mode (1 byte)
-    CMP #$0A        ; <--- Set Carry if A >= 10 (2 bytes)
-    ADC #$30        ; <--- The Magic Add (2 bytes)
-    CLD             ; <--- Clear Decimal Mode (1 byte)
-    ; drop through
+; PRT_HEX removed (v15.0, HEX$ no longer supported -- space for CORDIC)
 ; PUTCH ? character output  (PRNL drops through here for the LF)
 ;   In:  A    character to send
 ;   Out: Character emitted to terminal device.
@@ -2897,6 +3159,29 @@ INCIP:  INC IP
         BNE INCIP_ok
         INC IP+1
 INCIP_ok:
+        RTS
+; =============================================================================
+; PARSE_VAR ? parse a single A-Z variable letter at (IP) into a VARS offset
+;   In:  IP   points at the variable letter (may be preceded by whitespace)
+;   Out: C=0  matched: A = VARS byte offset (0,2,4,...50); IP advanced past it
+;        C=1  no match: A,IP unchanged (other than WPEEK_UC's non-destructive peek)
+;   Clobbers: A
+; =============================================================================
+PARSE_VAR:
+        JSR WPEEK_UC
+        CMP #'A'
+        BCC PV_fail
+        CMP #'Z'+1
+        BCS PV_fail
+        JSR GETCI
+        JSR UC
+        SEC
+        SBC #'A'
+        ASL                  ; x2: byte offset into VARS
+        CLC
+        RTS
+PV_fail:
+        SEC
         RTS
 WPEEK_UC:
         JSR WPEEK
@@ -3018,7 +3303,7 @@ LAST_ROM_CODE = *            ; first byte after executable ROM code (currently $
         .DB $1E, $00, $80, $99, $28, $FF, $3D, $00, $29, $3B, $99, $28, $FF, $3D, $00, $29, $3B, $22, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $53, $48, $4F, $57, $43, $41, $53, $45, $20, $22, $3B, $99, $28, $FF, $3D, $00, $29, $3B, $99, $28, $FF, $3D, $00, $29, $0D ; 30 PRINT CHR$(61);CHR$(61);" 4K BASIC SHOWCASE ";CHR$(61);CHR$(61)
         .DB $28, $00, $80, $22, $43, $48, $52, $24, $28, $36, $35, $29, $3D, $22, $3B, $99, $28, $FF, $41, $00, $29, $3B, $22, $20, $20, $41, $53, $43, $28, $41, $29, $3D, $22, $3B, $9A, $28, $22, $41, $22, $29, $0D ; 40 PRINT "CHR$(65)=";CHR$(65);"  ASC(A)=";ASC("A")
         .DB $32, $00, $89, $20, $2D, $2D, $2D, $20, $41, $42, $53, $20, $2F, $20, $53, $47, $4E, $20, $2F, $20, $4D, $4F, $44, $20, $2D, $2D, $2D, $0D ; 50 REM --- ABS / SGN / MOD ---
-        .DB $3C, $00, $80, $22, $41, $42, $53, $28, $2D, $37, $29, $3D, $22, $3B, $9B, $28, $2D, $FF, $07, $00, $29, $3B, $22, $20, $20, $53, $47, $4E, $28, $2D, $35, $29, $3D, $22, $3B, $A5, $28, $2D, $FF, $05, $00, $29, $3B, $22, $20, $20, $53, $47, $4E, $28, $30, $29, $3D, $22, $3B, $A5, $28, $FF, $00, $00, $29, $0D ; 60 PRINT "ABS(-7)=";ABS(-7);"  SGN(-5)=";SGN(-5);"  SGN(0)=";SGN(0)
+        .DB $19, $3C, $00, $89, $20, $28, $53, $47, $4E, $20, $72, $65, $6D, $6F, $76, $65, $64, $20, $76, $31, $35, $2E, $30, $29, $0D ; 60 REM (SGN removed v15.0)
         .DB $46, $00, $80, $22, $31, $37, $20, $4D, $4F, $44, $20, $35, $3D, $22, $3B, $FF, $11, $00, $A6, $FF, $05, $00, $3B, $22, $20, $20, $41, $42, $53, $28, $33, $29, $3D, $22, $3B, $9B, $28, $FF, $03, $00, $29, $0D ; 70 PRINT "17 MOD 5=";17 MOD 5;"  ABS(3)=";ABS(3)
         .DB $50, $00, $89, $20, $2D, $2D, $2D, $20, $4E, $4F, $54, $20, $2F, $20, $41, $4E, $44, $20, $2F, $20, $4F, $52, $20, $2F, $20, $58, $4F, $52, $20, $2D, $2D, $2D, $0D ; 80 REM --- NOT / AND / OR / XOR ---
         .DB $5A, $00, $80, $22, $4E, $4F, $54, $20, $30, $3D, $22, $3B, $9F, $FF, $00, $00, $3B, $22, $20, $20, $36, $20, $41, $4E, $44, $20, $33, $3D, $22, $3B, $FF, $06, $00, $9D, $FF, $03, $00, $0D ; 90 PRINT "NOT 0=";NOT 0;"  6 AND 3=";6 AND 3
@@ -3051,7 +3336,7 @@ LAST_ROM_CODE = *            ; first byte after executable ROM code (currently $
         .DB $68, $01, $83, $FF, $F4, $01, $0D ; 360 GOSUB 500
         .DB $72, $01, $89, $20, $2D, $2D, $2D, $20, $4F, $4E, $20, $6E, $20, $47, $4F, $53, $55, $42, $20, $2D, $2D, $2D, $0D ; 370 REM --- ON n GOSUB ---
         .DB $7C, $01, $8B, $4B, $3D, $FF, $01, $00, $98, $FF, $03, $00, $0D ; 380 FOR K=1 TO 3
-        .DB $86, $01, $91, $4B, $83, $FF, $FE, $01, $2C, $FF, $08, $02, $2C, $FF, $12, $02, $0D ; 390 ON K GOSUB 510,520,530
+        .DB $18, $86, $01, $89, $20, $28, $4F, $4E, $20, $72, $65, $6D, $6F, $76, $65, $64, $20, $76, $31, $35, $2E, $30, $29, $0D ; 390 REM (ON removed v15.0)
         .DB $90, $01, $8C, $4B, $0D ; 400 NEXT K
         .DB $9A, $01, $89, $20, $2D, $2D, $2D, $20, $4D, $61, $6E, $64, $65, $6C, $62, $72, $6F, $74, $20, $2D, $2D, $2D, $0D ; 410 REM --- Mandelbrot (inline via GOTO) ---
         .DB $A4, $01, $80, $99, $28, $FF, $3D, $00, $29, $3B, $99, $28, $FF, $3D, $00, $29, $3B, $22, $20, $4D, $41, $4E, $44, $45, $4C, $42, $52, $4F, $54, $20, $22, $3B, $99, $28, $FF, $3D, $00, $29, $3B, $99, $28, $FF, $3D, $00, $29, $0D ; 420 PRINT CHR$(61);CHR$(61);" MANDELBROT ";CHR$(61);CHR$(61)
