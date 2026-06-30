@@ -83,228 +83,52 @@
 ;   $FFxx+       string literals   (all on same ROM page -- PUTSTR constraint)
 ;   $FFFC-$FFFF  vectors  (RESET -> ROMSTART, IRQ -> IRQ_HANDLER)
 ;
-; v15.0 changes vs v14.2 (CORDIC trig, statement cuts, ROM size rescue):
-;   - BUG FOUND AND FIXED (introduced earlier in v15.0 development, caught by
-;     this version's functional smoke test, NOT present in any released
-;     version): the SI/CO KW_TABLE entries were accidentally dropped during
-;     the HEX$ removal step (the renumber-SIN/COS-down-by-one edit silently
-;     matched and replaced the wrong anchor text, leaving TOK_SIN/TOK_COS
-;     defined but unreachable from source text -- SIN(x) and COS(x) silently
-;     parsed as undefined variables, returning 0). Restored.
-;   - BUG FOUND AND FIXED (same root cause, also introduced and caught this
-;     version): the quadrant-negation step in E2_sin/E2_cos tried to reuse
-;     NEG16 with a custom X offset (LDX #CX-T0 / JSR NEG16) to negate CX/CY
-;     in place. This does not work -- NEG16 hardcodes LDX #0 as its first
-;     instruction (it and NEG_T1 are a matched pair of FIXED entry points
-;     into one shared body via the .BYTE $2C skip trick, at hardcoded offsets
-;     0 and 2 respectively; NEG16 was never designed to take a caller-supplied
-;     offset). The caller's X was silently discarded each time, so CX/CY were
-;     never actually negated -- SIN/COS returned the wrong sign in quadrants
-;     2-4 (e.g. SIN(270) returned +999 instead of -999). Confirmed by isolated
-;     simulator test before and after the fix. Reverted to plain inline
-;     negation for CX and CY (with T1 flags reloaded fresh before the second
-;     LSR test, since the negate code path also clobbers A).
-;   - BUG FOUND AND FIXED (pre-existing in the TAB(n) handler since it was
-;     first written this version, not from AT's original code): TAB(n) used
-;     EAT_EXPR believing it consumed both '(' and ')', but EAT_EXPR only
-;     consumes '(' (it tail-calls EXPR directly, leaving ')' unconsumed --
-;     confirmed by checking CHR$'s handler, which correctly follows EAT_EXPR
-;     with a separate WEAT call). Without the matching WEAT, the next PRINT
-;     item parse saw a stray ')' token, which EXPR silently evaluated as 0
-;     (E2_bad fallback), producing a spurious "0" after every TAB. Fixed by
-;     adding the missing WEAT call.
-;   - BUG FOUND AND FIXED (same area): TAB(n)'s loop-back jumped to DP_top
-;     (restart the whole PRINT item-parser) instead of DP_aft (the semicolon-
-;     separator check used by every other item type: strings, CHR$, plain
-;     expressions). This meant a ';' immediately after TAB(n) was never
-;     recognised as a separator -- it fell through to DP_norm's generic
-;     EXPR/PRT16 path, which evaluated the stray ';' as 0 via the same
-;     E2_bad fallback, then printed it before the next real item. Fixed by
-;     routing TAB's loop-back through DP_aft like every other item.
-;   - All four bugs above were caught by a functional smoke test (SIN/COS in
-;     all four quadrants, TAB alone and chained with ';' and other items, in
-;     both immediate mode and a stored FOR/NEXT program) run specifically
-;     because earlier versions of this changelog entry had been written
-;     before such a test was performed -- a reminder that "assembles cleanly"
-;     and "byte count fits" are necessary but not sufficient.
-;   - NEW: SIN(deg) and COS(deg) -- 16-bit fixed-point CORDIC, 12 iterations,
-;     shared rotation kernel (CORDIC_KERN). Result is integer*1000 in range
-;     -1000..+1000, max error ~2 units vs true value. Full 0-360 degree range
-;     via quadrant folding to 0-90 (4-way fold + sign flags), all comparisons
-;     using 8-bit-safe arithmetic (no CMP #imm > 255, which is illegal on 6502
-;     and was caught during development). New ZP scratch CX/CY/CZ/CX_SAV/CIDX
-;     at $C0-$C8 (9 bytes), plus ATEMP $C9 (quadrant/sign temp, reused by
-;     CORDIC_SCALE). New ATAN_TBL (24 bytes) added to ROM after KW_TABLE.
-;   - NEW: TAB(n) replaces AT(col,row). PRINT-only; prints n spaces via a
-;     simple loop (LDX T0 / DEX / BNE), so no terminal-specific cursor-position
-;     I/O is required -- removes the IO_XPOS/IO_YPOS Kowalski dependency
-;     entirely. High byte of n is ignored (column counts > 255 wrap mod 256).
-;   - REMOVED: CLS, HELP, AT(col,row), ON expr GOTO/GOSUB, HEX$(n), SGN(n).
-;     All freed for CORDIC's ROM footprint. Token slots for CLS/HELP/ON in
-;     STMT_JT now point at DO_DATA (RTS stub); KW_TABLE entries replaced with
-;     1-byte $80 placeholders to keep TKTOK token numbering aligned for the
-;     statement-token block. SIN/COS reuse the vacated HEX$/SGN token values.
-;     Pre-loaded showcase program lines that demonstrated SGN (line 60) and
-;     ON...GOSUB (line 390) replaced with REM stubs in place (same line
-;     numbers, so no other GOTO/GOSUB targets needed renumbering).
-;   - BUG FOUND (pre-existing, not introduced this version): the cold-start
-;     zero-page clear loop in INIT (LDX #$FF / STZ 0,x / DEX / BPL loop)
-;     clears only ONE byte ($FF) before exiting -- DEX from $FF to $FE sets
-;     N=1 immediately, so BPL (branch on N=0) never loops. Confirmed by
-;     simulation. Not fixed in v15.0 (out of scope for this pass): every ZP
-;     variable that matters is explicitly initialised at its point of use
-;     (PE/IP/RUN/FSTK in INIT and MAIN, VARS via DO_NEW-style clear, DATA_PTR
-;     via explicit STZ), so the interpreter is unaffected in practice. The
-;     correct fix (BPL -> BNE, accepting $00 stays unswept since IP overwrites
-;     it immediately) is free and zero-risk whenever someone wants to take it.
-;   - SIZE OPTIMISATION: PARSE_VAR subroutine factored from DO_LET, DO_INPUT,
-;     and EXPR2_tvar -- all three had a near-identical 10-14 instruction
-;     sequence (WPEEK_UC / range-check A-Z / GETCI / UC / SBC #'A' / ASL to
-;     compute a VARS offset). Consolidated into one shared routine (C=0 match
-;     with offset in A, C=1 no match). Saves ~28 bytes net across the 3 sites.
-;   - SIZE OPTIMISATION: five CMP #0 -> TAX substitutions (TOKENIZE, EDITLINE,
-;     STMT, DO_PRINT, DO_IF) where X was confirmed dead at that point -- TAX
-;     sets the Z flag identically to CMP #0 in 1 byte instead of 2.
-;   - SIZE OPTIMISATION: relational operator scanner (RL_LOOP in EXPR)
-;     rewritten. ASCII '<','=','>' are contiguous ($3C-$3E); subtract $3C to
-;     map to 0,1,2 and look up the result bit via a 3-byte REL_MASK table,
-;     replacing three near-identical CMP/BNE/TXA/ORA/TAX/JSR/BRA clauses with
-;     one loop. Bounds check (CMP #3 after the SBC) correctly rejects all
-;     out-of-range characters including the wraparound case for chars below
-;     '<', verified by hand-tracing the carry flag for several edge cases.
-;     Note: this assembler does not support ORA abs,Y or ORA abs,X (confirmed
-;     by isolated test -- LDA abs,Y assembles, ORA abs,Y does not), so the
-;     mask combine uses STX T2 / LDA REL_MASK,y / ORA T2 instead of the more
-;     direct TXA/ORA REL_MASK,y/TAX.
-;   - SIZE OPTIMISATION: REL_T/REL_F merged via the classic 6502 BIT-abs
-;     skip trick (.DB $2C swallows the following LDA #0 as a throwaway
-;     operand address, leaving A=$FF from REL_T intact when falling through
-;     to REL_F's STA T0/STA T0+1/RTS). Verified correct at runtime in
-;     isolation (REL_T -> T0=$FFFF, REL_F -> T0=$0000) before merging into
-;     the main source, not just trusted on the assembler's silence.
-;   - CONSIDERED AND REJECTED: an "OOM check dead code removal" suggestion
-;     (deleting STA T2/STA T2+1 in INSLINE's PE+total overflow check) does
-;     NOT apply here -- those values are read back two lines later for the
-;     RAM_TOP comparison (CMP #<RAM_TOP / SBC #>RAM_TOP operate on T2/T2+1),
-;     so removing the stores would corrupt the out-of-memory check. Likely
-;     valid for a differently-structured routine elsewhere, not this one.
-;   - TOOLING NOTE: the assembler's own "ROM footprint" report becomes
-;     unreliable once total code exceeds 64K during development -- it
-;     silently wraps addresses modulo 65536 rather than erroring, and
-;     different parts of the assembler (footprint message vs "Key symbols"
-;     list vs the resulting .DW vector bytes) can disagree with each other.
-;     Diagnosed by noticing the IRQ vector pointed at $0074 instead of
-;     IRQ_HANDLER. Worked around for the rest of development with a
-;     deliberately out-of-range BRA placed right after LAST_ROM_CODE, which
-;     forces the assembler to print the true unwrapped address in its
-;     "Branch out of range" error message.
-;   Net result: v14.2's 3858 bytes (232 free) -> v15.0 ROM is essentially
-;   FULL: 0 bytes free before vectors, after adding SIN/COS/CORDIC (~470
-;   bytes) and TAB, removing CLS/HELP/AT/ON/HEX$/SGN, the size optimisations
-;   above, and the WEAT-call fix for TAB (which cost the final few bytes of
-;   margin). There is no headroom left in this ROM; any future change needs
-;   to free space elsewhere first. check_size.sh (companion script, not
-;   part of this file) verifies true size reliably -- see the tooling note
-;   above for why the assembler's own footprint report cannot be trusted
-;   blindly once a build has ever overflowed 64K during development.
-; v14.2 changes vs v14.1 (size optimisation):
-;   - T2DEC subroutine factored from DELINE and INSLINE.
-;     Both copy loops contained an identical 14-byte sequence:
-;     16-bit decrement of T2 followed by ORA zero-test and conditional branch.
-;     Extracted as T2DEC (13 bytes + RTS): decrements T2 and returns Z=1
-;     when the result reaches zero, Z=0 otherwise.  Each call site replaced
-;     with JSR T2DEC(3) + BNE(2) = 5 bytes.
-;     Net saving: 5 bytes (3863 -> 3858); free space before vectors 227 -> 232.
-; v14.1 changes vs v14.0 (size optimisation):
-;   - EXPR relational evaluator redesigned: bitmask algorithm.
-;     Replaces six per-operator handlers (EQ_op, LT_op, GT_op, LE_op, GE_op,
-;     NE_op) with a single unified scan loop that accumulates an operator
-;     bitmask (LT=1, EQ=2, GT=4) in X, evaluates the right operand once via
-;     EXPR_ADD, then performs one 16-bit signed comparison.  Signed less-than
-;     detection uses the N XOR V trick (BVC / EOR #$80 / BMI) -- the 65C02
-;     equivalent of the 8088 JL/JG signed-branch instructions, requiring no
-;     extra ZP scratch beyond T2-lo (which is free at evaluation time).
-;     REL_SETUP is retained unchanged for the AND/OR/XOR boolean operators.
-;     All six relational operators (= < > <= >= <>) remain correct including
-;     signed negative operands.  65C02 opcodes used: LDA (IP), STZ, BRA.
-;     Saves 42 bytes: 3905 -> 3863, free space before vectors 185 -> 227 bytes.
-; v14.0 changes vs v13.0 (size optimisations):
-;   - Token reordering: all statement-tokens moved to a contiguous block
-;     ($80..$95, 22 entries).  STMT_JT expanded from 15 to 22 entries.
-;     The 7 explicit CMP/BEQ chains in STMT are eliminated.  Net saving:
-;     ~30 bytes (28B dispatch, 14B BRA stubs removed, minus 12B table growth).
-;     Token values affected: CLS $9C->$8F  HELP $9D->$90  ON $9F->$91
-;     DATA $A1->$92  READ $A2->$93  RESTORE $A3->$94  ELSE $A4->$95
-;     PEEK $8F->$96  STEP $90->$97  TO $91->$98  CHR$ $92->$99
-;     ASC $93->$9A  ABS $94->$9B  USR $95->$9C  AND $96->$9D  OR $97->$9E
-;     NOT $98->$9F  XOR $99->$A0  LET $9A->$A1  THEN $9B->$A2
-;     AT $9E->$A3  INKEY $A0->$A4  SGN/MOD/RND/HEX$ unchanged ($A5-$A8)
-;   - Showcase program byte-patched to match new token values.
-;   - Minor comment and alignment cleanup throughout.
-;   - Memory map comment updated: STMT_JT now 44 bytes (22 entries).
-; v13.0 changes vs v12.4 (size optimisations):
-;   - High-bit string termination: NUL ($00) replaced by setting bit 7 of the
-;     last character of each string literal (STR_BANNER, STR_CRLF, STR_BYTES,
-;     STR_ERROR, STR_IN, STR_BREAK).  PUTSTR/PUTSTRZP loops changed from
-;     BEQ PS_DN to BMI PS_DN with AND #$7F before PUTCH.  Saves 6 bytes
-;     (one NUL per string removed).
-;   - KW_TABLE high-bit last-char termination: the explicit NUL byte after
-;     each keyword string replaced by ORing $80 onto the last character.
-;     KW_NEXT, TRYKW compare loop, DO_LIST keyword print, DO_HELP keyword
-;     print all updated.  Saves 41 bytes (one per entry + end sentinel change).
-;   - KW_TABLE length bytes removed: the length byte at the start of each
-;     entry was used only by TRYKW as a loop counter.  TRYKW rewritten to
-;     scan until the high-bit char is found/matched.  KW_NEXT rewritten to
-;     scan forward past chars until high-bit, then advance 1 more.
-;     Saves 41 bytes (one length byte per entry).
-;   - PUTSTR: use INY instead of INC T2 (saves 1 byte; T2 now used as
-;     base addr with Y as index throughout PUTSTR/PUTSTRZP).
-;   - DO_HELP: merged keyword print loop with TRYKW/LS_prk pattern.
-;   Total ROM saving vs v12.4: ~89 bytes.
-; v12.4 changes vs v12.3:
-;   - BUG FIX: SGN(positive) returned 257 instead of 1.
-;     The .BYTE $2C skip-trick was applied to commented-out code, so the skip
-;     target was wrong: A=1 landed in E2_sgn_neg's STA T0+1, giving hi=1.
-;     Fix: restore explicit  LDA #1 / STA T0 / STZ T0+1 / RTS  for the
-;     positive path; drop the .BYTE $2C trick entirely.
-;   - BUG FIX: HEX$(n) returned 0 / was not recognised.
-;     TOK_HEXS=$A8 was defined but "HEX$" was missing from KW_TABLE and had
-;     no handler. Fix: add .DB 4,"HEX$",0 to KW_TABLE after RND; add handler
-;     in DO_PRINT that prints T0 as 4-digit uppercase hex via PRT_HEX.
-;     PRT_HEX helper added (~20 bytes); also reachable from EXPR2 for
-;     completeness (though documented as PRINT-only).
-; v12.3 changes vs v12.2:
-;   - IRQ handler extended: BREAK now prints "BREAK IN nnn" (line number)
-;     by sharing DO_ERROR's " IN line\r\n" exit tail (DO_break_in label).
-;     STR_BREAK trailing CRLF removed (-1B); CLI added to shared exit (+1B);
-;     IRQ JMP DO_break_in replaces CLI+JMP MAIN (-1B). Net: -1 byte.
-; v12.2 changes vs v12.1:
-;   - PEEKC inlined at all 3 call sites (LDA (IP)) -- frees 6 bytes
-; v12.1 changes vs v12.0:
-;   - 65C02 zp-indirect (no Y) used in DO_LIST, GOTOL, TKEMIT, RD_body,
-;     RD_f_go, RD_skip_ln, RD_uint -- saves 9 bytes total
-; v12.0 changes vs v11.5:
-;   - IRQ handler added.  Writing any value to $E007 (IO_IRQ) fires a
-;     maskable IRQ.  If a program is running (RUN != 0), the handler clears
-;     RUN / GRET / FSTK, unwinds the stack to RUNSP, prints "BREAK" and
-;     returns to the MAIN prompt -- program store is fully intact.
-;     If idle (RUN == 0), the IRQ is silently swallowed (RTI).
-;   - CLI added to INIT so IRQs are active immediately at cold start.
-;   - IO_IRQ = $E007 added as named I/O port constant.
-;   - STR_BREAK added to string table.
-;   - IRQ vector now points to IRQ_HANDLER instead of INIT.
-; v11.4 changes vs v11.3:
-;   - DO_GOTO / DO_GOSUB: CURLN now updated to target line number after GOTOL.
-;     Bug: CURLN held the GOTO/GOSUB line's number, not the target's. Any FOR
-;     loop at the jump target stored the wrong line number in its frame, so
-;     NEXT could not find the FOR line to loop back to (loop exited after 1 pass).
-;     Fix: 4 bytes in each handler (LDA T0/STA CURLN/LDA T0+1/STA CURLN+1)
-;     before RUN_LINE. GOTOL always leaves T0 = the matched line number.
-;   - Banner updated to v11.4.
-; v11.3 changes vs v11.2:
-;   - PRINT handler: ELSE token now treated as end-of-list after trailing ';'
-;     (fixes spurious "0" when IF/THEN branch ends with PRINT CHR$(n); ELSE ...)
-;   - Pre-loaded program replaced: full feature showcase (all statements + Mandelbrot)
+; =============================================================================
+; Revision History
+; v15.0
+;   Major feature update.
+;   - Added SIN(deg) and COS(deg) using a shared 12-iteration fixed-point
+;     CORDIC implementation (result scaled by 1000).
+;   - Added TAB(n) PRINT function.
+;   - Removed CLS, HELP, AT(), ON...GOTO/GOSUB, HEX$, SGN to recover ROM
+;   - Fixed SIN/COS keyword lookup regression.
+;   - Corrected SIN/COS quadrant sign handling.
+;   - Refactored variable parsing and relational operator handling.
+;   - Miscellaneous ROM optimisations.
+;   - ROM now effectively full; future additions require freeing space.
+;   - Known issue: INIT zero-page clear loop terminates early, but all
+;     required zero-page variables are explicitly initialised before use.
+; v14.2
+;   - Extracted shared T2DEC routine (-5 bytes ROM).
+; v14.1
+;   - Reworked relational expression evaluator (-42 bytes ROM).
+; v14.0
+;   - Reordered token table to allow direct statement dispatch.
+;   - Updated showcase program and documentation.
+; v13.0
+;   - Converted string and keyword tables to high-bit termination.
+;   - Removed keyword length bytes.
+;   - Miscellaneous ROM optimisations (~89 bytes saved).
+; v12.4
+;   - Fixed SGN() positive-result bug.
+;   - Added HEX$() keyword and implementation.
+; v12.3
+;   - BREAK now reports line number.
+; v12.2
+;   - Inlined PEEKC at all call sites.
+; v12.1
+;   - Adopted 65C02 zero-page indirect addressing where applicable.
+; v12.0
+;   - Added IRQ handler and BREAK support.
+;   - IRQ vector now points to IRQ_HANDLER.
+; v11.4
+;   - Fixed GOTO/GOSUB so CURLN tracks destination line correctly,
+;     restoring correct FOR/NEXT behaviour.
+; v11.3
+;   - Fixed PRINT/ELSE parsing after trailing semicolons.
+;   - Replaced demo program with a more comprehensive showcase.
+;--------------------------------------------------------------------------
+
 ; Zero-page layout:
 ;   $00-$01  IP      interpreter pointer  (token stream or program store)
 ;   $02-$03  PE      program end pointer
