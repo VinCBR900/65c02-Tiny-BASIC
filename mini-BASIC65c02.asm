@@ -1,6 +1,18 @@
-; miniBASIC 65C02 v1.0 -- 4KB Float BASIC (MBF4) for the 65C02
+; miniBASIC 65C02 v1.1 -- 4KB Float BASIC (MBF4) for the 65C02
 ; ORG $F000 (2732 EPROM).  RAM $0000-$0FFF.
 ; Derived from uBASIC v18.1 (integer 65C02) + miniBASIC 8088 v2.0 (float).
+;
+; v1.1: (1) DELINE no longer corrupts LP when editing/deleting a program
+;           line with >=256 bytes of trailing program text (the copy loop's
+;           page-boundary bookkeeping was bumping the caller's insertion
+;           pointer along with its own source pointer).
+;       (2) Immediate-mode GOTO no longer crashes when issued before the
+;           first RUN (DO_GOTO now only collapses the stack via RUNSP while
+;           a program is actually RUNning).
+;       (3) Dead FLT_A_TO_C/FLT_C_TO_A removed, FLT_C zero-page freed.
+;       (4) FLT_A_TO_B/FLT_B_TO_A, variable fetch/store, and FLT_ZERO
+;           rerolled into loops; float-alignment byte fast-path removed;
+;           PUTSTRZP tail-calls PUTCH.  68 bytes smaller overall.
 ;
 ; MBF4: Byte0=biased_exp($00=zero), Byte1=sign|mant[22:16], Byte2-3=mant[15:0]
 ;       value=(-1)^sign * 2^(exp-$80) * 0.1mmm...
@@ -9,7 +21,7 @@
 ; ZP:  $00/$01=IP  $02/$03=PE  $04/$05=LP
 ;      $06/$07=T0  $08/$09=T1  $0A/$0B=T2
 ;      $0C/$0D=CURLN  $0E=RUN  $10-$2F=IBUF(32)
-;      $30-$33=FLT_A  $34-$37=FLT_B  $38-$3B=FLT_C
+;      $30-$33=FLT_A  $34-$37=FLT_B  $38-$3B=free
 ;      $3C=FLT_SA  $3D=FLT_SB  $3E=FLT_ER  $3F=FLT_DE  $40=FLT_DB
 ;      $43=RUNSP  $44-$A7=VARS(A-Z,4 bytes each)
 ;
@@ -32,7 +44,6 @@ RUN      = $0E
 IBUF     = $10
 FLT_A    = $30
 FLT_B    = $34
-FLT_C    = $38
 FLT_SA   = $3C
 FLT_SB   = $3D
 FLT_ER   = $3E
@@ -260,6 +271,10 @@ DLL:     LDA (LP),Y
          LDA T2
          ORA T2+1
          BEQ DLU
+         LDA LP               ; save LP: the (LP),Y wraparound-bump below
+         PHA                  ; must advance the destination base past $xxFF
+         LDA LP+1             ; boundaries, but LP is also our caller's
+         PHA                  ; insertion point and must survive unchanged
          LDY #0
 DLC:     LDA (T0),Y
          STA (LP),Y
@@ -269,6 +284,10 @@ DLC:     LDA (T0),Y
          INC LP+1
 DLN:     JSR T2DEC
          BNE DLC
+         PLA
+         STA LP+1
+         PLA
+         STA LP
 DLU:     LDA PE
          SEC
          SBC T1
@@ -425,8 +444,7 @@ PSL:     LDA (T2),Y
          INC T2
          BRA PSL
 PSE:     AND #$7F
-         JSR PUTCH
-         RTS
+         JMP PUTCH
 
 ; ---- DO_FREE ----------------------------------------------------------------
 DO_FREE: SEC
@@ -538,9 +556,11 @@ DO_GOTO: JSR EXPR
          BCC DGOK
          LDA #ERR_UL
          JMP DO_ERROR
-DGOK:    LDX RUNSP
-         TXS
-RUNGO:   JSR STMT_LINE
+DGOK:    LDA RUN               ; only valid to collapse the stack via RUNSP
+         BEQ RUNGO             ; while already inside an active RUN loop;
+         LDX RUNSP             ; RUNSP is stale/uninitialized for an
+         TXS                   ; immediate-mode GOTO (stack is already at
+RUNGO:   JSR STMT_LINE         ; the correct depth in that case)
          LDA RUN
          BEQ RUNEND
 SKL:     JSR GETCI
@@ -625,14 +645,13 @@ DO_INPUT:
          STA IP+1
          PLA
          TAX
-         LDA FLT_A
+         LDY #0
+DILP:    LDA FLT_A,Y
          STA VARS,X
-         LDA FLT_A+1
-         STA VARS+1,X
-         LDA FLT_A+2
-         STA VARS+2,X
-         LDA FLT_A+3
-         STA VARS+3,X
+         INX
+         INY
+         CPY #4
+         BNE DILP
 DIDN:
 ST_NOP:  RTS
 
@@ -886,14 +905,13 @@ E2VR:    JSR UC
          ASL
          ASL
          TAX
-         LDA VARS,X
-         STA FLT_A
-         LDA VARS+1,X
-         STA FLT_A+1
-         LDA VARS+2,X
-         STA FLT_A+2
-         LDA VARS+3,X
-         STA FLT_A+3
+         LDY #0
+EVRL:    LDA VARS,X
+         STA FLT_A,Y
+         INX
+         INY
+         CPY #4
+         BNE EVRL
          RTS
 E2NG:    JSR E2PS
          JMP FLT_NEGATE
@@ -1026,14 +1044,13 @@ DO_LET:  JSR WPEEK_UC
          JSR EXPR
          PLA
          TAX
-         LDA FLT_A
+         LDY #0
+DLLP:    LDA FLT_A,Y
          STA VARS,X
-         LDA FLT_A+1
-         STA VARS+1,X
-         LDA FLT_A+2
-         STA VARS+2,X
-         LDA FLT_A+3
-         STA VARS+3,X
+         INX
+         INY
+         CPY #4
+         BNE DLLP
          RTS
 DLPOP:   PLA
          LDA #ERR_UK
@@ -1099,10 +1116,10 @@ MKFL:    LDA LP
 ; ===========================================================================
 
 FLT_ZERO:
-         STZ FLT_A
-         STZ FLT_A+1
-         STZ FLT_A+2
-         STZ FLT_A+3
+         LDX #3
+FZL:     STZ FLT_A,X
+         DEX
+         BPL FZL
          RTS
 
 FLT_NEGATE:
@@ -1134,47 +1151,19 @@ SIGN_XOR:
          RTS
 
 FLT_A_TO_B:
-         LDA FLT_A+3
-         STA FLT_B+3
-         LDA FLT_A+2
-         STA FLT_B+2
-         LDA FLT_A+1
-         STA FLT_B+1
-         LDA FLT_A
-         STA FLT_B
+         LDX #3
+FABL:    LDA FLT_A,X
+         STA FLT_B,X
+         DEX
+         BPL FABL
          RTS
 
 FLT_B_TO_A:
-         LDA FLT_B+3
-         STA FLT_A+3
-         LDA FLT_B+2
-         STA FLT_A+2
-         LDA FLT_B+1
-         STA FLT_A+1
-         LDA FLT_B
-         STA FLT_A
-         RTS
-
-FLT_A_TO_C:
-         LDA FLT_A+3
-         STA FLT_C+3
-         LDA FLT_A+2
-         STA FLT_C+2
-         LDA FLT_A+1
-         STA FLT_C+1
-         LDA FLT_A
-         STA FLT_C
-         RTS
-
-FLT_C_TO_A:
-         LDA FLT_C+3
-         STA FLT_A+3
-         LDA FLT_C+2
-         STA FLT_A+2
-         LDA FLT_C+1
-         STA FLT_A+1
-         LDA FLT_C
-         STA FLT_A
+         LDX #3
+FBAL:    LDA FLT_B,X
+         STA FLT_A,X
+         DEX
+         BPL FBAL
          RTS
 
 ; FLT_FROM_INT: T0 (s16) -> FLT_A
@@ -1421,20 +1410,6 @@ FA_NALIGN:
          STZ FLT_DB
 FAAL:    CPX #0
          BEQ FAOP
-         CPX #8
-         BCC FABT
-         LDA FLT_B+3
-         STA FLT_DB
-         LDA FLT_B+2
-         STA FLT_B+3
-         LDA FLT_B+1
-         STA FLT_B+2
-         STZ FLT_B+1
-         TXA
-         SEC
-         SBC #8
-         TAX
-         BRA FAAL
 FABT:    LSR FLT_B+1
          ROR FLT_B+2
          ROR FLT_B+3
