@@ -1080,7 +1080,8 @@ RL_LOOP: JSR WPEEK            ; A = next char
          BCS RL_DONE          ; Not a relational operator -> exit loop
          TAY                  ; Y = 0, 1, or 2
          TXA                  ; Pull accumulated mask so far
-         ORA REL_MASK,Y       ; Apply new bit
+         ; ORA REL_MASK,Y       ; Apply new bit
+         .DB $19, <REL_MASK, >REL_MASK ; Kludge - need to add to ASM65c02.c
          TAX
          JSR GETCI            ; Consume operator (always returns A=$3C, $3D, or $3E)
          BNE RL_LOOP          ; BNE always branches (A is never zero)
