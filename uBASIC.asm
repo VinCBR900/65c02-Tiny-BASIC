@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC v18.2  --  2 KB Tiny BASIC for the 65C02
+; uBASIC v18.3  --  2 KB Tiny BASIC for the 65C02
 ;    
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -29,7 +29,7 @@
 ;   $F800          BRA INIT  (2-byte Kowalski trampoline; see note below)
 ;   $F802..$F859   string / keyword table  (all on page $F8)
 ;   $F85A..$FFA7   interpreter code  (1960 bytes)
-;   $FFA8..$FFFB   free (82 bytes)
+;   $FF78..$FFFB   free (132 bytes)
 ;   $FFFC..$FFFF   reset / IRQ vectors
 ;
 ; ---- zero-page layout -------------------------------------------------------
@@ -64,6 +64,24 @@
 ;     LDA #>SHOWCASE_END  ->  LDA #>PROG
 ;
 ; ---- version history --------------------------------------------------------
+; v18.3 (Jul 2026)  Code-golf pass: 10 changes, 48 bytes saved (82->132 free).
+;   G1: DO_INPUT/DO_LET/E2_VAR bounds check: SEC/SBC #'A'/CMP #26/BCS replaces
+;       paired CMP/BCC + CMP/BCS; defers GETCI past offset calculation; removes
+;       redundant second JSR UC in E2_VAR.  Saves 7+7+5=19 bytes.
+;   G2: DO_PRINT end-of-line: CMP #' '/BCC replaces CMP #CR/BEQ+CMP #0/BEQ at
+;       DP_TOP and DP_AFT.  Saves 4+4=8 bytes.
+;   G3: INSLINE OOM check: LDA does not affect C; removed redundant STA/LDA T2
+;       pair; A already holds hi byte for CMP #>RAM_TOP.  Saves 6 bytes.
+;   G4: EL_FL/LS_LN/GT_SC 16-bit equality: CMP lo/LDA hi/SBC hi/BCS replaces
+;       4-instruction CMP/BNE+CMP/BEQ pattern (valid since pointers never
+;       overshoot PE).  Saves 2+2+2=6 bytes.
+;   G5: EXPR1 DIV/MOD tail: BIT-skip trick + LDA 0,X/LDA 1,X merges duplicate
+;       4-instruction copy blocks.  Saves 5 bytes.
+;   F2: DO_POKE: STA (T1) (65C02 zp-indirect) replaces LDY #0/STA (T1),Y.
+;       Saves 2 bytes.
+;   F3: PEEK handler: LDA (T0) replaces LDY #0/LDA (T0),Y.  Saves 2 bytes.
+;   BugFix: USR_CALL changed from JMP (T2) to JSR (T2) (.DB $FC encoding) so
+;       user RTS returns to USR_RET, which saves A into T0.  No size change.
 ; v18.2 (Jun 2026)  Added TAB(n) support to PRINT, 35 bytes free to vectors.
 ; v18.1 (Apr 2026)  T2DEC subroutine factored from DELINE and INSLINE.
 ;   Both copy loops contained an identical 14-byte 16-bit decrement and
@@ -184,7 +202,7 @@ T_DS  = 164              ; $24 + $80  ('$' -- CHR$)
 
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
-STR_BANNER: .DB "uBASIC v18.2"  ; startup banner; falls into STR_CRLF for CR+LF
+STR_BANNER: .DB "uBASIC v18.3"  ; startup banner; falls into STR_CRLF for CR+LF
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
 STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
@@ -335,17 +353,14 @@ IRQ_idle:
 ;   Clobbers: A X Y T0 T1 T2 IP
 ; =============================================================================
 DO_INPUT:
-         JSR WPEEK_UC         ; skip spaces; peek var name uppercased
-         CMP #'A'
-         BCC DO_IN_DN         ; not a letter -- nothing to do
-         CMP #'Z'+1
-         BCS DO_IN_DN
-         JSR GETCI            ; consume the variable letter
-         JSR UC               ; ensure uppercase
+         JSR WPEEK_UC         ; skip spaces; peek var name uppercased (A already UC'd)
          SEC
-         SBC #'A'
+         SBC #'A'             ; offset from 'A'; non-letter -> >= 26
+         CMP #26
+         BCS DO_IN_DN         ; not A-Z: nothing to do
          ASL                  ; -> VARS byte offset (0, 2, 4 ...)
          PHA                  ; [S: var_offset]
+         JSR GETCI            ; consume the variable letter
          LDA IP+1
          PHA                  ; [S: var_offset, IP_hi]
          LDA IP
@@ -564,12 +579,11 @@ EDITLN:
          STA LP
          LDA #>PROG
          STA LP+1
-EL_FL:   LDA LP               ; is LP == PE? (reached end of store)
-         CMP PE
-         BNE EL_GO
-         LDA LP+1
-         CMP PE+1
-         BEQ EL_INS           ; yes: insert at end
+EL_FL:   LDA LP               ; is LP >= PE? (LP always <= PE, so triggers only at ==)
+         CMP PE               ; sets C
+         LDA LP+1             ; preserves C
+         SBC PE+1
+         BCS EL_INS           ; C set: LP >= PE -> insert at end
 EL_GO:   LDY #1               ; compare stored line number hi-byte first
          LDA (LP),Y
          CMP CURLN+1
@@ -626,12 +640,9 @@ IN_CE:   INY                  ; include CR itself
          TAX                  ; X = total line size (header + body + CR)
          PHX                  ; save line size on stack
          SEC                  ; OOM check: new PE = PE + line_size
-         ADC PE
-         STA T2
-         LDA PE+1
-         ADC #0
-         STA T2+1
-         LDA T2+1
+         ADC PE               ; lo byte (sets C)
+         LDA PE+1             ; does NOT affect carry
+         ADC #0               ; hi byte + carry
          CMP #>RAM_TOP        ; would we cross RAM_TOP?
          BCC IN_OK
          PLX
@@ -745,10 +756,8 @@ DO_FREE:
 ; =============================================================================
 DO_PRINT:
 DP_TOP:  JSR WPEEK
-         CMP #CR
-         BEQ DP_NL
-         CMP #0
-         BEQ DP_NL
+         CMP #' '
+         BCC DP_NL            ; CR, NUL, or any control char: end of items
          CMP #'"'
          BNE DP_CHR
          JSR GETCI            ; consume opening '"'
@@ -788,10 +797,8 @@ DP_AFT:  JSR WPEEK
          BNE DP_NL
          JSR GETCI            ; consume ';'
          JSR WPEEK
-         CMP #CR
-         BEQ DP_RET           ; trailing ';': suppress CR/LF (DP_RET = IN_DN = RTS above)
-         CMP #0
-         BEQ DP_RET
+         CMP #' '
+         BCC DP_RET           ; trailing ';': CR/NUL/control -> suppress CR/LF
          BRA DP_TOP
 
 ; (DO_PRINT falls through into PRNL/PUTSTR at DP_NL when no items remain)
@@ -875,12 +882,11 @@ DO_LIST:
          STA LP
          LDA #>PROG
          STA LP+1
-LS_LN:   LDA LP               ; test LP == PE (end of program)
-         CMP PE
-         BNE LS_GO
-         LDA LP+1
-         CMP PE+1
-         BEQ LS_DONE          ; end of program: branches to shared RTS above
+LS_LN:   LDA LP               ; test LP >= PE (LP always <= PE, so triggers only at ==)
+         CMP PE               ; sets C
+         LDA LP+1             ; preserves C
+         SBC PE+1
+         BCS LS_DONE          ; C set: LP >= PE -> end of program
 LS_GO:   LDA (LP)             ; read line number lo  (65C02 zp-indirect, no Y needed)
          STA T0
          LDY #1
@@ -1016,8 +1022,7 @@ DO_POKE:
          STX T1
          PLX                   ; pull address hi -> X
          STX T1+1
-         LDY #0
-         STA (T1),Y            ; write value to address
+         STA (T1)              ; 65C02 zp-indirect: write value to address (saves LDY #0)
          RTS
 
 ; =============================================================================
@@ -1033,12 +1038,11 @@ GOTOL:
          STA IP
          LDA #>PROG
          STA IP+1
-GT_SC:   LDA IP               ; test IP == PE (end of store)
-         CMP PE
-         BNE GT_GO
-         LDA IP+1
-         CMP PE+1
-         BEQ GT_ERR           ; not found
+GT_SC:   LDA IP               ; test IP >= PE (IP always <= PE, so triggers only at ==)
+         CMP PE               ; sets C
+         LDA IP+1             ; preserves C
+         SBC PE+1
+         BCS GT_ERR           ; C set: IP >= PE -> not found
 GT_GO:   LDA (IP)             ; read line-number lo  (65C02 zp-indirect, no Y needed)
          CMP T0               ; compare line-number lo
          BNE GT_NX
@@ -1278,17 +1282,15 @@ E1_DB:   ASL T1               ; shift dividend left into T2 (shift-subtract meth
          INC T1               ; quotient bit = 1
 E1_DS:   DEY
          BNE E1_DB
-         LDA OP               ; MOD ('%'): use remainder in T2; else quotient T1
+         LDA OP               ; MOD ('%'): use remainder (T2); else quotient (T1)
          CMP #'%'
          BEQ E1_MOD
-         LDA T1               ; copy quotient to T0
+         LDX #T1              ; X = ZP address of T1 ($08) -- quotient
+         .DB $2C              ; BIT abs: skips next 2 bytes (the LDX #T2)
+E1_MOD:  LDX #T2              ; X = ZP address of T2 ($0A) -- remainder
+         LDA 0,X              ; lo byte of selected result (zp,X)
          STA T0
-         LDA T1+1
-         STA T0+1
-         BRA E1_SIGN          ; apply sign
-E1_MOD:  LDA T2               ; '%': copy remainder (T2) to T0
-         STA T0
-         LDA T2+1
+         LDA 1,X              ; hi byte of selected result
          STA T0+1
          BRA E1_SIGN          ; apply sign
 
@@ -1390,8 +1392,7 @@ E2_NOTCHRS:
          BCS E2_NOT_PEEK
          JSR EAT_EXPR         ; consume '(' and evaluate address -> T0
          JSR WEAT             ; consume ')'
-         LDY #0
-         LDA (T0),Y           ; read byte at address (T0 is ZP ptr $06/$07)
+         LDA (T0)             ; 65C02 zp-indirect: read byte at address (saves LDY #0)
          STA T0
          STZ T0+1
          RTS
@@ -1418,16 +1419,15 @@ E2_BAD:  STZ T0               ; unrecognised atom: return 0 (no error)
          STZ T0+1
          RTS
 
-E2_VAR:  JSR UC               ; variable name (single letter A-Z)?
-         CMP #'A'
-         BCC E2_BAD
-         CMP #'Z'+1
-         BCS E2_BAD
-         JSR GETCI            ; consume the letter
-         JSR UC
+E2_VAR:  JSR UC               ; uppercase peeked char (IP not advanced)
          SEC
-         SBC #'A'
+         SBC #'A'             ; offset from 'A'; non-letter -> >= 26
+         CMP #26
+         BCS E2_BAD           ; not A-Z: return 0
          ASL                  ; -> VARS byte offset (0, 2, 4 ...)
+         PHA
+         JSR GETCI            ; consume the letter
+         PLA
          TAX
          LDA VARS,X
          STA T0
@@ -1558,17 +1558,14 @@ ST_LET:  ; fall through into DO_LET
 ;   DL_DN: nearest following RTS -- shared with NEG16/NEG_T1 below.
 ; =============================================================================
 DO_LET:
-         JSR WPEEK_UC         ; skip spaces, peek var name, uppercase
-         CMP #'A'
-         BCC DL_DN            ; not a letter: bail (DL_DN = NEG16/DL_DN = RTS below)
-         CMP #'Z'+1
-         BCS DL_DN
-         JSR GETCI            ; consume variable letter
-         JSR UC
+         JSR WPEEK_UC         ; skip spaces, peek var name, uppercase (A already UC'd)
          SEC
-         SBC #'A'
+         SBC #'A'             ; offset from 'A'; non-letter -> >= 26
+         CMP #26
+         BCS DL_DN            ; not A-Z: bail (DL_DN = NEG16/DL_DN = RTS below)
          ASL                  ; -> VARS byte offset
          PHA
+         JSR GETCI            ; consume variable letter
          JSR WPEEK
          CMP #'='
          BNE DL_POP           ; no '=': bad assignment
@@ -1750,7 +1747,7 @@ GETCH:   LDA IO_IN
 ;   (PRT16PRNT falls into PUTCH; inserting code there breaks PRT16).
 ; =============================================================================
 USR_CALL:
-         JMP (T2)              ; indirect jump to user code; RTS returns to EXPR2's caller
+         .DB $FC, <T2, >T2    ; JSR (T2) -- 65C02 opcode $FC; assembler lacks this form
 USR_RET: STA T0                ; save A as the 16-bit result lo-byte
          STZ T0+1              ; result is zero-extended (hi = 0)
          RTS
