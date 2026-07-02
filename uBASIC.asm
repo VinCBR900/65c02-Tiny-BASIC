@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC v18.3  --  2 KB Tiny BASIC for the 65C02
+; uBASIC v18.4  --  2 KB Tiny BASIC for the 65C02
 ;    
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -11,8 +11,8 @@
 ;
 ; =============================================================================
 ;
-; Statements   : END  FREE  GOTO  HELP  IF..THEN INPUT  LET  LIST  NEW  REM  RUN
-;                POKE  PRINT     
+; Statements   : END  FREE  GOSUB  GOTO  HELP  IF..THEN  INPUT  LET  LIST  NEW
+;                POKE  PRINT  REM  RETURN  RUN
 ; Expressions  : + - * / %   = < > <= >= <>   unary -
 ;                PEEK(addr)   USR(addr)   A-Z variables
 ; Numbers      : signed 16-bit  (-32768 .. 32767)
@@ -24,33 +24,35 @@
 ;   ?2  division or modulo by zero
 ;   ?3  out of memory
 ;   ?4  bad variable name in LET
-;
-; ---- ROM memory map ---------------------------------------------------------
-;   $F800          BRA INIT  (2-byte Kowalski trampoline; see note below)
-;   $F802..$F859   string / keyword table  (all on page $F8)
-;   $F85A..$FFA7   interpreter code  (1960 bytes)
-;   $FF78..$FFFB   free (132 bytes)
-;   $FFFC..$FFFF   reset / IRQ vectors
+;   ?5  GOSUB stack overflow or RETURN without GOSUB
 ;
 ; ---- zero-page layout -------------------------------------------------------
-;   $00-$01  IP     interpreter pointer (into IBUF or program store)
-;   $02-$03  PE     program end pointer (one past last program byte)
-;   $04-$05  LP     line pointer / multi-purpose scratch pointer
-;   $06-$07  T0     primary scratch word / expression result
-;   $08-$09  T1     secondary scratch word
-;   $0A-$0B  T2     tertiary scratch word / STMT indirect-jump target
-;   $0C-$0D  CURLN  currently-executing line number
-;   $0E      RUN    run flag: $00 = immediate mode, $FF = program running
-;   $0F      OP     saved operator for MUL/DIV/MOD kernel ('*', '/', '%')
-;   $10-$2F  IBUF   input line buffer (32 bytes)
-;   $30-$4F  --     free RAM
-;   $50-$8B  VARS   A-Z variable store (2 bytes each, 52 bytes total)
-;   $8C      RUNSP  stack-pointer snapshot for GOTO / BREAK unwind
+;   $00-$01  IP      interpreter pointer (into IBUF or program store)
+;   $02-$03  PE      program end pointer (one past last program byte)
+;   $04-$05  LP      line pointer / multi-purpose scratch pointer
+;   $06-$07  T0      primary scratch word / expression result
+;   $08-$09  T1      secondary scratch word
+;   $0A-$0B  T2      tertiary scratch word / STMT indirect-jump target
+;   $0C-$0D  CURLN   currently-executing line number
+;   $0E      RUN     run flag: $00 = immediate mode, $FF = program running
+;   $0F      OP      saved operator for MUL/DIV/MOD kernel ('*', '/', '%')
+;   $10-$2F  IBUF    input line buffer (32 bytes)
+;   $30      RUNSP   SP snapshot for GOTO / BREAK unwind
+;   $31      GSSP    GOSUB stack pointer (0 = empty, max GS_DEPTH)
+;   $32-$65  VARS    A-Z variable store (2 bytes each, 52 bytes)
+;   $66-$75  GS_STK  GOSUB return stack (8 frames x 2 bytes: IP lo/hi only)
+;   $76-$FF  --      free RAM (138 bytes)
 ;
 ; ---- program storage --------------------------------------------------------
 ;   Base $0200; ceiling RAM_TOP ($1000 for 4 KB SRAM).
 ;   Line format:  <lineno_lo> <lineno_hi> <raw ASCII body> <CR>
 ;   No tokenisation; body bytes are stored exactly as typed.
+;
+; ---- ROM memory map ---------------------------------------------------------
+;   $F800          BRA INIT  (2-byte Kowalski trampoline; see note below)
+;   $F802..$F859   string / keyword table  (all on page $F8)
+;   $F85A..$FFA7   Space for interpreter code  
+;   $FFFC..$FFFF   reset / IRQ vectors
 ;
 ; ---- Kowalski simulator note ------------------------------------------------
 ;   Kowalski v2.x executes from the first assembled byte rather than the
@@ -58,12 +60,16 @@
 ;   string table so both Kowalski and real hardware work identically.
 ;
 ; ---- ROM / no-showcase note -------------------------------------------------
-;   To start with an empty program store (no pre-loaded showcase), change
-;   the two lines in INIT that load SHOWCASE_END into PE to instead load PROG:
-;     LDA #<SHOWCASE_END  ->  LDA #<PROG
-;     LDA #>SHOWCASE_END  ->  LDA #>PROG
+;   To start with an empty program store (no pre-loaded showcase), call DO_NEW
 ;
 ; ---- version history --------------------------------------------------------
+; v18.4 (Jul 2026)  Sequential ZP layout; GOSUB/RETURN (8-deep stack).
+;   ZP reorganised: RUNSP $8C->$30, VARS $50->$32 (VARS_MAX $3B->$33, exact fit),
+;   GSSP added $31, GS_STK added $66-$75.  Free ZP now contiguous at $76-$FF.
+;   GOSUB <linenum>: saves return IP (2 bytes/frame) to GS_STK, finds line
+;   via GOTOL, executes; CURLN not saved (RUNLP reloads from line header).
+;   RETURN: restores IP, unwinds hardware SP to RUNSP, resumes at SK_LP.
+;   ERR_GS (?5) added for stack overflow / RETURN without GOSUB.
 ; v18.3 (Jul 2026)  Code-golf pass: 10 changes, 48 bytes saved (82->132 free).
 ;   G1: DO_INPUT/DO_LET/E2_VAR bounds check: SEC/SBC #'A'/CMP #26/BCS replaces
 ;       paired CMP/BCC + CMP/BCS; defers GETCI past offset calculation; removes
@@ -128,9 +134,12 @@ T2       = $0A               ; 16-bit: tertiary scratch word / STMT jump target
 CURLN    = $0C               ; 16-bit: currently-executing line number
 RUN      = $0E               ; 8-bit:  run flag ($00 = immediate, $FF = running)
 OP       = $0F               ; 8-bit:  saved operator for MUL/DIV/MOD ('*'/'/'/'%')
-IBUF     = $10               ; 32-byte input line buffer
-VARS     = $50               ; 52-byte variable store (A-Z, 2 bytes each)
-RUNSP    = $8C               ; 8-bit:  stack-pointer snapshot for GOTO/BREAK unwind
+IBUF     = $10               ; 32-byte input line buffer  ($10-$2F)
+RUNSP    = $30               ; 8-bit:  SP snapshot for GOTO/BREAK unwind
+GSSP     = $31               ; 8-bit:  GOSUB stack pointer (0 = empty, max GS_DEPTH)
+VARS     = $32               ; 52-byte variable store (A-Z, 2 bytes each, $32-$65)
+GS_STK   = $66               ; GOSUB return stack: GS_DEPTH frames x 2 bytes ($66-$75)
+                             ;   frame layout: IP_lo IP_hi  (CURLN reloaded by RUNLP)
 
 ; ---- program store base ------------------------------------------------------
 PROG     = $0200
@@ -141,10 +150,12 @@ ERR_UL   = 1                 ; undefined line number
 ERR_OV   = 2                 ; division or modulo by zero
 ERR_OM   = 3                 ; out of memory
 ERR_UK   = 4                 ; bad variable name in LET
+ERR_GS   = 5                 ; GOSUB stack overflow / RETURN without GOSUB
 
 ; ---- miscellaneous constants -------------------------------------------------
-IBUF_MAX = 31                ; highest valid index into IBUF
-VARS_MAX = $3B               ; highest X index for STZ VARS,X loop ($50..$8B)
+IBUF_MAX = 31                ; highest valid index into IBUF (0-based)
+VARS_MAX = $33               ; highest X index for STZ VARS,X loop ($32..$65, 52 bytes)
+GS_DEPTH = 8                 ; maximum GOSUB nesting depth (8 frames x 2 bytes = 16)
 CR       = $0D               ; ASCII carriage return
 LF       = $0A               ; ASCII line feed
 BS       = $08               ; ASCII backspace
@@ -186,14 +197,14 @@ STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string and keyword addresse
 ; Naming: T_<char>  where <char> is the ASCII letter or symbol.
 T_LF  = 138              ; $0A + $80  (LF  -- final byte of STR_CRLF)
 T_SP  = 160              ; $20 + $80  (' ' -- final byte of STR_IN)
-T_B   = 194		
+T_B   = 194              ; $42 + $80  ('B' -- TAB)
 T_D   = 196              ; $44 + $80  ('D' -- END)
 T_E   = 197              ; $45 + $80  ('E' -- POKE, FREE)
 T_F   = 198              ; $46 + $80  ('F' -- IF)
 T_K   = 203              ; $4B + $80  ('K' -- BREAK, PEEK)
 T_M   = 205              ; $4D + $80  ('M' -- REM)
-T_N   = 206              ; $4E + $80  ('N' -- RUN, THEN)
-T_O   = 207              ; $4F + $80  ('O' -- GOTO)
+T_N   = 206              ; $4E + $80  ('N' -- RUN, THEN, RETURN)
+T_O   = 207              ; $4F + $80  ('O' -- GOTO, GOSUB)
 T_P   = 208              ; $50 + $80  ('P' -- HELP)
 T_R   = 210              ; $52 + $80  ('R' -- USR)
 T_T   = 212              ; $54 + $80  ('T' -- PRINT, LIST, INPUT, LET)
@@ -202,7 +213,7 @@ T_DS  = 164              ; $24 + $80  ('$' -- CHR$)
 
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
-STR_BANNER: .DB "uBASIC v18.3"  ; startup banner; falls into STR_CRLF for CR+LF
+STR_BANNER: .DB "uBASIC v18.4"  ; startup banner; falls into STR_CRLF for CR+LF
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
 STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
@@ -229,6 +240,8 @@ KW_PEEK:    .DB "PEE", T_K
 KW_USR:     .DB "US", T_R
 KW_HELP:    .DB "HEL", T_P
 KW_TAB:	    .DB "TA", T_B
+KW_GOSUB:   .DB "GOSU", T_B   ; must come BEFORE KW_GOTO in ST_TAB (longer match first)
+KW_RETURN:  .DB "RETUR", T_N
 KW_LIST_END:.DB 0             ; $00 end-of-table sentinel for DO_HELP (not a string terminator)
 
 ; =============================================================================
@@ -250,10 +263,12 @@ INIT:
 INIT_Z:  STZ 0,X              ; clear zero-page byte at X (65C02: STZ zp,X)
          DEX
          BPL INIT_Z
+; ---
          LDA #<SHOWCASE_END   ; point PE at end of pre-loaded showcase program
-         STA PE               ; (change to PROG/PROG for no pre-loaded program)
+         STA PE               ; change to DO_NEW for no pre-loaded program)
          LDA #>SHOWCASE_END
          STA PE+1
+; ---
          LDA #<STR_BANNER
          JSR PUTSTR           ; print banner + CR+LF (STR_CRLF follows immediately)
          JSR DO_FREE          ; print free byte count
@@ -931,6 +946,71 @@ DO_GOTO:
 DG_OK:   LDX RUNSP
          TXS                  ; restore SP to pre-statement state (unwinds call stack)
          BRA RUNGO            ; jump into run loop at statement-execute point
+
+; =============================================================================
+; DO_GOSUB  --  GOSUB <linenum>
+;
+;   In:  IP -> line number digits (leading spaces already skipped by STMT)
+;   Out: IP saved to GS_STK frame; IP set to body of target line; GSSP++
+;        Execution continues in subroutine; RETURN restores IP and resumes
+;        at SK_LP (which advances past the GOSUB line's CR then hits RUNLP).
+;   Clobbers: A X T0 IP GSSP GS_STK
+;
+;   Frame layout (2 bytes per frame):
+;     GS_STK + GSSP*2 + 0 : IP lo  (points to CR or ':' after "GOSUB nnn")
+;     GS_STK + GSSP*2 + 1 : IP hi
+;
+;   CURLN is NOT saved: RUNLP reloads it from the next line header on every
+;   iteration, so it is always correct after SK_LP->RUNLP re-enters the loop.
+;
+;   Stack depth check: GSSP must be < GS_DEPTH before pushing.
+;   GOSUB reuses DG_OK from DO_GOTO (unwinds hardware SP via RUNSP, jumps RUNGO).
+; =============================================================================
+DO_GOSUB:
+         LDA GSSP             ; check stack depth before EXPR clobbers A
+         CMP #GS_DEPTH
+         BCS GS_OVF           ; >= GS_DEPTH: overflow
+         ASL                  ; frame byte offset = GSSP * 2
+         TAX                  ; X = GS_STK index (before EXPR clobbers it)
+         PHX                  ; save X across JSR EXPR (65C02 PHX)
+         JSR EXPR             ; parse line number -> T0 (clobbers A X)
+         PLX                  ; restore frame index
+         LDA IP
+         STA GS_STK,X         ; save IP lo
+         LDA IP+1
+         STA GS_STK+1,X       ; save IP hi
+         INC GSSP             ; push frame
+         JSR GOTOL            ; find target: C=0 found (IP=body), C=1 not found
+         BCC DG_OK            ; reuse GOTO's path: unwind SP, jump RUNGO
+         LDA #ERR_UL
+         JMP DO_ERROR
+GS_OVF:  LDA #ERR_GS
+         JMP DO_ERROR
+
+; =============================================================================
+; DO_RETURN  --  RETURN
+;
+;   In:  GSSP > 0
+;   Out: GSSP--; IP restored from GS_STK frame; hardware SP restored to RUNSP;
+;        execution resumes at SK_LP (scans past GOSUB line CR, then RUNLP)
+;   Clobbers: A X IP GSSP
+; =============================================================================
+DO_RETURN:
+         LDA GSSP
+         BEQ GS_UNF           ; GSSP == 0: RETURN without GOSUB
+         DEC GSSP
+         LDA GSSP
+         ASL                  ; frame byte offset = GSSP * 2
+         TAX
+         LDA GS_STK,X         ; restore IP lo
+         STA IP
+         LDA GS_STK+1,X       ; restore IP hi
+         STA IP+1
+         LDX RUNSP
+         TXS                  ; restore hardware SP (unwinds subroutine call frames)
+         BRA SK_LP             ; advance past GOSUB line CR, then loop via RUNLP
+GS_UNF:  LDA #ERR_GS
+         JMP DO_ERROR
 
 ; =============================================================================
 ; DO_RUN  --  RUN  :  execute program starting from the first line
@@ -1763,20 +1843,22 @@ USR_RET: STA T0                ; save A as the 16-bit result lo-byte
 ; absolute addresses rather than zero-page on the first pass.
 ; =============================================================================
 ST_TAB:
-         .DB <KW_PRINT, <DO_PRINT, >DO_PRINT
-         .DB <KW_IF,    <DO_IF,    >DO_IF
-         .DB <KW_GOTO,  <DO_GOTO,  >DO_GOTO
-         .DB <KW_LIST,  <DO_LIST,  >DO_LIST
-         .DB <KW_RUN,   <DO_RUN,   >DO_RUN
-         .DB <KW_NEW,   <DO_NEW,   >DO_NEW
-         .DB <KW_INPUT, <DO_INPUT, >DO_INPUT
-         .DB <KW_REM,   <ST_NOP,   >ST_NOP  ; REM: ST_NOP is the nearest following RTS
-         .DB <KW_END,   <DO_END,   >DO_END
-         .DB <KW_LET,   <DO_LET,   >DO_LET  ; explicit LET keyword (body = implicit path)
-         .DB <KW_POKE,  <DO_POKE,  >DO_POKE
-         .DB <KW_FREE,  <DO_FREE,  >DO_FREE
-         .DB <KW_HELP,  <DO_HELP,  >DO_HELP
-         .DB $FF                             ; sentinel: fall through to implicit assign
+         .DB <KW_PRINT,  <DO_PRINT,  >DO_PRINT
+         .DB <KW_IF,     <DO_IF,     >DO_IF
+         .DB <KW_GOSUB,  <DO_GOSUB,  >DO_GOSUB  ; GOSUB before GOTO: longer match first
+         .DB <KW_GOTO,   <DO_GOTO,   >DO_GOTO
+         .DB <KW_RETURN, <DO_RETURN, >DO_RETURN
+         .DB <KW_LIST,   <DO_LIST,   >DO_LIST
+         .DB <KW_RUN,    <DO_RUN,    >DO_RUN
+         .DB <KW_NEW,    <DO_NEW,    >DO_NEW
+         .DB <KW_INPUT,  <DO_INPUT,  >DO_INPUT
+         .DB <KW_REM,    <ST_NOP,    >ST_NOP    ; REM: ST_NOP is the nearest following RTS
+         .DB <KW_END,    <DO_END,    >DO_END
+         .DB <KW_LET,    <DO_LET,    >DO_LET    ; explicit LET (body = implicit path)
+         .DB <KW_POKE,   <DO_POKE,   >DO_POKE
+         .DB <KW_FREE,   <DO_FREE,   >DO_FREE
+         .DB <KW_HELP,   <DO_HELP,   >DO_HELP
+         .DB $FF                                ; sentinel: fall through to implicit assign
 ; =============================================================================
 ; MTCHKW  --  case-insensitive keyword match at IP
 ;
