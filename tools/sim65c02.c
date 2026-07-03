@@ -1,11 +1,11 @@
 /*
- * sim65c02.c  —  Toy 65C02 simulator  (v7, Mar 2026)
+ * sim65c02.c  —  Toy 65C02 simulator  (v7, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
  * Canonical simulator for:
- *   ubasic.asm    uBASIC v13    (2 KB ROM at $F800-$FFFF)
- *   4kbasic.asm   4K BASIC v11  (4 KB ROM at $F000-$FFFF)
+ *   ubasic.asm    uBASIC     (2 KB ROM at $F800-$FFFF)
+ *   4kbasic.asm   4K BASIC   (4 KB ROM at $F000-$FFFF)
  *
  * Build (requires asm65c02.c in the same directory):
  *   gcc -O2 -o sim65c02 sim65c02.c
@@ -32,14 +32,28 @@
  *                      intended for single-instruction debugging only.
  *   --stats            Print cycle count and key zero-page values on exit.
  *   --load-addr 0xNNNN Override auto-detected load address for .bin files.
+ *   -w 0xADDR          Write watchpoint: log every write to address to stderr,
+ *                      continue running. Repeatable.
+ *   -W 0xADDR          Write watchpoint: log to stderr and halt on first write.
+ *                      Repeatable.\n"
+ *   -m 0xADDR LEN      Dump LEN bytes from address to stderr at exit/halt.
+ *                      Up to 4 -m options.
  *   --help             Print this help and exit.
+ *
+ * Typical invocations:
+ *   ./sim65c02 ubasic13.asm --input "PRINT 42"
+ *   ./sim65c02 4kbasic_v7.asm --input "PRINT 42"
+ *   ./sim65c02 4kbasic_v7.asm --mandelbrot --maxcycles 800000000
+ *   ./sim65c02 4kbasic_v7.asm --plain --input "NEW" --input "10 PRINT 1+1" --input "RUN"
+ *   ./sim65c02 ubasic13.bin --load-addr 0xF800 --input "PRINT 42"
+ *   ./sim65c02 ubasic.asm --plain -w 0x08 -w 0x04 --input \"PRINT 1\" -m 0x08 2
  *
  * File types:
  *   .asm   Assembled in-process via the embedded asm65c02 assembler.
  *   .bin   Loaded as a raw binary.  Load address auto-detected from size:
- *            2 048 bytes → $F800  (uBASIC v13)
- *            4 096 bytes → $F000  (4K BASIC v11)
- *           65 536 bytes → verbatim full-image load
+ *            2048 bytes → $F800  (uBASIC v13)
+ *            4096 bytes → $F000  (4K BASIC v11)
+ *           65536 bytes → verbatim full-image load
  *           other size   → placed at top of 64 KB (0x10000 - size)
  *          Override with --load-addr if needed.
  *
@@ -59,13 +73,6 @@
  *
  * Reset vector at $FFFC/$FFFD is used to set the initial PC on startup.
  *
- * Typical invocations:
- *   ./sim65c02 ubasic13.asm --input "PRINT 42"
- *   ./sim65c02 4kbasic_v7.asm --input "PRINT 42"
- *   ./sim65c02 4kbasic_v7.asm --mandelbrot --maxcycles 800000000
- *   ./sim65c02 4kbasic_v7.asm --plain --input "NEW" --input "10 PRINT 1+1" --input "RUN"
- *   ./sim65c02 ubasic13.bin --load-addr 0xF800 --input "PRINT 42"
- *
  * Version history:
  *   v1  Initial version for microbasic / uBASIC testing.
  *   v2  Added GOSUB/RETURN, FOR/NEXT, 4K BASIC support.
@@ -75,6 +82,7 @@
  *       asm65c02.c is now #included; no Python runtime required.
  *   v6  Header updated: full option docs, --help flag, --plain documented,
  *       corrected project version references (uBASIC v13, 4K BASIC v11).
+ *   v7  Added -w & -W  watches to stderr output
  */
 
 #include <stdio.h>
@@ -119,6 +127,37 @@ uint8_t mem[65536];   /* shared with embedded asm65c02.c */
 /* Pending hardware IRQ: set by write to $E007, consumed by main loop */
 static int pending_irq = 0;
 
+/* ── write watchpoints (-w log-only, -W log+halt) and post-halt dumps (-m) ── */
+#define MAX_WATCH 16
+static uint16_t watch_addr[MAX_WATCH];
+static int      watch_halt[MAX_WATCH];   /* 0 = -w, 1 = -W */
+static int      nwatch = 0;
+static int      watch_triggered  = 0;    /* set when a -W watchpoint fires */
+static uint16_t watch_trigger_addr = 0;
+static uint8_t  watch_trigger_val  = 0;
+static uint16_t watch_trigger_pc   = 0;
+
+#define MAX_DUMP 4
+static uint16_t dump_addr[MAX_DUMP];
+static int      dump_len[MAX_DUMP];
+static int      ndump = 0;
+
+static uint16_t cur_instr_pc = 0;   /* PC of the instruction currently executing; set by step() */
+
+static void check_watch(uint16_t a, uint8_t v) {
+    for (int i = 0; i < nwatch; i++) {
+        if (watch_addr[i] == a) {
+            fprintf(stderr, "[WATCH] $%04X <- $%02X  (PC=$%04X)\n", a, v, cur_instr_pc);
+            if (watch_halt[i] && !watch_triggered) {
+                watch_triggered    = 1;
+                watch_trigger_addr = a;
+                watch_trigger_val  = v;
+                watch_trigger_pc   = cur_instr_pc;
+            }
+        }
+    }
+}
+
 static uint8_t rd(uint16_t a) {
     if (a == 0xE004) {
         /* poll: if char available consume and return it, else 0 */
@@ -130,6 +169,7 @@ static uint8_t rd(uint16_t a) {
 }
 
 static void wr(uint16_t a, uint8_t v) {
+    check_watch(a, v);
     switch (a) {
     case 0xE000:             /* TERMINAL_CLS: clear screen and home cursor */
         if (!plain_mode) { fputs("\033[2J\033[H", stdout); fflush(stdout); }
@@ -169,7 +209,7 @@ typedef struct {
     uint8_t  N, V, D, I, Z, C; /* each 0 or 1 */
 } CPU;
 
-#define PUSH(cpu,v)  mem[0x100 + (cpu)->SP--] = (v)
+#define PUSH(cpu,v)  do { uint8_t _pv=(v); check_watch((uint16_t)(0x100+(cpu)->SP), _pv); mem[0x100 + (cpu)->SP--] = _pv; } while(0)
 #define POP(cpu)     mem[0x100 + ++(cpu)->SP]
 
 static uint8_t pack_flags(CPU *cpu) {
@@ -284,6 +324,7 @@ static long long cycle_count = 0;
 /* returns 0=ok, 1=BRK/unknown */
 static int step(CPU *cpu) {
     uint16_t pc = cpu->PC;
+    cur_instr_pc = pc;
     uint8_t  op = mem[pc];
     cpu->PC++;
     cycle_count++;
@@ -671,12 +712,19 @@ static void sim_usage(FILE *out) {
         "  --verbose          Print every instruction executed (very slow).\n"
         "  --stats            Print cycle count and ZP state on exit.\n"
         "  --load-addr 0xNNNN Override auto-detected load address for .bin files.\n"
+        "  -w 0xADDR          Write watchpoint: log every write to address to stderr,\n"
+        "                     continue running. Repeatable.\n"
+        "  -W 0xADDR          Write watchpoint: log to stderr and halt on first write.\n"
+        "                     Repeatable.\n"
+        "  -m 0xADDR LEN      Dump LEN bytes from address to stderr at exit/halt.\n"
+        "                     Up to 4 -m options.\n"
         "  --help             Print this help and exit.\n"
         "\n"
         "Examples:\n"
         "  sim65c02 ubasic13.asm --input \"PRINT 42\"\n"
         "  sim65c02 4kbasic_v7.asm --mandelbrot --maxcycles 800000000\n"
         "  sim65c02 4kbasic_v7.asm --plain --input \"NEW\" --input \"10 PRINT 1+1\" --input \"RUN\"\n"
+        "  sim65c02 basic.asm --plain -w 0x08 -w 0x04 --input \"PRINT 1\" -m 0x08 2\n"
         "\n"
         "Build:\n"
         "  gcc -O2 -o sim65c02 sim65c02.c      (asm65c02.c must be in same directory)\n"
@@ -715,6 +763,20 @@ int main(int argc, char **argv) {
         else if(!strcmp(argv[i],"--verbose")) { verbose=1; }
         else if(!strcmp(argv[i],"--stats"))   { show_stats=1; }
         else if(!strcmp(argv[i],"--load-addr") && i+1<argc) { bin_load_addr=(uint32_t)strtoul(argv[++i],NULL,0); }
+        else if(!strcmp(argv[i],"-w") && i+1<argc) {
+            if(nwatch<MAX_WATCH){ watch_addr[nwatch]=(uint16_t)strtoul(argv[++i],NULL,0); watch_halt[nwatch]=0; nwatch++; }
+            else { i++; }
+        }
+        else if(!strcmp(argv[i],"-W") && i+1<argc) {
+            if(nwatch<MAX_WATCH){ watch_addr[nwatch]=(uint16_t)strtoul(argv[++i],NULL,0); watch_halt[nwatch]=1; nwatch++; }
+            else { i++; }
+        }
+        else if(!strcmp(argv[i],"-m") && i+2<argc) {
+            uint16_t a=(uint16_t)strtoul(argv[i+1],NULL,0);
+            int len=atoi(argv[i+2]);
+            i+=2;
+            if(ndump<MAX_DUMP && len>0){ dump_addr[ndump]=a; dump_len[ndump]=len; ndump++; }
+        }
         else if(!strcmp(argv[i],"--mandelbrot")) {
             /* showcase is pre-loaded; RUN runs it (Mandelbrot is its final section) */
             const char *cmd="RUN\r";
@@ -784,6 +846,11 @@ int main(int argc, char **argv) {
                     cpu.PC-1,cycles);
             break;
         }
+        if(watch_triggered) {
+            fprintf(stderr,"\n[SIM] Watchpoint halt: $%04X <- $%02X at PC=$%04X after %lld cycles\n",
+                    watch_trigger_addr, watch_trigger_val, watch_trigger_pc, cycles);
+            break;
+        }
         /* hardware IRQ: fire if pending and I flag clear */
         if (pending_irq && !cpu.I) {
             pending_irq = 0;
@@ -801,6 +868,12 @@ int main(int argc, char **argv) {
         fprintf(stderr,"[SIM] Total cycles: %lld\n",cycles);
         fprintf(stderr,"[SIM] ZP dump: IP=%02X%02X PE=%02X%02X RUN=%02X\n",
                 mem[1],mem[0],mem[3],mem[2],mem[0x0E]);
+    }
+    for(int i=0;i<ndump;i++){
+        fprintf(stderr,"[DUMP $%04X len=%d]:", dump_addr[i], dump_len[i]);
+        for(int j=0;j<dump_len[i];j++)
+            fprintf(stderr," %02X", mem[(uint16_t)(dump_addr[i]+j)]);
+        fprintf(stderr,"\n");
     }
     return 0;
 }
