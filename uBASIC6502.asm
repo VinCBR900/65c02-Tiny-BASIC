@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC6502 v1.4  --  2 KB Tiny BASIC (NMOS 6502)
+; uBASIC6502 v1.5  --  2 KB Tiny BASIC (NMOS 6502)
 ;
 ; Derived from uBASIC 65C02 v17.0, refactored for NMOS 6502 mnemonics and
 ; 2-byte keyword-prefix matching while retaining support for conventional
@@ -8,7 +8,7 @@
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Statements accepted (full or 2-letter prefix):
-;   PRINT  IF..THEN  GOTO  LIST  RUN  NEW  INPUT  REM  END  LET  POKE
+;   PRINT FREE IF..THEN  GOTO  LIST  RUN  NEW  INPUT  REM  END  LET  POKE
 ;   (also PR IF GO LI RU NE IN RE EN LE PO)
 ;
 ; Expressions:
@@ -44,9 +44,9 @@
 ;   $0F      OP     MUL/DIV/MOD operator save ('*'/'/'/'%');
 ;                   also used as relop bitmask scratch during EXPR evaluation
 ;   $10-$2F  IBUF   input line buffer (32 bytes)
-;   $30-$4F  --     free RAM
-;   $50-$8B  VARS   A-Z variable store (2 bytes each, 52 bytes total)
-;   $8C      RUNSP  stack-pointer snapshot for GOTO / BREAK unwind
+;   $30-$63  VARS   A-Z variable store (2 bytes each, 52 bytes total)
+;   $64      RUNSP  stack-pointer snapshot for GOTO / BREAK unwind
+;   $65-$FF  --     free RAM
 ;
 ; ---- program storage --------------------------------------------------------
 ;   Base $0200; ceiling RAM_TOP ($1000 for 4 KB SRAM).
@@ -67,6 +67,14 @@
 ;   v17.0 (Mar 2026)  comment cleanup/public release baseline.
 ;
 ; NMOS 6502 branch:
+;   v1.5  (Jul 2026)  68 bytes free before vectors
+;                     Zero-page reorder: every ZP symbol is now contiguous
+;                     ($00-$64) with all free space in one block at the end
+;                     ($65-$FF). No ROM cost (equates only).
+;                     BUGFIX: DELINE returned with LP+1 corrupted (advanced
+;                     by one or more pages) whenever the shifted tail was
+;                     >=256 bytes, causing EDITLN to write the replacement
+;                     line into the wrong page and corrupt memory.
 ;   v1.4  (Jun 2026)  Refactor for size, Added FREE & TAB(n), 75 bytes free for IO
 ;   v1.3  (Apr 2026)  T2DEC subroutine factored from DELINE and INSLINE.
 ;   v1.2  (Apr 2026)  EXPR relational evaluator redesigned: bitmask algorithm.
@@ -96,7 +104,7 @@
 ; ---- hardware I/O ports (Kowalski simulator UART) ----------------------------
 IO_OUT   = $E001             ; UART output: write character to terminal
 IO_IN    = $E004             ; UART input:  read character (0 = no char ready)
-IO_IRQ   = $E007             ; write any value to fire a maskable hardware IRQ
+IO_IRQ   = $E007             ; Sim only write a value to fire maskable IRQ
 
 ; ---- RAM ceiling -------------------------------------------------------------
 RAM_TOP  = $1000             ; first address above usable SRAM (4 KB)
@@ -112,8 +120,8 @@ CURLN    = $0C               ; 16-bit: currently-executing line number
 RUN      = $0E               ; 8-bit:  run flag ($00 = immediate, $FF = running)
 OP       = $0F               ; 8-bit:  saved operator for MUL/DIV/MOD ('*'/'/'/'%')
 IBUF     = $10               ; 32-byte input line buffer
-VARS     = $50               ; 52-byte variable store (A-Z, 2 bytes each)
-RUNSP    = $8C               ; 8-bit:  stack-pointer snapshot for GOTO/BREAK unwind
+VARS     = $30               ; A-Z variable store (2 bytes each), 52 bytes ($30-$63)
+RUNSP    = $64               ; 8-bit:  stack-pointer snapshot for GOTO/BREAK unwind
 
 ; ---- program store base ------------------------------------------------------
 PROG     = $0200
@@ -127,7 +135,7 @@ ERR_UK   = 4                 ; bad variable name in LET
 
 ; ---- miscellaneous constants -------------------------------------------------
 IBUF_MAX = 31                ; highest valid index into IBUF
-VARS_MAX = $3B               ; highest X index for variable clear loop ($50..$8B)
+VARS_MAX = $33               ; highest X index for variable clear loop ($30..$63)
 CR       = $0D               ; ASCII carriage return
 LF       = $0A               ; ASCII line feed
 BS       = $08               ; ASCII backspace
@@ -150,14 +158,9 @@ ROMSTART:
 ; when reading keyword bytes by (T1),Y.
 ;
 ; TERMINATION: the last byte of every string has bit 7 set (value |= $80).
-;   PUTSTR strips bit 7 with AND #$7F before printing the final character.
-;   All string content is 7-bit ASCII so bit 7 never occurs naturally --
-;   the scheme is unambiguous.
 ;
 ; Named T_x constants are used for bit-7-set final characters because the
-; Kowalski assembler cannot evaluate "ch"|$80 inside a .DB argument.  Each
-; constant is simply the ASCII value plus 128 (addition equals OR here since
-; all base characters are below $80).
+; Kowalski assembler cannot evaluate "ch"|$80 inside a .DB argument.
 ; =============================================================================
 STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string and keyword addresses
 
@@ -184,7 +187,7 @@ T_DS  = 164              ; $24 + $80  ('$' -- CHR$)
 
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
-STR_BANNER: .DB "uBASIC6502 v1.4 "  ; startup banner, rolls into free
+STR_BANNER: .DB "uBASIC6502 v1.5 "  ; startup banner, rolls into free
 STR_FREE:   .DB "Free", T_SP
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
@@ -320,7 +323,6 @@ PV_FAIL: SEC
 ;        if RUN == 0: silently ignored (RTI)
 ;   Clobbers: A X  (stack deliberately abandoned when running)
 ;
-;   Triggered by writing any value to IO_IRQ ($E007) -- the "Break" key.
 ;   When a program is running: restores the stack to RUNSP (unwinding all
 ;   call frames), prints "\r\nBREAK IN <linenum>\r\n", then jumps to MAIN.
 ;   The program store is left intact; the user can LIST or RUN again.
@@ -490,11 +492,22 @@ T2D_LO:  DEC T2
 ;
 ;   In:  LP -> start of line to delete (the line-number lo byte)
 ;        PE -> one past the last program byte
-;   Out: line removed; PE decremented by line length
+;   Out: line removed; PE decremented by line length; LP restored to its
+;        original (In:) value -- EDITLN/INSLINE depend on this being intact
 ;   Clobbers: A X Y T0 T1 T2 PE
 ;
 ;   Measures the line length by scanning for CR (starting at body offset 2),
 ;   then shifts all subsequent bytes forward to close the gap.
+;
+;   BUGFIX v1.5: DL_CP uses LP as the live destination pointer and must bump
+;   LP+1 on every Y-wrap to track the copy across page boundaries -- that part
+;   is required. The bug was that nothing undid it afterward: whenever the
+;   shifted tail was >=256 bytes, DELINE returned with LP+1 one or more pages
+;   too high, and EDITLN's subsequent INSLINE wrote the replacement line into
+;   the wrong page, corrupting whatever was there. Fixed by stashing the
+;   original LP+1 in T1+1 (dead for the whole routine -- line length never
+;   exceeds IBUF's 32 bytes, so T1's high byte is otherwise unused) and
+;   restoring it once the copy is done.
 ; =============================================================================
 DELINE:
          LDY #2
@@ -520,6 +533,8 @@ DL_LL:   LDA (LP),Y           ; scan body + CR
          LDA T2
          ORA T2+1
          BEQ DL_UPD           ; nothing to shift -- just update PE
+         LDA LP+1             ; save LP hi -- loop below advances it across pages
+         STA T1+1
          LDY #0
 DL_CP:   LDA (T0),Y           ; forward copy: (T0),Y -> (LP),Y
          STA (LP),Y
@@ -529,6 +544,8 @@ DL_CP:   LDA (T0),Y           ; forward copy: (T0),Y -> (LP),Y
          INC LP+1
 DL_NHI:  JSR T2DEC            ; decrement T2; Z=1 when zero
          BNE DL_CP
+         LDA T1+1             ; restore LP hi for the caller (EDITLN/INSLINE)
+         STA LP+1
 DL_UPD:  LDA PE               ; PE -= line length
          SEC
          SBC T1
