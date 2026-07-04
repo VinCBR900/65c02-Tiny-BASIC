@@ -374,6 +374,9 @@ static int step(CPU *cpu) {
     case 0xA4: cpu->Y=RD(ZP);    cpu->PC+=1; set_nz(cpu,cpu->Y); return 0;
     case 0xB4: cpu->Y=RD(ZPX);   cpu->PC+=1; set_nz(cpu,cpu->Y); return 0;
     case 0xAC: cpu->Y=RD(ABS);   cpu->PC+=2; set_nz(cpu,cpu->Y); return 0;
+    /* v8: LDY abs,X -- newly reachable now that asm65c02.c (v1.9) can
+     * emit it; previously unassemblable so unneeded here. */
+    case 0xBC: cpu->Y=RD(ABSX);  cpu->PC+=2; set_nz(cpu,cpu->Y); return 0;
 
     /* ── STA ── */
     case 0x85: WR(ZP,   cpu->A); cpu->PC+=1; return 0;
@@ -489,6 +492,10 @@ static int step(CPU *cpu) {
     case 0xCD: do_cmp(cpu,cpu->A,RD(ABS));  cpu->PC+=2; return 0;
     case 0xD1: do_cmp(cpu,cpu->A,RD(INDY)); cpu->PC+=1; return 0;
     case 0xDD: do_cmp(cpu,cpu->A,RD(ABSX)); cpu->PC+=2; return 0;
+    /* v8: CMP abs,Y and CMP (zp,X) -- newly reachable now that asm65c02.c
+     * (v1.9) can emit them; previously unassemblable so unneeded here. */
+    case 0xD9: do_cmp(cpu,cpu->A,RD(ABSY)); cpu->PC+=2; return 0;
+    case 0xC1: do_cmp(cpu,cpu->A,RD(INDX)); cpu->PC+=1; return 0;
 
     /* ── CPX ── */
     case 0xE0: do_cmp(cpu,cpu->X,IMM);    cpu->PC+=1; return 0;
@@ -524,18 +531,25 @@ static int step(CPU *cpu) {
     case 0x46: { uint8_t v=mem[ZP]; cpu->C=v&1; v>>=1; WR(ZP,v); cpu->PC+=1; set_nz(cpu,v); return 0; }
     case 0x56: { uint8_t v=mem[ZPX];cpu->C=v&1; v>>=1; WR(ZPX,v);cpu->PC+=1; set_nz(cpu,v); return 0; }
     case 0x4E: { uint8_t v=RD(ABS); cpu->C=v&1; v>>=1; WR(ABS,v);cpu->PC+=2; set_nz(cpu,v); return 0; }
+    /* v8: LSR abs,X -- newly reachable now that asm65c02.c (v1.9) can
+     * emit it; previously unassemblable so unneeded here. */
+    case 0x5E: { uint8_t v=RD(ABSX);cpu->C=v&1; v>>=1; WR(ABSX,v);cpu->PC+=2;set_nz(cpu,v); return 0; }
 
     /* ── ROL ── */
     case 0x2A: { uint8_t c=cpu->C; cpu->C=cpu->A>>7; cpu->A=(cpu->A<<1)|c; set_nz(cpu,cpu->A); return 0; }
     case 0x26: { uint8_t v=mem[ZP]; uint8_t c=cpu->C; cpu->C=v>>7; v=(v<<1)|c; WR(ZP,v); cpu->PC+=1; set_nz(cpu,v); return 0; }
     case 0x36: { uint8_t v=mem[ZPX];uint8_t c=cpu->C; cpu->C=v>>7; v=(v<<1)|c; WR(ZPX,v);cpu->PC+=1; set_nz(cpu,v); return 0; }
     case 0x2E: { uint8_t v=RD(ABS); uint8_t c=cpu->C; cpu->C=v>>7; v=(v<<1)|c; WR(ABS,v);cpu->PC+=2; set_nz(cpu,v); return 0; }
+    /* v8: ROL abs,X -- see LSR abs,X note above. */
+    case 0x3E: { uint8_t v=RD(ABSX);uint8_t c=cpu->C; cpu->C=v>>7; v=(v<<1)|c; WR(ABSX,v);cpu->PC+=2; set_nz(cpu,v); return 0; }
 
     /* ── ROR ── */
     case 0x6A: { uint8_t c=cpu->C; cpu->C=cpu->A&1; cpu->A=(cpu->A>>1)|(c<<7); set_nz(cpu,cpu->A); return 0; }
     case 0x66: { uint8_t v=mem[ZP]; uint8_t c=cpu->C; cpu->C=v&1; v=(v>>1)|(c<<7); WR(ZP,v); cpu->PC+=1; set_nz(cpu,v); return 0; }
     case 0x76: { uint8_t v=mem[ZPX];uint8_t c=cpu->C; cpu->C=v&1; v=(v>>1)|(c<<7); WR(ZPX,v);cpu->PC+=1; set_nz(cpu,v); return 0; }
     case 0x6E: { uint8_t v=RD(ABS); uint8_t c=cpu->C; cpu->C=v&1; v=(v>>1)|(c<<7); WR(ABS,v);cpu->PC+=2; set_nz(cpu,v); return 0; }
+    /* v8: ROR abs,X -- see LSR abs,X note above. */
+    case 0x7E: { uint8_t v=RD(ABSX);uint8_t c=cpu->C; cpu->C=v&1; v=(v>>1)|(c<<7); WR(ABSX,v);cpu->PC+=2; set_nz(cpu,v); return 0; }
 
     /* ── BIT ── */
     case 0x24: { uint8_t v=mem[ZP];  cpu->Z=((cpu->A&v)==0); cpu->N=(v>>7); cpu->V=(v>>6)&1; cpu->PC+=1; return 0; }
