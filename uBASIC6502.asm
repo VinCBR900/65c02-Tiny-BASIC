@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC6502 v1.7 
+; uBASIC6502 v1.8 
 ;
 ; 16 bit signed Tiny BASIC interpreter for NMOS 6502 and 2kbyte 2716 EPROM.
 ;
@@ -14,6 +14,8 @@
 ;
 ; Numbers      : signed 16-bit  (-32768 .. 32767)
 ; String print : "literals", `;`, TAB(n) and CHR$() only; no string variables
+;
+; NOTE: Line input buffer is 32 chars, Multi-Statement `:` not supported.
 ;
 ; Error codes (printed as "?N"):
 ;   ?0  syntax / bad expression
@@ -31,7 +33,12 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ;
-; v1.7 (Jul 2026) 58 bytes free before vectors
+; v1.8 (Jul 2026) 76 bytes free before vectors
+;   - REMOVED incomplete multi-statement (':') support - too many edge cases. 
+;     DO_RETURN refactored, Showcase program rewritten in mixed format and .
+;     exercise GOSUB/RETURN (incl. nesting), TAB, FREE, and POKE/PEEK.
+;
+; v1.7 (Jul 2026) 51 bytes free before vectors
 ;   - FIXED: GOSUB degraded to GOTO,due to EXPR overwritten
 ;   - FIXED: Replacing existing line inserted at end of the program instead of 
 ;     in place, fixed by save/restore LP. 
@@ -127,67 +134,103 @@ PROG     = HWSTACK+$101      ; May be lower if we use a smaller Stack
          JMP INIT
 
 ; =============================================================================
-; Pre-loaded showcase program  
+; Pre-loaded showcase program
 ;
-;   Stored as raw ASCII.  Line format: <lineno_lo> <lineno_hi> <body> <CR>
+;   Stored as raw ASCII, mixed .DB format: <lineno_lo>,<lineno_hi>,"text",CR
+;   Runs of plain characters are quoted strings; a literal `"` or `;` in the
+;   BASIC text is emitted as a raw byte ($22 / $3B) instead of inside the
+;   quotes -- `"` would terminate the assembler's own string literal, and
+;   `;` would start an assembler comment and swallow the rest of the line.
+;   One statement per line throughout -- this interpreter does not support
+;   multi-statement (':') lines (removed in v1.8, see STMT's header).
 ;
-;   Lines  10-260: feature demos (PRINT, CHR$, arithmetic, comparisons, loops)
-;   Lines 270-480: Mandelbrot set renderer
+;   Lines  10-130: PRINT, CHR$, arithmetic, comparisons
+;   Lines 140-240: GOSUB/RETURN (incl. nested)
+;   Lines 250-430: GOTO loop, nested GOTO loop
+;   Lines 440-500: TAB, FREE, POKE/PEEK
+;   Lines 510-760: Mandelbrot set renderer
 ;
-;   v1.1: Mandelbrot column scan adjusted from -128..16 to -120..4 for a
-;         better-centred render.
+;   v1.8: rewrote in the mixed .DB/string format above (was fully hex-coded);
+;         added GOSUB/RETURN, TAB, FREE, and POKE/PEEK sections
 ; =============================================================================
          .ORG PROG
 
-         .DB $0A,$00,$52,$45,$4D,$20,$75,$42,$41,$53,$49,$43,$20,$76,$31,$33,$20,$2D,$20,$53,$48,$4F,$57,$43,$41,$53,$45,$0D  ; 10 REM uBASIC v13 - SHOWCASE
-         .DB $14,$00,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$20,$75,$42,$41,$53,$49,$43,$20,$76,$31,$33,$20,$53,$48,$4F,$57,$43,$41,$53,$45,$20,$2D,$2D,$22,$0D  ; 20 PRINT "-- uBASIC v13 SHOWCASE --"
-         .DB $1E,$00,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$50,$52,$49,$4E,$54,$20,$2F,$20,$43,$48,$52,$24,$20,$2D,$2D,$2D,$22,$0D  ; 30 PRINT "--- PRINT / CHR$ ---"
-         .DB $28,$00,$50,$52,$49,$4E,$54,$20,$43,$48,$52,$24,$28,$36,$35,$29,$3B,$43,$48,$52,$24,$28,$36,$36,$29,$3B,$43,$48,$52,$24,$28,$36,$37,$29,$0D  ; 40 PRINT CHR$(65);CHR$(66);CHR$(67)
-         .DB $32,$00,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$41,$52,$49,$54,$48,$4D,$45,$54,$49,$43,$20,$2D,$2D,$2D,$22,$0D  ; 50 PRINT "--- ARITHMETIC ---"
-         .DB $3C,$00,$50,$52,$49,$4E,$54,$20,$22,$33,$2B,$34,$3D,$22,$3B,$33,$2B,$34,$3B,$22,$20,$20,$31,$30,$2D,$33,$3D,$22,$3B,$31,$30,$2D,$33,$3B,$22,$20,$20,$36,$2A,$37,$3D,$22,$3B,$36,$2A,$37,$0D  ; 60 PRINT "3+4=";3+4;"  10-3=";10-3;"  6*7=";6*7
-         .DB $46,$00,$50,$52,$49,$4E,$54,$20,$22,$32,$30,$2F,$34,$3D,$22,$3B,$32,$30,$2F,$34,$3B,$22,$20,$20,$31,$37,$25,$35,$3D,$22,$3B,$31,$37,$25,$35,$0D  ; 70 PRINT "20/4=";20/4;"  17%5=";17%5
-         .DB $50,$00,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$43,$4F,$4D,$50,$41,$52,$49,$53,$4F,$4E,$53,$20,$2D,$2D,$2D,$22,$0D  ; 80 PRINT "--- COMPARISONS ---"
-         .DB $5A,$00,$49,$46,$20,$35,$3E,$33,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$35,$3E,$33,$20,$6F,$6B,$22,$0D  ; 90 IF 5>3 THEN PRINT "5>3 ok"
-         .DB $64,$00,$49,$46,$20,$33,$3C,$35,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$33,$3C,$35,$20,$6F,$6B,$22,$0D  ; 100 IF 3<5 THEN PRINT "3<5 ok"
-         .DB $6E,$00,$49,$46,$20,$33,$3E,$3D,$33,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$33,$3E,$3D,$33,$20,$6F,$6B,$22,$0D  ; 110 IF 3>=3 THEN PRINT "3>=3 ok"
-         .DB $78,$00,$49,$46,$20,$34,$3C,$3E,$33,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$34,$3C,$3E,$33,$20,$6F,$6B,$22,$0D  ; 120 IF 4<>3 THEN PRINT "4<>3 ok"
-         .DB $82,$00,$49,$46,$20,$33,$3D,$33,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$33,$3D,$33,$20,$6F,$6B,$22,$0D  ; 130 IF 3=3 THEN PRINT "3=3 ok"
-         .DB $8C,$00,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$4C,$4F,$4F,$50,$20,$76,$69,$61,$20,$47,$4F,$54,$4F,$20,$2D,$2D,$2D,$22,$0D  ; 140 PRINT "--- LOOP via GOTO ---"
-         .DB $96,$00,$49,$3D,$31,$0D  ; 150 I=1
-         .DB $A0,$00,$49,$46,$20,$49,$3E,$35,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$31,$39,$30,$0D  ; 160 IF I>5 THEN GOTO 190
-         .DB $AA,$00,$50,$52,$49,$4E,$54,$20,$49,$3B,$0D  ; 170 PRINT I;
-         .DB $B4,$00,$49,$3D,$49,$2B,$31,$3A,$47,$4F,$54,$4F,$20,$31,$36,$30,$0D  ; 180 I=I+1:GOTO 160
-         .DB $BE,$00,$50,$52,$49,$4E,$54,$20,$22,$22,$0D  ; 190 PRINT ""
-         .DB $C8,$00,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$4E,$45,$53,$54,$45,$44,$20,$4C,$4F,$4F,$50,$20,$2D,$2D,$2D,$22,$0D  ; 200 PRINT "--- NESTED LOOP ---"
-         .DB $D2,$00,$49,$3D,$31,$0D  ; 210 I=1
-         .DB $DC,$00,$49,$46,$20,$49,$3E,$33,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$32,$37,$30,$0D  ; 220 IF I>3 THEN GOTO 270
-         .DB $E6,$00,$4A,$3D,$31,$0D  ; 230 J=1
-         .DB $F0,$00,$49,$46,$20,$4A,$3E,$33,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$32,$36,$30,$0D  ; 240 IF J>3 THEN GOTO 260
-         .DB $FA,$00,$50,$52,$49,$4E,$54,$20,$4A,$3B,$0D  ; 250 PRINT J;
-         .DB $FF,$00,$4A,$3D,$4A,$2B,$31,$3A,$47,$4F,$54,$4F,$20,$32,$34,$30,$0D  ; 255 J=J+1:GOTO 240
-         .DB $04,$01,$50,$52,$49,$4E,$54,$20,$22,$22,$3A,$49,$3D,$49,$2B,$31,$3A,$47,$4F,$54,$4F,$20,$32,$32,$30,$0D  ; 260 PRINT "":I=I+1:GOTO 220
-         .DB $0E,$01,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$4D,$41,$4E,$44,$45,$4C,$42,$52,$4F,$54,$20,$2D,$2D,$2D,$22,$0D  ; 270 PRINT "--- MANDELBROT ---"
-         .DB $18,$01,$49,$3D,$2D,$36,$34,$0D  ; 280 I=-64
-         .DB $22,$01,$49,$46,$20,$49,$3E,$35,$36,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$34,$38,$30,$0D  ; 290 IF I>56 THEN GOTO 480
-         .DB $2C,$01,$44,$3D,$49,$0D  ; 300 D=I
-; v1.1: line 310 C=-120 (was -128), line 320 C>4 (was C>16) — better-centred render
-         .DB $36,$01,$43,$3D,$2D,$31,$32,$30,$0D  ; 310 C=-120
-         .DB $40,$01,$49,$46,$20,$43,$3E,$34,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$34,$35,$30,$0D  ; 320 IF C>4 THEN GOTO 450
-         .DB $4A,$01,$41,$3D,$43,$3A,$42,$3D,$44,$3A,$45,$3D,$30,$3A,$4E,$3D,$31,$0D  ; 330 A=C:B=D:E=0:N=1
-         .DB $54,$01,$49,$46,$20,$4E,$3E,$31,$36,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$33,$39,$30,$0D  ; 340 IF N>16 THEN GOTO 390
-         .DB $5E,$01,$49,$46,$20,$45,$3E,$30,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$33,$38,$30,$0D  ; 350 IF E>0 THEN GOTO 380
-         .DB $68,$01,$54,$3D,$41,$2A,$41,$2F,$36,$34,$2D,$42,$2A,$42,$2F,$36,$34,$2B,$43,$0D  ; 360 T=A*A/64-B*B/64+C
-         .DB $72,$01,$42,$3D,$32,$2A,$41,$2A,$42,$2F,$36,$34,$2B,$44,$3A,$41,$3D,$54,$0D  ; 370 B=2*A*B/64+D:A=T
-         .DB $7C,$01,$49,$46,$20,$41,$2A,$41,$2F,$36,$34,$2B,$42,$2A,$42,$2F,$36,$34,$3E,$32,$35,$36,$20,$54,$48,$45,$4E,$20,$49,$46,$20,$45,$3D,$30,$20,$54,$48,$45,$4E,$20,$45,$3D,$4E,$0D  ; 380 IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N
-         .DB $86,$01,$4E,$3D,$4E,$2B,$31,$3A,$49,$46,$20,$4E,$3C,$3D,$31,$36,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$33,$34,$30,$0D  ; 390 N=N+1:IF N<=16 THEN GOTO 340
-         .DB $90,$01,$49,$46,$20,$45,$3E,$30,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$43,$48,$52,$24,$28,$45,$2B,$33,$32,$29,$3B,$0D  ; 400 IF E>0 THEN PRINT CHR$(E+32);
-         .DB $9A,$01,$49,$46,$20,$45,$3D,$30,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$43,$48,$52,$24,$28,$33,$32,$29,$3B,$0D  ; 410 IF E=0 THEN PRINT CHR$(32);
-         .DB $A4,$01,$43,$3D,$43,$2B,$34,$0D  ; 420 C=C+4
-         .DB $AE,$01,$47,$4F,$54,$4F,$20,$33,$32,$30,$0D  ; 430 GOTO 320
-         .DB $C2,$01,$50,$52,$49,$4E,$54,$20,$22,$22,$0D  ; 450 PRINT ""
-         .DB $CC,$01,$49,$3D,$49,$2B,$36,$0D  ; 460 I=I+6
-         .DB $D6,$01,$47,$4F,$54,$4F,$20,$32,$39,$30,$0D  ; 470 GOTO 290
-         .DB $E0,$01,$45,$4E,$44,$0D  ; 480 END
+         .DB $0A,$00,"REM uBASIC v1.8 - SHOWCASE",CR        ; 10 REM uBASIC v1.8 - SHOWCASE
+         .DB $14,$00,"PRINT ",$22,"-- uBASIC v1.8 SHOWCASE --",$22,CR ; 20 PRINT "-- uBASIC v1.8 SHOWCASE --"
+         .DB $1E,$00,"PRINT ",$22,"--- PRINT / CHR$ ---",$22,CR ; 30 PRINT "--- PRINT / CHR$ ---"
+         .DB $28,$00,"PRINT CHR$(65)",$3B,"CHR$(66)",$3B,"CHR$(67)",CR ; 40 PRINT CHR$(65);CHR$(66);CHR$(67)
+         .DB $32,$00,"PRINT ",$22,"--- ARITHMETIC ---",$22,CR ; 50 PRINT "--- ARITHMETIC ---"
+         .DB $3C,$00,"PRINT ",$22,"3+4=",$22,$3B,"3+4",$3B,$22,"  10-3=",$22,$3B,"10-3",$3B,$22,"  6*7=",$22,$3B,"6*7",CR ; 60 PRINT "3+4=";3+4;"  10-3=";10-3;"  6*7=";6*7
+         .DB $46,$00,"PRINT ",$22,"20/4=",$22,$3B,"20/4",$3B,$22,"  17%5=",$22,$3B,"17%5",CR ; 70 PRINT "20/4=";20/4;"  17%5=";17%5
+         .DB $50,$00,"PRINT ",$22,"--- COMPARISONS ---",$22,CR ; 80 PRINT "--- COMPARISONS ---"
+         .DB $5A,$00,"IF 5>3 THEN PRINT ",$22,"5>3 ok",$22,CR ; 90 IF 5>3 THEN PRINT "5>3 ok"
+         .DB $64,$00,"IF 3<5 THEN PRINT ",$22,"3<5 ok",$22,CR ; 100 IF 3<5 THEN PRINT "3<5 ok"
+         .DB $6E,$00,"IF 3>=3 THEN PRINT ",$22,"3>=3 ok",$22,CR ; 110 IF 3>=3 THEN PRINT "3>=3 ok"
+         .DB $78,$00,"IF 4<>3 THEN PRINT ",$22,"4<>3 ok",$22,CR ; 120 IF 4<>3 THEN PRINT "4<>3 ok"
+         .DB $82,$00,"IF 3=3 THEN PRINT ",$22,"3=3 ok",$22,CR ; 130 IF 3=3 THEN PRINT "3=3 ok"
+         .DB $8C,$00,"PRINT ",$22,"--- GOSUB/RETURN ---",$22,CR ; 140 PRINT "--- GOSUB/RETURN ---"
+         .DB $96,$00,"GOSUB 200",CR                         ; 150 GOSUB 200
+         .DB $A0,$00,"PRINT ",$22,"back from depth 1, X=",$22,$3B,"X",CR ; 160 PRINT "back from depth 1, X=";X
+         .DB $AA,$00,"GOSUB 220",CR                         ; 170 GOSUB 220
+         .DB $B4,$00,"PRINT ",$22,"back from depth 2, X=",$22,$3B,"X",CR ; 180 PRINT "back from depth 2, X=";X
+         .DB $BE,$00,"GOTO 250",CR                          ; 190 GOTO 250
+         .DB $C8,$00,"X=1",CR                               ; 200 X=1
+         .DB $D2,$00,"RETURN",CR                            ; 210 RETURN
+         .DB $DC,$00,"GOSUB 200",CR                         ; 220 GOSUB 200
+         .DB $E6,$00,"X=X+1",CR                             ; 230 X=X+1
+         .DB $F0,$00,"RETURN",CR                            ; 240 RETURN
+         .DB $FA,$00,"PRINT ",$22,"--- LOOP via GOTO ---",$22,CR ; 250 PRINT "--- LOOP via GOTO ---"
+         .DB $04,$01,"I=1",CR                               ; 260 I=1
+         .DB $0E,$01,"IF I>5 THEN GOTO 310",CR              ; 270 IF I>5 THEN GOTO 310
+         .DB $18,$01,"PRINT I",$3B,CR                       ; 280 PRINT I;
+         .DB $22,$01,"I=I+1",CR                             ; 290 I=I+1
+         .DB $2C,$01,"GOTO 270",CR                          ; 300 GOTO 270
+         .DB $36,$01,"PRINT ",$22,$22,CR                    ; 310 PRINT ""
+         .DB $40,$01,"PRINT ",$22,"--- NESTED LOOP ---",$22,CR ; 320 PRINT "--- NESTED LOOP ---"
+         .DB $4A,$01,"I=1",CR                               ; 330 I=1
+         .DB $54,$01,"IF I>3 THEN GOTO 430",CR              ; 340 IF I>3 THEN GOTO 430
+         .DB $5E,$01,"J=1",CR                               ; 350 J=1
+         .DB $68,$01,"IF J>3 THEN GOTO 400",CR              ; 360 IF J>3 THEN GOTO 400
+         .DB $72,$01,"PRINT J",$3B,CR                       ; 370 PRINT J;
+         .DB $7C,$01,"J=J+1",CR                             ; 380 J=J+1
+         .DB $86,$01,"GOTO 360",CR                          ; 390 GOTO 360
+         .DB $90,$01,"PRINT ",$22,$22,CR                    ; 400 PRINT ""
+         .DB $9A,$01,"I=I+1",CR                             ; 410 I=I+1
+         .DB $A4,$01,"GOTO 340",CR                          ; 420 GOTO 340
+         .DB $AE,$01,"REM nested loop done",CR              ; 430 REM nested loop done
+         .DB $B8,$01,"PRINT ",$22,"--- TAB / FREE ---",$22,CR ; 440 PRINT "--- TAB / FREE ---"
+         .DB $C2,$01,"PRINT ",$22,"col1",$22,$3B,"TAB(3)",$3B,$22,"col2",$22,$3B,"TAB(3)",$3B,$22,"col3",$22,CR ; 450 PRINT "col1";TAB(3);"col2";TAB(3);"col3"
+         .DB $CC,$01,"PRINT ",$22,"bytes free:",$22,CR      ; 460 PRINT "bytes free:"
+         .DB $D6,$01,"FREE",CR                              ; 470 FREE
+         .DB $E0,$01,"PRINT ",$22,"--- POKE / PEEK ---",$22,CR ; 480 PRINT "--- POKE / PEEK ---"
+         .DB $EA,$01,"POKE 900,42",CR                       ; 490 POKE 900,42
+         .DB $F4,$01,"PRINT ",$22,"poked 42, read back ",$22,$3B,"PEEK(900)",CR ; 500 PRINT "poked 42, read back ";PEEK(900)
+         .DB $FE,$01,"PRINT ",$22,"--- MANDELBROT ---",$22,CR ; 510 PRINT "--- MANDELBROT ---"
+         .DB $08,$02,"I=-64",CR                             ; 520 I=-64
+         .DB $12,$02,"IF I>56 THEN GOTO 760",CR             ; 530 IF I>56 THEN GOTO 760
+         .DB $1C,$02,"D=I",CR                               ; 540 D=I
+         .DB $26,$02,"C=-120",CR                            ; 550 C=-120
+         .DB $30,$02,"IF C>4 THEN GOTO 730",CR              ; 560 IF C>4 THEN GOTO 730
+         .DB $3A,$02,"A=C",CR                               ; 570 A=C
+         .DB $44,$02,"B=D",CR                               ; 580 B=D
+         .DB $4E,$02,"E=0",CR                               ; 590 E=0
+         .DB $58,$02,"N=1",CR                               ; 600 N=1
+         .DB $62,$02,"IF N>16 THEN GOTO 690",CR             ; 610 IF N>16 THEN GOTO 690
+         .DB $6C,$02,"IF E>0 THEN GOTO 670",CR              ; 620 IF E>0 THEN GOTO 670
+         .DB $76,$02,"T=A*A/64-B*B/64+C",CR                 ; 630 T=A*A/64-B*B/64+C
+         .DB $80,$02,"B=2*A*B/64+D",CR                      ; 640 B=2*A*B/64+D
+         .DB $8A,$02,"A=T",CR                               ; 650 A=T
+         .DB $94,$02,"IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N",CR ; 660 IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N
+         .DB $9E,$02,"N=N+1",CR                             ; 670 N=N+1
+         .DB $A8,$02,"IF N<=16 THEN GOTO 610",CR            ; 680 IF N<=16 THEN GOTO 610
+         .DB $B2,$02,"IF E>0 THEN PRINT CHR$(E+32)",$3B,CR  ; 690 IF E>0 THEN PRINT CHR$(E+32);
+         .DB $BC,$02,"IF E=0 THEN PRINT CHR$(32)",$3B,CR    ; 700 IF E=0 THEN PRINT CHR$(32);
+         .DB $C6,$02,"C=C+4",CR                             ; 710 C=C+4
+         .DB $D0,$02,"GOTO 560",CR                          ; 720 GOTO 560
+         .DB $DA,$02,"PRINT ",$22,$22,CR                    ; 730 PRINT ""
+         .DB $E4,$02,"I=I+6",CR                             ; 740 I=I+6
+         .DB $EE,$02,"GOTO 530",CR                          ; 750 GOTO 530
+         .DB $F8,$02,"END",CR                               ; 760 END
 SHOWCASE_END:
 
 ; =============================================================================
@@ -290,7 +333,7 @@ INIT_Z:  STA 0,X              ; clear zero-page byte at X
 ;   Clobbers: everything (infinite loop)
 ;
 ;   Reads one line from the terminal.  Lines that start with a digit are
-;   routed to EDITLN (program store editor); else executed via STMT_LINE 
+;   routed to EDITLN (program store editor); else executed via STMT
 ; =============================================================================
 MAIN:
          LDX #HWSTACK
@@ -308,7 +351,7 @@ MAIN:
          JSR EDITLN           ; digit: store / delete numbered line
          JMP MAIN
 MAIN_DIR:
-         JSR STMT_LINE        ; execute as immediate statement
+         JSR STMT              ; execute as immediate statement
          JMP MAIN
 
 ; =============================================================================
@@ -880,17 +923,6 @@ LS_EOL:  JSR PRNL              ; print CR+LF at end of each listed line
 ;
 ;   3rd char 'S' (case-insensitive) selects GOSUB; anything else -- including
 ;   the full word "GOTO" -- falls through as plain GOTO.
-;
-;   BUGFIX: the 3rd-char peek must happen BEFORE "JSR EXPR" below, not after.
-;   EXPR2 unconditionally tries MTCHKW against "CHR$"/"PEEK"/"USR" for every
-;   atom -- including a plain number -- and MTCHKW's first action is always
-;   "LP = IP", regardless of whether the match succeeds. So by the time EXPR
-;   returns, LP no longer points at "GOTO"/"GOSUB" at all; it points wherever
-;   EXPR's own atom parsing last left it. Peeking (LP),Y afterward reads
-;   garbage relative to the keyword, which is why GOSUB was silently
-;   degrading to a plain GOTO (no frame pushed) -- confirmed via sim65c02:
-;   "10 GOSUB 100" / "100 PRINT 1" / "110 RETURN" prints 1, then errors
-;   "?5 IN 110" (RETURN without GOSUB) because no frame was ever pushed.
 ; =============================================================================
 DO_GO:
          LDY #2
@@ -942,7 +974,7 @@ DO_ERR_GS:  LDA #ERR_RET         ; RETURN without GOSUB
 ;        NOTE: IP and CURLN must be sequential in Zero Page.
 ;   Out: REM: no-op.  RETURN: pops the frame pushed by the matching GOSUB
 ;        and resumes execution there.
-;   Clobbers: A X (RETURN also: Y IP CURLN SP, via STLN_CHK)
+;   Clobbers: A X (RETURN also: Y IP CURLN SP)
 ;
 ;   3rd char 'T' (case-insensitive) selects RETURN ("RE" + T); anything
 ;   else -- including the full word "REM" -- falls through as a no-op.
@@ -961,13 +993,6 @@ DO_RETURN:
          BEQ DO_ERR_GS           ; Branch on empty straight to error exit
 
          ; --- GOSUB Frame Pop (Loop) ---
-         ; BUGFIX: STA has no zero-page,Y addressing mode -- STA IP+4,Y
-         ; assembles as absolute,Y (99 04 00), so Y=$FC computed as
-         ; $0004+252=$0100, not a zero-page wraparound to $0000. The pop
-         ; wrote into the base of the hardware stack instead of IP/CURLN,
-         ; which were then never restored -- confirmed via sim65c02 listing.
-         ; Fixed by using small positive Y (0..3), matching PUSH_LP's own
-         ; already-safe range, instead of the negative-offset trick.
          LDY #0
 POP_LP:  INX
          LDA 0,X
@@ -980,8 +1005,7 @@ POP_LP:  INX
 
          LDX RUNSP
          TXS                  ; unwind hardware stack to pre-statement state
-         JSR STLN_CHK         ; resume any remaining statements on this line
-         JMP SK_LP            ; then advance to the next line
+         JMP SK_LP            ; advance to the next line
 
 ; =============================================================================
 ; DO_NEW  --  NEW  :  clear program store and all variables
@@ -1042,7 +1066,7 @@ RUNLP:   TSX
          STA CURLN
          JSR GETCI            ; read line-number hi
          STA CURLN+1
-RUNGO:   JSR STMT_LINE         ; execute statement(s) on this line (honouring ':')
+RUNGO:   JSR STMT               ; execute the statement on this line
          LDA RUN
          BEQ RUNEND           ; RUN cleared by END/error -- stop
 SK_LP:   JSR GETCI            ; advance IP past CR (SKIPEOL inlined)
@@ -1057,12 +1081,6 @@ SK_LP:   JSR GETCI            ; advance IP past CR (SKIPEOL inlined)
 ;   Out: C=0  found -- IP points to body (past 2-byte header); CURLN = T0
 ;        C=1  not found -- IP = PE; CURLN unchanged
 ;   Clobbers: A Y IP CURLN
-;
-;   BUGFIX: previously left CURLN untouched, so after any GOTO/GOSUB jump
-;   error messages reported the line that started the jump chain rather than
-;   the current line (e.g. "?3 IN 10" instead of "?3 IN 90" for an error 9
-;   GOSUBs deep). T0 already equals the line just matched, so no extra scan
-;   is needed -- just copy it across at GT_OK.
 ; =============================================================================
 GOTOL:
          LDA #<PROG
@@ -1519,7 +1537,6 @@ GETCI:   LDY #0
 ; DO_IF_F and GETCI_SK are adjacent because DO_IF (condition-false path)
 ; and GETCI both want a plain RTS and this is the nearest one.
 DO_IF_F:
-STLN_RTS:
 GETCI_SK: RTS
          
 ; =============================================================================
@@ -1542,26 +1559,6 @@ DO_IF:
          ; fall through into STMT to execute the consequent
 
 ; =============================================================================
-; STMT_LINE  --  execute one or more statements separated by ':' on a line
-;
-;   In:  IP -> statement text
-;   Out: all colon-separated statements on this line executed; IP advanced
-;   Clobbers: A X Y T0 T1 T2 IP
-;
-;   After each statement, peeks the next character.  If it is ':', consumes
-;   it and loops to execute the next statement.  Otherwise returns.
-;   MAIN and RUNGO call this instead of STMT directly.
-; =============================================================================
-STMT_LINE:
-         JSR STMT              ; execute one statement
-STLN_CHK:
-         JSR WPEEK             ; peek next char (skips spaces)
-         CMP #':'
-         BNE STLN_RTS          ; not ':', done
-         JSR GETCI             ; consume ':'
-         BNE STMT_LINE         ; always taken here (':' = $3A, nonzero)
-
-; =============================================================================
 ; STMT  --  execute one statement from IP
 ;
 ;   In:  IP -> statement text (spaces will be skipped)
@@ -1571,6 +1568,7 @@ STLN_CHK:
 ;   Walks ST_TAB trying MTCHKW for each keyword.  On match, loads handler
 ;   address into T2 and jumps indirect.  Falls through to DO_LET when the
 ;   $FF sentinel is reached (implicit variable assignment).
+;
 ; =============================================================================
 STMT:
          JSR WPEEK
