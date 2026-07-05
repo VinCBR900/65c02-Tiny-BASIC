@@ -1,5 +1,5 @@
 ; =============================================================================
-; uBASIC6502 v1.8 
+; uBASIC6502 v1.9
 ;
 ; 16 bit signed Tiny BASIC interpreter for NMOS 6502 and 2kbyte 2716 EPROM.
 ;
@@ -15,7 +15,7 @@
 ; Numbers      : signed 16-bit  (-32768 .. 32767)
 ; String print : "literals", `;`, TAB(n) and CHR$() only; no string variables
 ;
-; NOTE: Line input buffer is 32 chars, Multi-Statement `:` not supported.
+; NOTES: 32 byte input buffer, multi-statement `:` not supported.
 ;
 ; Error codes (printed as "?N"):
 ;   ?0  syntax / bad expression
@@ -29,14 +29,17 @@
 ;   Base $0200; ceiling RAM_TOP ($1000 for 4 KB SRAM).
 ;   Line format:  <lineno_lo> <lineno_hi> <raw ASCII body> <CR>
 ;   No tokenisation; body bytes are stored exactly as typed.
-;
 ; =============================================================================
 ; CHANGE HISTORY
 ;
-; v1.8 (Jul 2026) 76 bytes free before vectors
-;   - REMOVED incomplete multi-statement (':') support - too many edge cases. 
-;     DO_RETURN refactored, Showcase program rewritten in mixed format and .
-;     exercise GOSUB/RETURN (incl. nesting), TAB, FREE, and POKE/PEEK.
+; v1.9 (Jul 2026) — 32 bytes free
+;   - ADDED: RND expression atom - returns 0..32767 via 16-bit Galois LFSR.
+;   - LFSR configuration uses ZP $87-$88 (RND_SEED), tap $B4, initialized to $ACE1.
+;   - Added RND verification sequences (raw output and RND%10) to showcase code.
+;
+; v1.8 (Jul 2026) — 76 bytes free
+;   - Rewrote pre-loaded showcase using mixed .DB text/hex syntax instead of raw hex.
+;   - Expanded showcase to exercise GOSUB/RETURN nesting, TAB, FREE, and POKE/PEEK.
 ;
 ; v1.7 (Jul 2026) 51 bytes free before vectors
 ;   - FIXED: GOSUB degraded to GOTO,due to EXPR overwritten
@@ -108,6 +111,7 @@ GOSUB_SP = $66               ; 8-bit:  GOSUB/RETURN stack pointer (holds a ZP ad
 GOSUB_LO = $67               ; base of the 8-level GOSUB return-frame stack (32 bytes, $67-$86)
 GOSUB_TOP  = $86             ; initial/empty GOSUB_SP value (topmost stack byte, = GOSUB_LO+31)
 GOSUB_FULL = $6A             ; lowest X for which a full 4-byte push still fits ($67-$6A)
+RND_SEED = $87                ; 16-bit: Galois LFSR state for RND (lo=$87, hi=$88)
 
 ; ---- error codes -------------------------------------------------------------
 ERR_SN   = 0                 ; syntax / bad expression
@@ -138,25 +142,24 @@ PROG     = HWSTACK+$101      ; May be lower if we use a smaller Stack
 ;
 ;   Stored as raw ASCII, mixed .DB format: <lineno_lo>,<lineno_hi>,"text",CR
 ;   Runs of plain characters are quoted strings; a literal `"` or `;` in the
-;   BASIC text is emitted as a raw byte ($22 / $3B) instead of inside the
-;   quotes -- `"` would terminate the assembler's own string literal, and
-;   `;` would start an assembler comment and swallow the rest of the line.
-;   One statement per line throughout -- this interpreter does not support
-;   multi-statement (':') lines (removed in v1.8, see STMT's header).
+;   BASIC text is emitted as a raw byte ($22 / $3B) instead of inside.
+;   One statement per line throughout
 ;
 ;   Lines  10-130: PRINT, CHR$, arithmetic, comparisons
 ;   Lines 140-240: GOSUB/RETURN (incl. nested)
 ;   Lines 250-430: GOTO loop, nested GOTO loop
 ;   Lines 440-500: TAB, FREE, POKE/PEEK
-;   Lines 510-760: Mandelbrot set renderer
+;   Lines 510-600: RND
+;   Lines 610-860: Mandelbrot set renderer
 ;
-;   v1.8: rewrote in the mixed .DB/string format above (was fully hex-coded);
-;         added GOSUB/RETURN, TAB, FREE, and POKE/PEEK sections
+;   v1.9:  Added RND section 
+;   v1.8:  Added GOSUB/RETURN, TAB, FREE, and POKE/PEEK sections
+;   v1.1:  Mandelbrot column scan adjusted from -128..16 to -120..4
 ; =============================================================================
          .ORG PROG
 
-         .DB $0A,$00,"REM uBASIC v1.8 - SHOWCASE",CR        ; 10 REM uBASIC v1.8 - SHOWCASE
-         .DB $14,$00,"PRINT ",$22,"-- uBASIC v1.8 SHOWCASE --",$22,CR ; 20 PRINT "-- uBASIC v1.8 SHOWCASE --"
+         .DB $0A,$00,"REM uBASIC v1.9 - SHOWCASE",CR        ; 10 REM uBASIC v1.9 - SHOWCASE
+         .DB $14,$00,"PRINT ",$22,"-- uBASIC v1.9 SHOWCASE --",$22,CR ; 20 PRINT "-- uBASIC v1.9 SHOWCASE --"
          .DB $1E,$00,"PRINT ",$22,"--- PRINT / CHR$ ---",$22,CR ; 30 PRINT "--- PRINT / CHR$ ---"
          .DB $28,$00,"PRINT CHR$(65)",$3B,"CHR$(66)",$3B,"CHR$(67)",CR ; 40 PRINT CHR$(65);CHR$(66);CHR$(67)
          .DB $32,$00,"PRINT ",$22,"--- ARITHMETIC ---",$22,CR ; 50 PRINT "--- ARITHMETIC ---"
@@ -205,32 +208,42 @@ PROG     = HWSTACK+$101      ; May be lower if we use a smaller Stack
          .DB $E0,$01,"PRINT ",$22,"--- POKE / PEEK ---",$22,CR ; 480 PRINT "--- POKE / PEEK ---"
          .DB $EA,$01,"POKE 900,42",CR                       ; 490 POKE 900,42
          .DB $F4,$01,"PRINT ",$22,"poked 42, read back ",$22,$3B,"PEEK(900)",CR ; 500 PRINT "poked 42, read back ";PEEK(900)
-         .DB $FE,$01,"PRINT ",$22,"--- MANDELBROT ---",$22,CR ; 510 PRINT "--- MANDELBROT ---"
-         .DB $08,$02,"I=-64",CR                             ; 520 I=-64
-         .DB $12,$02,"IF I>56 THEN GOTO 760",CR             ; 530 IF I>56 THEN GOTO 760
-         .DB $1C,$02,"D=I",CR                               ; 540 D=I
-         .DB $26,$02,"C=-120",CR                            ; 550 C=-120
-         .DB $30,$02,"IF C>4 THEN GOTO 730",CR              ; 560 IF C>4 THEN GOTO 730
-         .DB $3A,$02,"A=C",CR                               ; 570 A=C
-         .DB $44,$02,"B=D",CR                               ; 580 B=D
-         .DB $4E,$02,"E=0",CR                               ; 590 E=0
-         .DB $58,$02,"N=1",CR                               ; 600 N=1
-         .DB $62,$02,"IF N>16 THEN GOTO 690",CR             ; 610 IF N>16 THEN GOTO 690
-         .DB $6C,$02,"IF E>0 THEN GOTO 670",CR              ; 620 IF E>0 THEN GOTO 670
-         .DB $76,$02,"T=A*A/64-B*B/64+C",CR                 ; 630 T=A*A/64-B*B/64+C
-         .DB $80,$02,"B=2*A*B/64+D",CR                      ; 640 B=2*A*B/64+D
-         .DB $8A,$02,"A=T",CR                               ; 650 A=T
-         .DB $94,$02,"IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N",CR ; 660 IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N
-         .DB $9E,$02,"N=N+1",CR                             ; 670 N=N+1
-         .DB $A8,$02,"IF N<=16 THEN GOTO 610",CR            ; 680 IF N<=16 THEN GOTO 610
-         .DB $B2,$02,"IF E>0 THEN PRINT CHR$(E+32)",$3B,CR  ; 690 IF E>0 THEN PRINT CHR$(E+32);
-         .DB $BC,$02,"IF E=0 THEN PRINT CHR$(32)",$3B,CR    ; 700 IF E=0 THEN PRINT CHR$(32);
-         .DB $C6,$02,"C=C+4",CR                             ; 710 C=C+4
-         .DB $D0,$02,"GOTO 560",CR                          ; 720 GOTO 560
-         .DB $DA,$02,"PRINT ",$22,$22,CR                    ; 730 PRINT ""
-         .DB $E4,$02,"I=I+6",CR                             ; 740 I=I+6
-         .DB $EE,$02,"GOTO 530",CR                          ; 750 GOTO 530
-         .DB $F8,$02,"END",CR                               ; 760 END
+         .DB $FE,$01,"PRINT ",$22,"--- RND ---",$22,CR      ; 510 PRINT "--- RND ---"
+         .DB $08,$02,"PRINT RND",$3B,$22," ",$22,$3B,"RND",$3B,$22," ",$22,$3B,"RND",$3B,$22," ",$22,$3B,"RND",$3B,$22," ",$22,$3B,"RND",CR ; 520 PRINT RND;" ";RND;" ";RND;" ";RND;" ";RND
+         .DB $12,$02,"I=1",CR                               ; 530 I=1
+         .DB $1C,$02,"IF I>5 THEN GOTO 600",CR              ; 540 IF I>5 THEN GOTO 600
+         .DB $26,$02,"R=RND",CR                             ; 550 R=RND
+         .DB $30,$02,"R=R%10",CR                            ; 560 R=R%10
+         .DB $3A,$02,"PRINT ",$22,"d",$22,$3B,"R",$3B,$22," ",$22,$3B,CR ; 570 PRINT "d";R;" ";
+         .DB $44,$02,"I=I+1",CR                             ; 580 I=I+1
+         .DB $4E,$02,"GOTO 540",CR                          ; 590 GOTO 540
+         .DB $58,$02,"PRINT ",$22,$22,CR                    ; 600 PRINT ""
+         .DB $62,$02,"PRINT ",$22,"--- MANDELBROT ---",$22,CR ; 610 PRINT "--- MANDELBROT ---"
+         .DB $6C,$02,"I=-64",CR                             ; 620 I=-64
+         .DB $76,$02,"IF I>56 THEN GOTO 860",CR             ; 630 IF I>56 THEN GOTO 860
+         .DB $80,$02,"D=I",CR                               ; 640 D=I
+         .DB $8A,$02,"C=-120",CR                            ; 650 C=-120
+         .DB $94,$02,"IF C>4 THEN GOTO 830",CR              ; 660 IF C>4 THEN GOTO 830
+         .DB $9E,$02,"A=C",CR                               ; 670 A=C
+         .DB $A8,$02,"B=D",CR                               ; 680 B=D
+         .DB $B2,$02,"E=0",CR                               ; 690 E=0
+         .DB $BC,$02,"N=1",CR                               ; 700 N=1
+         .DB $C6,$02,"IF N>16 THEN GOTO 790",CR             ; 710 IF N>16 THEN GOTO 790
+         .DB $D0,$02,"IF E>0 THEN GOTO 770",CR              ; 720 IF E>0 THEN GOTO 770
+         .DB $DA,$02,"T=A*A/64-B*B/64+C",CR                 ; 730 T=A*A/64-B*B/64+C
+         .DB $E4,$02,"B=2*A*B/64+D",CR                      ; 740 B=2*A*B/64+D
+         .DB $EE,$02,"A=T",CR                               ; 750 A=T
+         .DB $F8,$02,"IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N",CR ; 760 IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N
+         .DB $02,$03,"N=N+1",CR                             ; 770 N=N+1
+         .DB $0C,$03,"IF N<=16 THEN GOTO 710",CR            ; 780 IF N<=16 THEN GOTO 710
+         .DB $16,$03,"IF E>0 THEN PRINT CHR$(E+32)",$3B,CR  ; 790 IF E>0 THEN PRINT CHR$(E+32);
+         .DB $20,$03,"IF E=0 THEN PRINT CHR$(32)",$3B,CR    ; 800 IF E=0 THEN PRINT CHR$(32);
+         .DB $2A,$03,"C=C+4",CR                             ; 810 C=C+4
+         .DB $34,$03,"GOTO 660",CR                          ; 820 GOTO 660
+         .DB $3E,$03,"PRINT ",$22,$22,CR                    ; 830 PRINT ""
+         .DB $48,$03,"I=I+6",CR                             ; 840 I=I+6
+         .DB $52,$03,"GOTO 630",CR                          ; 850 GOTO 630
+         .DB $5C,$03,"END",CR                               ; 860 END
 SHOWCASE_END:
 
 ; =============================================================================
@@ -268,7 +281,7 @@ T_DS  = 164              ; $24 + $80  ('$' -- CHR$)
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
 ; Bit 7 terminated, Kowalski assembler doesnt like "ch"|$80 inside a .DB 
-STR_BANNER: .DB "uBASIC6502 v1.4 "; startup banner, rolls into free
+STR_BANNER: .DB "uBASIC6502 v1.9 "; startup banner, rolls into free
 STR_FREE:   .DB "Free "
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
@@ -294,6 +307,7 @@ KW_POKE:    .DB 'P','O'
 KW_PEEK:    .DB 'P','E'
 KW_USR:     .DB 'U','S'
 KW_TAB:     .DB 'T','A'	     
+KW_RND:     .DB 'R','N'
 KW_FREE:    .DB 'F','R'
 
 ; =============================================================================
@@ -314,11 +328,19 @@ INIT_Z:  STA 0,X              ; clear zero-page byte at X
          BNE INIT_Z
          LDA #GOSUB_TOP
          STA GOSUB_SP          ; empty call stack and immediate-mode GOSUB
-         ; --- 
+
+         ;Setup RND_SEED to a fixed nonzero constant for a Galois LFSR 
+         LDA #$E1              ; nonzero LFSR seed ($ACE1 -- an all-zero seed
+         STA RND_SEED          ; is a fixed point for a Galois LFSR and would
+         LDA #$AC              ; make RND return 0 forever
+         STA RND_SEED+1
+
+         ; --- Setup showcase  
          LDA #<SHOWCASE_END   ; point PE at end of pre-loaded showcase program
          STA PE               ; Replace with `JSR DO_NEW` for clean program (ROM)
          LDA #>SHOWCASE_END
          STA PE+1
+         
          ; ---
          LDA #<STR_BANNER
          JSR PUTSTR           ; print banner + Free + CR+LF (STR_CRLF follows )
@@ -992,7 +1014,6 @@ DO_RETURN:
          CPX #GOSUB_TOP       ; stack empty (nothing was ever pushed)?
          BEQ DO_ERR_GS           ; Branch on empty straight to error exit
 
-         ; --- GOSUB Frame Pop (Loop) ---
          LDY #0
 POP_LP:  INX
          LDA 0,X
@@ -1444,7 +1465,8 @@ E2_POS:  JSR GETCI            ; consume unary '+', then fall through
 EXPR2:
          JSR WPEEK
          CMP #'('
-         BEQ E2_PAR
+         BNE E2_NOT_PAR
+         JMP E2_PAR            ; out of BEQ range once E2_RND was inserted
 
 E2_NOT_PAR:
          CMP #'-'
@@ -1485,6 +1507,12 @@ E2_NOT_PEEK:
          JMP (T0)             ; indirect tail call to user code
 
 E2_NOT_USR:
+         LDA #<KW_RND
+         JSR MTCHKW           ; matched "RND"?
+         BCS E2_NOT_RND
+         JMP E2_RND            ; tail call: shuffle LFSR, result -> T0
+
+E2_NOT_RND:
          LDY #0
          LDA (IP),Y           ; peek next char without consuming
          CMP #'0'
@@ -1501,6 +1529,35 @@ E2_VAR:  JSR PARSE_VAR               ; variable name (single letter A-Z)?
          LDA VARS,X
          STA T0
          LDA VARS+1,X
+         STA T0+1
+         RTS
+
+; =============================================================================
+; E2_RND  --  RND atom: shuffle the LFSR and return the new value
+;
+;   In:  (none -- "RND" already consumed by EXPR2's MTCHKW call)
+;   Out: T0 = new pseudo-random value, 0..32767 (bit 15 forced clear)
+;   Clobbers: A T0
+;
+;   16-bit Galois LFSR in RND_SEED, tap $B4 (x^16+x^14+x^13+x^11+1),
+;   maximal-length for a nonzero seed. Shuffles on every call - better
+;   on a heartbeat but we dont have one.
+; =============================================================================
+E2_RND:
+         LSR RND_SEED+1       ; shift hi byte right, MSB = 0
+         ROR RND_SEED         ; shift lo byte right, MSB = old hi bit 0
+
+         LDA RND_SEED         ; LDA/STA don't touch Carry -- safe before BCC
+         STA T0
+
+         LDA RND_SEED+1       ; Carry from the LSR above is still intact
+         BCC E2_RND_SK        ; no bit fell out: skip the feedback tap
+
+         EOR #$B4             ; apply feedback tap
+         STA RND_SEED+1       ; update the seed in memory
+
+E2_RND_SK:
+         AND #$7F             ; force positive (clear bit 15) for T0
          STA T0+1
          RTS
 
@@ -1568,7 +1625,6 @@ DO_IF:
 ;   Walks ST_TAB trying MTCHKW for each keyword.  On match, loads handler
 ;   address into T2 and jumps indirect.  Falls through to DO_LET when the
 ;   $FF sentinel is reached (implicit variable assignment).
-;
 ; =============================================================================
 STMT:
          JSR WPEEK
