@@ -9,17 +9,17 @@ A minimal but complete integer BASIC. No tokeniser — program lines are stored 
 #### uBASIC `uBASIC6502.asm`
 
 **Statements:** 
-  * `END` `GOSUB`/`RETURN`  `GOTO`  `IF`/`THEN`  `INPUT`  `LET`  `POKE`  `PRINT`  `REM`  `RUN`  
+  * `END` `GOSUB`/`RETURN`  `GOTO`  `IF`/`THEN`  `INPUT`  `LET`  `POKE`  `PRINT [TAB(n)] [;] CHR$(n)`  `REM`  `RUN`  
   * `LIST` `NEW` `FREE`
 
 **Expressions:** 
   * `+` `-` `*` `/` `%`(mod) `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)`  variables `A`–`Z`
-  * Functions: `PEEK(addr)` `USR(addr)`; In Print context only: `CHR$(n)`  `TAB(n)` `;`
+  * Functions: `PEEK(addr)` `USR(addr)`  `RND`
 
 **Numbers:** signed 16-bit integers, −32768 to 32767
 
 **Notes**
-  * Uses 2 character matching (with 3rd char match for `GOSUB`/`GOTO` and `RETURN`/`REM`) so technically maches anything e.g. PROCEED matches PRINT.  This means spaces are important e.g. `PRINT TAB(5);"hello" works, whereas `PRINTTAB(5);"HELLO"` does not.
+  * Uses 2 character matching (with 3rd char match for `GOSUB`/`GOTO` and `RETURN`/`REM`) so technically maches anything e.g. PROCEED matches PRINT.  This means spaces are important e.g. `PRINT TAB(5);"hello"` works, whereas `PRINTTAB(5);"HELLO"` does not.
   * Multi-statement operator `:` is not supported and input buffer is 32 characters only.
 
 **Errors** (printed as `?N [IN line]`):
@@ -36,17 +36,17 @@ A minimal but complete integer BASIC. No tokeniser — program lines are stored 
 
 **<4096 bytes assembled. ROM at $F000–$FFFF**
 
-A significantly more capable integer BASIC. Keywords are tokenised on entry and numbers converted to 16-bit binary, so the interpreter does not re-parse ASCII on execution — several times faster than uBASIC and easier on RAM. Structured loops (FOR/NEXT) and subroutines (GOSUB/RETURN) are supported.
+A significantly more capable integer BASIC. Keywords are tokenised on entry and numbers converted to 16-bit binary, so the interpreter does not re-parse ASCII on execution — several times faster than uBASIC and easier on RAM. 
 
 **Statements:** 
-  * `PRINT` `IF`/`THEN`/`ELSE` `GOTO` `GOSUB` `RETURN` `FOR`/`TO`/`STEP`/`NEXT` `LET` `INPUT` `REM` `END` `POKE` `DATA` `READ` `RESTORE` 
+  * `PRINT [TAB(n)] [;] CHR$(n)` `IF`/`THEN`/`ELSE` `GOTO` `GOSUB` `RETURN` `FOR`/`TO`/`STEP`/`NEXT` `LET` `INPUT` `REM` `END` `POKE` `DATA` `READ` `RESTORE` 
   * `RUN` `LIST` `NEW` `FREE` `HELP`
  
 **Functions:** `ABS(n)` `SGN(n)` `CHR$(n)` `ASC("c")` `PEEK(addr)` `USR(addr)` `RND` `SIN(deg)`  `COS(deg)`
 
 **Expressions:** `AND` `OR` `XOR` `NOT` `MOD` `+` `-` `*` `/` `%`(mod) `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)` variables `A`–`Z`
 
-**Numbers:** signed 16-bit integers, −32768 to 32767. Relational operators return −1 (true) or 0 (false). `AND`/`OR`/`XOR`/`NOT` are bitwise. `PRINT` items separated by `;` suppress the newline between them.
+**Numbers:** signed 16-bit integers, −32768 to 32767. Relational operators return −1 (true) or 0 (false). `AND`/`OR`/`XOR`/`NOT` are bitwise.
 
 **Notes**
 - **`GOTO`/`GOSUB` accept expressions** — `GOTO X`, `GOSUB BASE+N`, `GOTO 10*I` all work
@@ -110,7 +110,6 @@ gcc -O2 -o sim65c02 sim65c02.c
 ./sim65c02 4kBASIC.asm --input "PRINT 42"
 # to execute the showcase
 ./sim65c02 4kBASIC.asm --input "RUN" --maxcycles 800000000
-./sim65c02 4kBASIC.asm --mandelbrot 
 # For interactive
 ./sim65c02 4kBASIC.asm --maxcycles 0
 ```
@@ -151,7 +150,7 @@ For real Hardware you will need to modify the I/O Addresses for Serial I/O, spec
 
 ### Things to watch out for
 
-- **ROM size.** uBASIC has less than a dozen bytes free, so pretty full. Always check after a change. Claude will help you find space savings if you're over budget.
+- **ROM size.** All variants dotn have much free space. Always check after a change. Claude will help you find space savings if you're over budget.
 - **Page constraints.** The uBASIC string table must stay entirely on page $F8 (all strings accessed via a shared hi-byte). Claude can get confused if the page boundary is exceeded - it will find it eventually but after a lot of thrashing, so tell it to watch out when adding new strings to uBASIC.
 - **Zero-page register clobbers.** The In/Out/Clobbers comments on each function document which of T0/T1/T2/LP/IP/OP are live. Claude will respect these if you share the relevant headers.
 - **Fall-through chains.** Several functions share a single RTS by falling through into the next function. These are clearly marked in the source. Inserting code between them without understanding the fall-through will break things — tell Claude to watch out for them.
@@ -168,7 +167,7 @@ A tokeniser saves RAM (shorter stored programs) and speeds execution (no re-pars
 
 Both interpreters support `%` as integer modulo: `10 % 3` gives `1`. 4K BASIC v11 also accepts the word `MOD`: `10 MOD 3` gives the same result. The sign follows the dividend (C convention), so `-7 % 4` gives `-3`. Division and modulo by zero both raise error OV.
 
-#### `RND` in 4K BASIC
+#### `RND` 
 
 `RND` returns a pseudo-random integer in the range 1–32767. It uses a 16-bit Galois LFSR (linear feedback shift register) with taps at $B400, seeded to $ACE1 at startup. The seed is not resettable from BASIC — every run produces the same sequence, which is useful for reproducible tests. A common idiom for a six-sided die roll is:
 
@@ -178,49 +177,15 @@ Both interpreters support `%` as integer modulo: `10 % 3` gives `1`. 4K BASIC v1
 
 #### USR(addr)
 
-`USR(addr)` calls machine code at the given address. The routine should end with `RTS` and write any retuirn value to T0 which becomes the result of the `USR()` expression. This allows hardware-specific extensions without modifying the interpreter source.
+`USR(addr)` calls machine code at the given address. The routine should end with `RTS` and write any return value to T0 for the return value, allowing hardware-specific extensions without modifying the interpreter source.
 
 #### The pre-loaded showcase program
 
-Both ROMs include a feature showcase program pre-loaded at $0200. Type `RUN` to execute it, `NEW` to clear it, or `LIST` to read the source. The showcase is designed to exercise as much of each interpreter's instruction set as possible in a single self-contained program.
+All ROMs include a feature showcase program pre-loaded at $0200. Type `RUN` to execute it, `NEW` to clear it, or `LIST` to read the source. The showcase is designed to exercise as much of each interpreter's instruction set as possible in a single self-contained program.
 
-The **4K BASIC showcase** (lines 10–930) produces output like:
-```
-== 4K BASIC SHOWCASE ==
---- PRINT / CHR$ / ASC ---
-CHR$(65)=A  ASC(A)=65
---- ABS / SGN / MOD ---
-ABS(-7)=7  SGN(-5)=-1  SGN(0)=0
-17 MOD 5=2
---- NOT / AND / OR / XOR ---
-NOT 0=-1  NOT -1=0
-6 AND 3=2  5 OR 2=7  7 XOR 3=4
---- RND / PEEK / POKE ---
-RND=25200  RND MOD 10=4
-POKE 512,42  PEEK=42
---- DATA / READ / RESTORE ---
-READ: 111,222,333
-RESTORE->A=111
---- FOR / NEXT / STEP ---
-12345
-10741
---- IF / THEN / ELSE ---
-IF true
-ELSE ok
---- GOSUB / RETURN ---
-GOSUB ok
---- ON n GOSUB ---
-ON 1
-ON 2
-ON 3
---- MANDELBROT ---
- '!!!!!!!""%#,,# #""""$*$#)$*' - ##%#
-...
-```
-
-The **uBASIC showcase** (lines 10–480) demonstrates arithmetic, comparisons, `IF`/`THEN`, `GOTO`-based loops, nested loops, and the same Mandelbrot renderer — all without `FOR`/`NEXT` or `GOSUB`, showcasing how much can be done with minimal primitives.
-
-The Mandelbrot renderer uses only integer arithmetic (scaled fixed-point: coordinates scaled by 64, 16 iterations) and serves as a thorough stress-test of the expression evaluator and loop constructs.
+### Notes
+  * Originally I started with a 65c02 2kbyte tiny BASIC, whichafter got working ported to NMOS 6502.  The 65c02 version had more features due to better code density, but eventually I Realized I should just refactor NMOS 6502 and get as many features in that, rather than working on two 2kbyte versions.  So the original 65c02 version `uBASIC.asm` is in the `Archive` folder.
+  * Originally I had two different simulator versions - a batch version and an interactive.  Eventually I realized maintaining both was a pain, and one could do both jobs.  So the old _interactive_ versions are in the `Archive` folder. 
 
 ---
 
