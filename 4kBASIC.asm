@@ -73,59 +73,22 @@
 ; =============================================================================
 ; RECENT CHANGE HISTORY
 ;
-; v15.5 (Jul 2026) - 156 bytes free (ROM code; +63 vs v15.4)
-;   - Ported INSLINE from uBASIC6502b: the shift-up loop no longer counts
-;     bytes into a scratch register and calls a shared decrement helper
-;     per byte copied. Instead the moving source/dest pointers are compared
-;     directly against LP each iteration, stopping exactly when the shift
-;     is done. Removes T2 usage from INSLINE entirely and drops the total-
-;     byte-count hardware-stack juggling (TSX/peek) the old version needed
-;     to keep the OOM-checked total alive across the shift.
-;   - Deleted T2DEC (shared 16-bit decrement-and-test helper). INSLINE no
-;     longer calls it; DELINE's own single call site was inlined directly
-;     (a JSR to a single-caller subroutine is pure overhead once INSLINE
-;     stopped needing it).
-;   - OOM check simplified to a hi-byte-only compare (new_PE_hi vs
-;     >RAM_TOP), exactly correct rather than approximate because
-;     RAM_TOP=$1000 is page-aligned; flagged in the routine header for any
-;     future RAM_TOP change.
-;   - Reviewed for further 65C02-vs-NMOS wins during the port: the source
-;     material is NMOS-only (BNE relying on Y never wrapping within a
-;     bounded copy). Adopted BRA for the one "always taken" copy-loop
-;     back-branch to match this file's existing house style; no byte-count
-;     difference from BNE here, just removes a dependency on the length
-;     invariant. No other 65C02-specific opcode swap applied in this pass.
-;   - Full line-editing regression re-verified after the port: in-order and
-;     out-of-order insert, delete, replace, multi-line programs, plus the
-;     full showcase (which exercises INSLINE for every pre-loaded line)
-;     and Mandelbrot.
-;
-
-;   - Ported from uBASIC6502.asm review, adapted to 65C02 and tokenized dispatch:
-;   - Reordered zero page: FVAR/FLIM/FSTEP inserted immediately before CURLN,
-;     forming a contiguous 7-byte run [FVAR,FLIM,FLIM+1,FSTEP,FSTEP+1,
-;     CURLN,CURLN+1] matching the FOR_STK frame layout exactly. DO_FOR now
-;     stages var_slot/limit/step directly into this block (no hardware-stack
-;     juggling) and pushes the frame with one indexed copy loop instead of
-;     7 unrolled LDA/STA/INY sequences. DO_NEXT unchanged (its per-field
-;     logic -- VARS indexing, signed step add, limit compare -- does not
-;     benefit from a blind copy loop the way a push does).
-;   - Merged DO_GOTO and DO_GOSUB's duplicated GOTOL/error/CURLN-update tail
-;     into one shared block (DO_go_common), entered directly by GOTO or
-;     after the return-frame push by GOSUB.
-;   - Replaced the ZP-bounce workaround for the relational-mask combine
-;     (STX/LDA/ORA/TAX) with direct opcode injection (.DB $19 / .DW REL_MASK
-;     = ORA REL_MASK,Y) since the assembler lacks the abs,Y mnemonic form for
-;     ORA. Verified correct with an isolated test before applying.
-;   - No functional or timing-sensitive behaviour changed; full regression
-;     (GOTO, GOSUB/RETURN, FOR ascending/descending/STEP, nested and colon-
-;     chained FOR/NEXT, relational/boolean operators, full showcase +
-;     Mandelbrot) re-verified after the ZP reorg.
-;
-;   - FIXED: Cold-start Zero Page clear loop condition changed from BPL to BNE.
-;   - FIXED: Single-line colon-chained FOR/NEXT execution via new SKIP_STMT logic.
-;   - FIXED: Trailing colon evaluation bug in PRINT statement output.
-;   - NOTE: Multi-FOR headers sharing a single line remains a documented limitation.
+; v15.5 (Jul 2026) - 156 bytes free
+; Core Memory & Editor Refactors from uBASIC6502.asm
+;   - Ported optimized INSLINE: Replaced the byte-counter loop with direct pointer 
+;     comparisons against LP, eliminating T2 usage and hardware-stack juggling.
+;   - Inlined T2DEC helperinside DELINE, Streamlined OOM check
+; Zero Page & Control Flow Reorg
+;   - Reordered Zero Page: Grouped FVAR, FLIM, and FSTEP immediately before CURLN to 
+;     mirror the FOR_STK frame layout.
+;   - Optimized DO_FOR to stage variables directly in ZP and execute stack pushes 
+;     via a tight indexed copy loop, eliminating 7 unrolled LDA/STA sequences.
+;   - Consolidated duplicate line-update and error tail-code from DO_GOTO and 
+;     DO_GOSUB into a unified entry point (DO_go_common).
+; Critical Core Fixes
+;   - FIXED: Cold-start Zero Page clear loop condition corrected from BPL to BNE.
+;   - FIXED: Enabled single-line colon-chained FOR/NEXT execution via new SKIP_STMT logic.
+;   - FIXED: Resolved trailing colon evaluation bugs within PRINT statement streams.
 ;
 ; v15.2 (Jul 2026) - 67 bytes free (ROM unaffected)
 ;   - Rewrote pre-loaded RAM showcase to an 805-byte self-checking test suite.
