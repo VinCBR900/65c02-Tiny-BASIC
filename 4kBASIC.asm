@@ -1,5 +1,5 @@
 ; =============================================================================
-; 4K Integer BASIC v15.3 for the 65C02
+; 4K Integer BASIC v15.5 for the 65C02
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -73,7 +73,55 @@
 ; =============================================================================
 ; RECENT CHANGE HISTORY
 ;
-; v15.3 (Jul 2026) - 24 bytes free
+; v15.5 (Jul 2026) - 156 bytes free (ROM code; +63 vs v15.4)
+;   - Ported INSLINE from uBASIC6502b: the shift-up loop no longer counts
+;     bytes into a scratch register and calls a shared decrement helper
+;     per byte copied. Instead the moving source/dest pointers are compared
+;     directly against LP each iteration, stopping exactly when the shift
+;     is done. Removes T2 usage from INSLINE entirely and drops the total-
+;     byte-count hardware-stack juggling (TSX/peek) the old version needed
+;     to keep the OOM-checked total alive across the shift.
+;   - Deleted T2DEC (shared 16-bit decrement-and-test helper). INSLINE no
+;     longer calls it; DELINE's own single call site was inlined directly
+;     (a JSR to a single-caller subroutine is pure overhead once INSLINE
+;     stopped needing it).
+;   - OOM check simplified to a hi-byte-only compare (new_PE_hi vs
+;     >RAM_TOP), exactly correct rather than approximate because
+;     RAM_TOP=$1000 is page-aligned; flagged in the routine header for any
+;     future RAM_TOP change.
+;   - Reviewed for further 65C02-vs-NMOS wins during the port: the source
+;     material is NMOS-only (BNE relying on Y never wrapping within a
+;     bounded copy). Adopted BRA for the one "always taken" copy-loop
+;     back-branch to match this file's existing house style; no byte-count
+;     difference from BNE here, just removes a dependency on the length
+;     invariant. No other 65C02-specific opcode swap applied in this pass.
+;   - Full line-editing regression re-verified after the port: in-order and
+;     out-of-order insert, delete, replace, multi-line programs, plus the
+;     full showcase (which exercises INSLINE for every pre-loaded line)
+;     and Mandelbrot.
+;
+
+;   - Ported from uBASIC6502.asm review, adapted to 65C02 and tokenized dispatch:
+;   - Reordered zero page: FVAR/FLIM/FSTEP inserted immediately before CURLN,
+;     forming a contiguous 7-byte run [FVAR,FLIM,FLIM+1,FSTEP,FSTEP+1,
+;     CURLN,CURLN+1] matching the FOR_STK frame layout exactly. DO_FOR now
+;     stages var_slot/limit/step directly into this block (no hardware-stack
+;     juggling) and pushes the frame with one indexed copy loop instead of
+;     7 unrolled LDA/STA/INY sequences. DO_NEXT unchanged (its per-field
+;     logic -- VARS indexing, signed step add, limit compare -- does not
+;     benefit from a blind copy loop the way a push does).
+;   - Merged DO_GOTO and DO_GOSUB's duplicated GOTOL/error/CURLN-update tail
+;     into one shared block (DO_go_common), entered directly by GOTO or
+;     after the return-frame push by GOSUB.
+;   - Replaced the ZP-bounce workaround for the relational-mask combine
+;     (STX/LDA/ORA/TAX) with direct opcode injection (.DB $19 / .DW REL_MASK
+;     = ORA REL_MASK,Y) since the assembler lacks the abs,Y mnemonic form for
+;     ORA. Verified correct with an isolated test before applying.
+;   - No functional or timing-sensitive behaviour changed; full regression
+;     (GOTO, GOSUB/RETURN, FOR ascending/descending/STEP, nested and colon-
+;     chained FOR/NEXT, relational/boolean operators, full showcase +
+;     Mandelbrot) re-verified after the ZP reorg.
+;
 ;   - FIXED: Cold-start Zero Page clear loop condition changed from BPL to BNE.
 ;   - FIXED: Single-line colon-chained FOR/NEXT execution via new SKIP_STMT logic.
 ;   - FIXED: Trailing colon evaluation bug in PRINT statement output.
@@ -118,27 +166,35 @@
 ;
 ; Zero-page layout:
 ;   $00-$01  IP      interpreter pointer  (token stream or program store)
-;   $02-$03  PE      program end pointer
-;   $04-$05  LP      scratch / line / keyword pointer
-;   $06-$07  T0      expression result / scratch 0
-;   $08-$09  T1      scratch 1
-;   $0A-$0B  T2      scratch 2
-;   $0C-$0D  CURLN   current executing line number
-;   $0E      GRET    GOSUB nesting depth  (0-8)
-;   $0F      RUN     non-zero while program is running
-;   $10-$2F  IBUF    raw input buffer  (32 bytes)
-;   $30-$4F  TBUF    tokenised buffer  (32 bytes)
-;   $50-$8B  VARS    A-Z variables  (2 bytes each = 52 bytes)
-;   $8C-$9B  GORET   GOSUB return-address stack  (8 x 2 bytes)
-;   $9C      TKTOK   keyword scan index  (TRYKW scratch)
-;   $9D      FSTK    FOR loop nesting depth  (0-4)
-;   $9E-$B9  FOR_STK FOR stack frames  (4 x 7 bytes)
-;   $BA      RUNSP    saved SP for GOTO/NEXT/GOSUB stack unwind
-;   $BB      OP       saved MUL/DIV/MOD operator  ('*', '/' or '%')
-;   $BC-$BD  DATA_PTR READ pointer into program store:
+;   $02      FVAR    FOR staging: var_slot (VARS offset)
+;   $03-$04  FLIM    FOR staging: limit
+;   $05-$06  FSTEP   FOR staging: step
+;   $07-$08  CURLN   current executing line number
+;              (FVAR/FLIM/FSTEP/CURLN are deliberately contiguous, $02-$08:
+;               DO_FOR copies this 7-byte block into a FOR_STK frame with
+;               one indexed loop instead of unrolled stores -- see v15.4)
+;   $09-$0A  LP      scratch / line / keyword pointer
+;   $0B-$0C  T0      expression result / scratch 0
+;   $0D-$0E  T1      scratch 1
+;   $0F-$10  T2      scratch 2
+;   $11-$12  PE      program end pointer
+;   $13      GRET    GOSUB nesting depth  (0-8)
+;   $14      RUN     non-zero while program is running
+;   $15-$34  IBUF    raw input buffer  (32 bytes)
+;   $35-$54  TBUF    tokenised buffer  (32 bytes)
+;   $55-$90  VARS    A-Z variables  (2 bytes each = 52 bytes)
+;   $91-$A0  GORET   GOSUB return-address stack  (8 x 2 bytes)
+;   $A1      TKTOK   keyword scan index  (TRYKW scratch)
+;   $A2      FSTK    FOR loop nesting depth  (0-4)
+;   $A3-$BE  FOR_STK FOR stack frames  (4 x 7 bytes)
+;   $BF      RUNSP    saved SP for GOTO/NEXT/GOSUB stack unwind
+;   $C0      OP       saved MUL/DIV/MOD operator  ('*', '/' or '%')
+;   $C1-$C2  DATA_PTR READ pointer into program store:
 ;              0    = reset/RESTORE'd ? rescan from PROG on next READ
 ;              PE   = exhausted, no more DATA values
 ;              else = position inside current DATA body (past TOK_DATA byte)
+;   $C3-$C4  RND_SEED LFSR seed for RND
+;   $C5-$CE  CX/CY/CZ/CX_SAV/CIDX/ATEMP  CORDIC scratch (see equates)
 ; Token stream format  (TBUF / program store):
 ;   Keywords    $80-$A5  (single byte)
 ;   Numbers     $FF <lo> <hi>  (3 bytes, little-endian)
@@ -230,34 +286,42 @@ ERR_OD   = 14                ; out of DATA
 
 ; ---- zero-page addresses -----------------------------------------------------
 IP       = $00               ; 16-bit: interpreter pointer
-CURLN    = $02               ; 16-bit: current executing line number
-LP       = $04               ; 16-bit: list/edit/scratch pointer
-T0       = $06               ; 16-bit: expression result / scratch 0
-T1       = $08               ; 16-bit: scratch 1
-T2       = $0A               ; 16-bit: scratch 2
-PE       = $0C               ; 16-bit: program end
-GRET     = $0E               ;  8-bit: GOSUB nesting depth
-RUN      = $0F               ;  8-bit: 0 = idle, $FF = running
-IBUF     = $10               ; 32 bytes: raw input buffer  ($10-$2F)
-TBUF     = $30               ; 32 bytes: tokenised buffer  ($30-$4F)
-VARS     = $50               ; 52 bytes: A-Z variables     ($50-$8B)
-GORET    = $8C               ; 16 bytes: GOSUB return stack ($8C-$9B)
-TKTOK    = $9C               ;  8-bit: TRYKW keyword index
-FSTK     = $9D               ;  8-bit: FOR nesting depth
-FOR_STK  = $9E               ; 28 bytes: FOR frames        ($9E-$B9)
+FVAR     = $02               ;  8-bit: FOR staging: var_slot (VARS offset)
+FLIM     = $03               ; 16-bit: FOR staging: limit
+FSTEP    = $05               ; 16-bit: FOR staging: step
+CURLN    = $07               ; 16-bit: current executing line number
+                              ; FVAR,FLIM,FSTEP,CURLN ($02-$08) are contiguous
+                              ; on purpose: DO_FOR copies this 7-byte block into
+                              ; a FOR_STK frame with one indexed loop instead of
+                              ; unrolled stores (CURLN already holds the correct
+                              ; loop_line value, so no separate copy is needed).
+LP       = $09               ; 16-bit: list/edit/scratch pointer
+T0       = $0B               ; 16-bit: expression result / scratch 0
+T1       = $0D               ; 16-bit: scratch 1
+T2       = $0F               ; 16-bit: scratch 2
+PE       = $11               ; 16-bit: program end
+GRET     = $13               ;  8-bit: GOSUB nesting depth
+RUN      = $14               ;  8-bit: 0 = idle, $FF = running
+IBUF     = $15               ; 32 bytes: raw input buffer  ($15-$34)
+TBUF     = $35               ; 32 bytes: tokenised buffer  ($35-$54)
+VARS     = $55               ; 52 bytes: A-Z variables     ($55-$90)
+GORET    = $91               ; 16 bytes: GOSUB return stack ($91-$A0)
+TKTOK    = $A1               ;  8-bit: TRYKW keyword index
+FSTK     = $A2               ;  8-bit: FOR nesting depth
+FOR_STK  = $A3               ; 28 bytes: FOR frames        ($A3-$BE)
 FOR_FRSZ = 7                 ; bytes per FOR frame
-RUNSP    = $BA               ;  8-bit: saved SP for stack unwind
-OP       = $BB               ;  8-bit: MUL/DIV operator ('*' or '/')
-DATA_PTR = $BC               ; 16-bit: pointer to next DATA value to READ ($BC-$BD)
-RND_SEED = $BE               ; 16-bit: LFSR seed for RND  ($BE-$BF); init to $ACE1
+RUNSP    = $BF               ;  8-bit: saved SP for stack unwind
+OP       = $C0               ;  8-bit: MUL/DIV operator ('*' or '/')
+DATA_PTR = $C1               ; 16-bit: pointer to next DATA value to READ ($C1-$C2)
+RND_SEED = $C3               ; 16-bit: LFSR seed for RND  ($C3-$C4); init to $ACE1
 
 ; CORDIC scratch (zeroed by INIT_z with rest of ZP):
-CX       = $C0               ; 16-bit: CORDIC X accumulator
-CY       = $C2               ; 16-bit: CORDIC Y accumulator
-CZ       = $C4               ; 16-bit: CORDIC Z angle accumulator
-CX_SAV   = $C6               ; 16-bit: saved CX per iteration
-CIDX     = $C8               ;  8-bit: CORDIC iteration counter
-ATEMP    = $C9               ;  8-bit: angle quadrant temp
+CX       = $C5               ; 16-bit: CORDIC X accumulator
+CY       = $C7               ; 16-bit: CORDIC Y accumulator
+CZ       = $C9               ; 16-bit: CORDIC Z angle accumulator
+CX_SAV   = $CB               ; 16-bit: saved CX per iteration
+CIDX     = $CD               ;  8-bit: CORDIC iteration counter
+ATEMP    = $CE               ;  8-bit: angle quadrant temp
 
 ; =============================================================================
 ; PRE-LOADED FEATURE SHOWCASE  (program storage at $0200)
@@ -326,7 +390,7 @@ SHOWCASE_END:               ; assembles to $0200+805 = $0525
 ; STRING TABLE (all strings on same page)
 ; =============================================================================
 STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string/kw addresses
-STR_BANNER: .DB "4K BASIC v15.3"        ; drop through (trimmed ".0" -- saves 2 bytes)
+STR_BANNER: .DB "4K BASIC v15.5"        ; drop through (trimmed ".0" -- saves 2 bytes)
 STR_CRLF:   .DB $0D,$8A             ; CR, LF|$80 = $8A
 STR_BYTES:  .DB " BYTES FREE",$0D,$8A  ; last LF has high-bit
 STR_ERROR:  .DB " ER",$D2           ; 'R'|$80 = $D2
@@ -756,21 +820,6 @@ PNUM:   JSR WEAT             ; skip whitespace, consume $FF token
         STA T0+1
         RTS
 ; =============================================================================
-; T2DEC ? decrement 16-bit counter T2; return Z=1 when result reaches zero
-;   In:  T2 = 16-bit counter
-;   Out: T2 decremented; Z=1 if T2==0, Z=0 otherwise
-;   Clobbers: A
-;   Shared by DELINE and INSLINE to avoid duplicating the 14-byte
-;   decrement-and-zero-test sequence in each copy loop.
-; =============================================================================
-T2DEC:  LDA T2
-        BNE T2D_lo
-        DEC T2+1
-T2D_lo: DEC T2
-        LDA T2
-        ORA T2+1
-        RTS                  ; Z=1 if zero, Z=0 if not
-; =============================================================================
 ; DELINE ? remove the program line whose 2-byte header starts at LP
 ;   In:  LP   points at <lo> <hi> of line to delete
 ;        PE   program end pointer
@@ -809,7 +858,13 @@ DL_cp:  LDA (T0),y           ; shift bytes down
         BNE DL_nhi
         INC T0+1
         INC LP+1
-DL_nhi: JSR T2DEC            ; decrement T2; Z=1 when zero
+DL_nhi: LDA T2               ; decrement T2 (inlined; T2DEC removed, single caller)
+        BNE DL_declo
+        DEC T2+1
+DL_declo:
+        DEC T2
+        LDA T2
+        ORA T2+1
         BNE DL_cp
 DL_upd: LDA PE               ; update PE
         SEC
@@ -826,114 +881,85 @@ DL_ok:  RTS
 ;        CURLN line number for the 2-byte header
 ;   Out: new line written at LP with 2-byte header prepended
 ;        PE   advanced by inserted byte count
-;   Clobbers: A Y T0 T1 T2
+;   Clobbers: A Y T0 T1
+;   Ported from uBASIC6502b (v15.5): the NMOS original counted the shift
+;   distance into a scratch register and called a shared decrement-and-test
+;   helper (T2DEC) once per byte copied. Replaced with a direct pointer
+;   comparison (does the moving pointer equal LP yet?) each iteration,
+;   which needs no scratch counter at all and removes T2DEC's last
+;   remaining caller after DELINE's own copy of the same pattern was
+;   inlined (see DELINE) -- T2DEC itself is deleted. OOM check compares
+;   only the new PE's high byte against RAM_TOP's high byte, which is
+;   exactly correct (not approximate) because RAM_TOP=$1000 is page-aligned.
 ; =============================================================================
 INSLINE:
-        LDA IP
-        STA T0
-        LDA IP+1
-        STA T0+1
         LDY #0
-IN_cnt: LDA (T0),y           ; count body bytes up to and including $0D
-        CMP #$0D
-        BEQ IN_ce
+IN_cnt: LDA (IP),y           ; find body length
         INY
-        BRA IN_cnt
-IN_ce:  INY                  ; include the $0D itself
-        TYA
+        CMP #$0D
+        BNE IN_cnt
+        INY                  ; +2 for the 2-byte line-number header
+        INY
+        TYA                  ; A = total line size
         CLC
-        ADC #2               ; + 2-byte header
-        PHA                  ; total byte count on stack
-        ; OOM check: PE + total > RAM_TOP ?
-        CLC
-        ADC PE
-        STA T2
-        LDA PE+1
-        ADC #0
-        STA T2+1
-        LDA T2
-        CMP #<RAM_TOP        ; lo byte compare
-        LDA T2+1
-        SBC #>RAM_TOP        ; hi byte with borrow
-        BCC IN_ok            ; new PE < RAM_TOP: fits
-        PLA
-        LDA #ERR_OM
-        JMP DO_ERROR
-IN_ok:  ; shift [LP..PE) up by total to make room
-        LDA PE
-        SEC
-        SBC LP
-        STA T0               ; T0 = bytes to shift
-        LDA PE+1
-        SBC LP+1
-        STA T0+1
-        LDA T0
-        ORA T0+1
-        BEQ IN_shift         ; nothing to shift
-        LDA PE               ; T0 = PE - 1  (top of source range)
-        SEC
-        SBC #1
-        STA T0
-        LDA PE+1
-        SBC #0
-        STA T0+1
-        TSX
-        LDA $0101,x          ; peek total from stack (without popping)
-        CLC
-        ADC T0               ; T1 = T0 + total  (top of destination range)
+        ADC PE                ; new PE = PE + total size
         STA T1
-        LDA T0+1
+        LDA PE+1
         ADC #0
         STA T1+1
-        LDA PE               ; T2 = bytes to shift (PE - LP)
-        SEC
-        SBC LP
-        STA T2
+        CMP #>RAM_TOP        ; would this cross RAM_TOP? (hi-byte only:
+        BCC IN_ok            ;  exact since RAM_TOP is page-aligned)
+        LDA #ERR_OM
+        JMP DO_ERROR
+IN_ok:  LDA PE                ; T0 = old PE
+        STA T0
         LDA PE+1
-        SBC LP+1
-        STA T2+1
-IN_bk:  LDY #0               ; copy backwards: high addresses first
-        LDA (T0),y
-        STA (T1),y
-        LDA T0               ; decrement T0
-        BNE IN_bk_d0
-        DEC T0+1
-IN_bk_d0:
-        DEC T0
-        LDA T1               ; decrement T1
-        BNE IN_bk_d1
-        DEC T1+1
-IN_bk_d1:
-        DEC T1
-        JSR T2DEC            ; decrement T2; Z=1 when zero
-        BNE IN_bk
-IN_shift:
-        PLA                  ; recover total byte count
-        CLC
-        ADC PE               ; update PE
+        STA T0+1
+        LDA T1                ; commit new PE now (OOM check already passed)
         STA PE
-        BCC IN_hdr
-        INC PE+1
-IN_hdr: LDY #0               ; write 2-byte line-number header at LP
-        LDA CURLN
-        STA (LP),y
+        LDA T1+1
+        STA PE+1
+        LDY #0
+        LDA T0                ; if old PE == LP, nothing to shift upward
+        CMP LP
+        BNE IN_bk
+        LDA T0+1
+        CMP LP+1
+        BEQ IN_hdr
+IN_bk:  LDA T0                ; pre-decrement source (T0)
+        BNE IN_d0
+        DEC T0+1
+IN_d0:  DEC T0
+        LDA T1                ; pre-decrement destination (T1)
+        BNE IN_d1
+        DEC T1+1
+IN_d1:  DEC T1
+        LDA (T0),y            ; backward copy loop
+        STA (T1),y
+        LDA T0                ; stop exactly when T0 == LP
+        CMP LP
+        BNE IN_bk
+        LDA T0+1
+        CMP LP+1
+        BNE IN_bk
+IN_hdr: LDA CURLN             ; write 2-byte line-number header at LP
+        STA (LP),y            ; Y is 0 here
         INY
         LDA CURLN+1
         STA (LP),y
-        LDA LP               ; T0 = LP + 2  (body destination)
+        LDA LP                ; advance LP by 2 for the payload destination
         CLC
         ADC #2
-        STA T0
-        LDA LP+1
-        ADC #0
-        STA T0+1
-        LDY #0
-IN_cp:  LDA (IP),y           ; copy body from IP to T0
-        STA (T0),y
+        STA LP
+        BCC IN_l2
+        INC LP+1
+IN_l2:  LDY #0
+IN_cp:  LDA (IP),y            ; copy payload from IP
+        STA (LP),y
         CMP #$0D
         BEQ IN_done
         INY
-        BRA IN_cp
+        BRA IN_cp             ; always taken for bounded line lengths (<256)
 IN_done:
         RTS
 
@@ -1110,13 +1136,7 @@ DO_IF_f_skip:
 ; =============================================================================
 DO_GOTO:
         JSR EXPR             ; evaluate target (literal or expression) -> T0
-        JSR GOTOL
-        BCS DO_gosub_ul      ; seek failed: share DO_GOSUB's error stub
-        LDA T0               ; update CURLN to target line (GOTOL leaves T0=line#)
-        STA CURLN
-        LDA T0+1
-        STA CURLN+1
-        BRA RUN_LINE         ; seek succeeded: unwind stack and run
+        BRA DO_go_common     ; GOTO has no frame to push -- skip straight to the tail
 ; =============================================================================
 ; DO_GOSUB ? GOSUB lineno
 ;   Clobbers: A X T0
@@ -1135,6 +1155,8 @@ DO_gosub_ok:
         LDA IP+1
         STA GORET+1,x
         INC GRET
+        ; fall through into the shared GOTO/GOSUB tail
+DO_go_common:                ; shared by DO_GOTO and DO_GOSUB
         JSR GOTOL
         BCS DO_gosub_ul
         LDA T0               ; update CURLN to target line (GOTOL leaves T0=line#)
@@ -1444,7 +1466,13 @@ FSTK_BASE:
 
 ; =============================================================================
 ; DO_FOR ? FOR var = start TO limit [STEP step]
-;   Clobbers: A X Y T0 T1 T2 LP
+;   Stages var_slot/limit/step into FVAR/FLIM/FSTEP, which sit immediately
+;   before CURLN in zero page (see equates) forming one contiguous 7-byte
+;   run [FVAR,FLIM,FLIM+1,FSTEP,FSTEP+1,CURLN,CURLN+1] matching the FOR_STK
+;   frame layout exactly. CURLN already holds the correct loop_line value
+;   (set once per line before STMT runs), so no separate copy is needed for
+;   it. The final push is one indexed loop instead of 7 unrolled stores.
+;   Clobbers: A X Y T0 LP
 ; =============================================================================
 DO_FOR:
         JSR WPEEK_UC
@@ -1461,87 +1489,52 @@ DO_for_ok:
         SEC
         SBC #'A'
         ASL                  ; byte offset into VARS
-        PHA                  ; save var_slot
+        STA FVAR             ; stage var_slot directly (no stack juggling)
         JSR EAT_EXPR         ; evaluate start value -> T0
-        PLA
-        TAX
-        PHA                  ; save var_slot again (needed after EAT_EXPR)
+        LDX FVAR
         LDA T0
         STA VARS,x           ; store start value in variable
         LDA T0+1
         STA VARS+1,x
         JSR EAT_EXPR         ; consume '=' then evaluate '=', then TO, then limit
-        LDA T0               ; push limit onto hardware stack
-        PHA
+        LDA T0
+        STA FLIM             ; stage limit directly
         LDA T0+1
-        PHA
+        STA FLIM+1
         JSR WPEEK
         CMP #TOK_STEP
         BNE DO_for_nostep
         JSR GETCI            ; consume STEP token
         JSR EXPR             ; evaluate step -> T0
         LDA T0
-        STA T2
+        STA FSTEP            ; stage step directly
         LDA T0+1
-        STA T2+1
+        STA FSTEP+1
         BRA DO_for_havestep
 DO_for_nostep:
         LDA #1               ; default step = 1
-        STA T2
-        STZ T2+1
+        STA FSTEP
+        STZ FSTEP+1
 DO_for_havestep:
-        LDA T2               ; step of zero is illegal
-        ORA T2+1
+        LDA FSTEP            ; step of zero is illegal
+        ORA FSTEP+1
         BNE DO_for_szok
-        PLA
-        PLA
-        PLA                  ; clean limit hi, limit lo, var_slot from stack
         LDA #ERR_ST
         JMP DO_ERROR
 DO_for_szok:
         LDA FSTK
         CMP #4               ; max 4 nested FOR loops
         BCC DO_for_push
-        PLA
-        PLA
-        PLA
         JMP DO_ERR_NR        ; ? shared error stub
 DO_for_push:
-        LDA T2               ; save step before FSTK_BASE clobbers T2
-        PHA
-        LDA T2+1
-        PHA
         LDA FSTK
-        JSR FSTK_BASE        ; LP = FOR_STK + FSTK*7  (clobbers T2)
-        PLA
-        STA T2+1             ; restore step hi
-        PLA
-        STA T2               ; restore step lo
-        PLA
-        STA T0+1             ; limit hi  (popped in push order: hi first)
-        PLA
-        STA T0               ; limit lo
-        PLA                  ; var_slot
-        LDY #0
-        STA (LP),y           ; [0] var_slot
-        INY
-        LDA T0
-        STA (LP),y           ; [1] limit_lo
-        INY
-        LDA T0+1
-        STA (LP),y           ; [2] limit_hi
-        INY
-        LDA T2
-        STA (LP),y           ; [3] step_lo
-        INY
-        LDA T2+1
-        STA (LP),y           ; [4] step_hi
-        INY
-        LDA CURLN
-        STA (LP),y           ; [5] loop_line_lo
-        INY
-        LDA CURLN+1
-        STA (LP),y           ; [6] loop_line_hi
+        JSR FSTK_BASE        ; LP = FOR_STK + FSTK*7  (clobbers T2 only)
+        LDY #6
+DO_for_cp:
+        LDA FVAR,y           ; copy FVAR,FLIM,FLIM+1,FSTEP,FSTEP+1,CURLN,CURLN+1
+        STA (LP),y           ; into the frame in one pass (offsets match exactly)
+        DEY
+        BPL DO_for_cp
         INC FSTK
         RTS
 
@@ -2129,9 +2122,9 @@ RL_LOOP:
         CMP #3
         BCS RL_DONE          ; not a relational operator: exit loop
         TAY                  ; Y = 0, 1, or 2
-        STX T2                ; stash running mask (T2 free here; assembler lacks ORA abs,x/y)
-        LDA REL_MASK,y       ; new bit
-        ORA T2               ; combine with running mask
+        TXA                  ; running mask so far
+        .DB $19               ; ORA REL_MASK,y  (opcode $19; assembler lacks the mnemonic form)
+        .DW REL_MASK
         TAX
         JSR GETCI            ; consume operator (A = '<'/'='/'>' afterward, never 0)
         BNE RL_LOOP          ; always taken
