@@ -5,63 +5,67 @@
  *
  * Also used as an embedded assembler inside sim65c02.c (included directly).
  *
- * Version history:
+ * Changelog & Version History 
+ *
  * v1.9 (Jul 2026) — Audit Pass & Syntax Regression Fixes
- *   - Added M_IND_X (zp,X) indexed indirect mode (2 bytes) for $x1 opcodes.
- *   - Added M_IND_ABSX JMP (abs,X) mode (3 bytes, $7C) [65C02-only].
- *   - Filled OPTAB gaps: ADC/CMP/SBC abs,Y and AND/EOR/ORA abs,X/abs,Y.
- *   - Integrated TSB, TRB, and STZ abs,X ($9E) into OPTAB.
- *   - Added missing abs,X rows: ASL, LSR, ROL, ROR, DEC, INC, LDY.
- *   - Added Rockwell/WDC extensions: BBR0-7/BBS0-7 and RMB0-7/SMB0-7.
- *   - Added directives: .INCLUDE "file.asm" and .INCBIN "file.bin".
- *   - Added default warnings for un-flagged 65C02 instructions.
- *   - Added CLI flags: -NoWarn65c02 and -Strict6502.
- *   - Updated cpu_mode to tri-state; Pass 2 now resets mode explicitly.
- *   - FIXED: Explicit widths (e.g., $0000) now correctly force absolute modes.
- *   - FIXED: LDX zp,Y OPTAB typo corrected from M_ZPX ($96) to M_ZPY ($B6).
- *   - FIXED: Post-error diagnostics gated on successful assembly (ok==1).
+ *   - Added M_IND_X (zp,X) indexed indirect addressing mode (2 bytes).
+ *   - Added M_IND_ABSX JMP (abs,X) addressing mode (3 bytes, $7C) [65C02-only].
+ *   - Added missing absolute indexed rows: ADC/CMP/SBC abs,Y and AND/EOR/ORA abs,X/abs,Y.
+ *   - Integrated TSB, TRB, and STZ abs,X ($9E) into the master OPTAB.
+ *   - Added missing abs,X opcode rows: ASL, LSR, ROL, ROR, DEC, INC, and LDY.
+ *   - Added Rockwell/WDC bit extensions: BBR0-7/BBS0-7 (zp,target) and RMB0-7/SMB0-7 (zp).
+ *   - Added file directives: .INCLUDE "file.asm" (depth-capped) and .INCBIN "file.bin".
+ *   - Assembling 65C02 opcodes outside of .opt proc6502 now warns by default.
+ *   - Added CLI flags: -NoWarn65c02 (suppress warnings) and -Strict6502 (warnings become errors).
+ *   - Updated cpu_mode to tri-state; Pass 2 now resets the target mode state explicitly.
+ *   - FIXED: Explicit widths (e.g., $0000) now correctly force absolute addressing modes.
+ *   - FIXED: LDX zp,Y entry corrected from mis-mapped M_ZPX ($96) to M_ZPY ($B6).
+ *   - FIXED: Post-error diagnostic listings are now gated on successful assembly (ok==1).
  *   * Note: STP ($DB) and WAI ($CB) remain explicitly out of scope.
  *
  * v1.8 — Correctness & Compatibility Pass
- *   - FIXED: Explicit "A" operands (e.g., INC A) now parse correctly as M_ACC.
- *   - FIXED: has_undef() now skips literal prefixes ($, %%, decimal) to prevent
- *     hex digits A-F from being misread as undefined symbols.
- *   - FIXED: Applied pc & 0xFFFF masking across all emissions and labels;
- *     added check_pc_overflow() to throw hard errors on out-of-bounds compiles.
- *   - FIXED: Added explicit NULL pointer checks in derive_lst_path().
+ *   - FIXED: Explicit "A" operands (e.g., INC A) are now properly parsed as M_ACC.
+ *   - FIXED: has_undef() now skips literal prefixes ($, %%, decimal), preventing hex digits 
+ *     A-F in literals from being falsely evaluated as undefined forward-referenced symbols.
+ *   - FIXED: Enforced consistent pc & 0xFFFF masking across all emissions and labels; integrated 
+ *     check_pc_overflow() to convert image-wrapping faults into hard assembly errors.
+ *   - FIXED: Resolved potential C undefined behavior by adding explicit NULL checks in derive_lst_path().
  *
  * v1.7 — Listing Output
  *   - Enabled sidecar .LST listing file generation by default.
- *   - Added -NoList CLI switch to suppress listings.
+ *   - Added -NoList CLI switch to suppress listing generation.
  *
  * v1.6 — CPU Target Switching
- *   - Added .opt proc6502 / .opt proc65c02 and .setcpu target directives.
- *   - Enforced hard errors for 65C02-specific features when in 6502 mode.
+ *   - Added target control directives: .opt proc6502 / .opt proc65c02 and .setcpu.
+ *   - In strict 6502 mode, the assembler flags all 65C02-specific opcodes, accumulator 
+ *     syntax variations, immediate BIT modes, and no-index indirect zero-page modes as errors.
  *
  * v1.5 — CLI Refresh
- *   - Added -o for output naming and -r for range extraction.
- *   - Enforced strict rejection of unknown command-line arguments.
- *   - Implemented AsmStats tracking for accurate size reporting.
+ *   - Added -o <file> for custom output names and -r $HHHH-$HHHH for binary range extraction.
+ *   - Enforced strict command-line parsing to explicitly reject unknown arguments.
+ *   - Implemented the AsmStats tracking structure for transparent size reporting.
  *
  * v1.4 — Opcode Correction
- *   - Added missing SED opcode ($F8, Set Decimal Mode) to master table.
+ *   - Added the missing SED opcode ($F8, Set Decimal Mode) to the master instruction table.
  *
  * v1.3 — Forward-Reference Sizing
- *   - Undefined/forward symbols in Pass 1 now force absolute addressing modes.
+ *   - Any Pass 1 expression containing an undefined or forward symbol now automatically 
+ *     forces absolute addressing modes (ABS/ABSX/ABSY) to safely guarantee size constraints.
+ *
  * v1.2 — Stack Protection
- *   - Made source_copy[] static to prevent 1MB stack overflow on Windows.
- * v1.1  (Mar 2026)  Header updated: full option docs, --help flag, corrected
- * v1.0  (Mar 2026)  Initial C port of assembler.py v1.6.
- *                     project version references (uBASIC v13, 4K BASIC v11).
- * 
+ *   - Converted source_copy[] allocation to static, preventing a 1MB stack overflow crash on Windows.
  * =============================================================================
  *
+ *       NOTE: 
+ *       STP ($DB) / WAI ($CB) not implemented.
+ *
  * Build (standalone):
- *   (The -DASM65C02_MAIN flag enables main(); without it the file is a
- *    pure library suitable for #include by sim65c02.c.)
  *   gcc -O2 -DASM65C02_MAIN -o asm65c02 asm65c02.c
  *   TCC -O2 -DASM65C02_MAIN -o asm65c02.exe asm65c02.c
-  *
+ *
+ *   (The -DASM65C02_MAIN flag enables main(); without it the file is a
+ *    pure library suitable for #include by sim65c02.c.)
+ *
  * Usage:
  *   asm65c02 <file.asm> [options]
  *   asm65c02 --help
@@ -76,12 +80,12 @@
  *                   Preferred ROM extraction examples:
  *                     uBASIC (2 KB at $F800):   -r $F800-$FFFF
  *                     4K BASIC (4 KB at $F000): -r $F000-$FFFF
- *   -NoList         Suppress default sidecar .LST listing generation.
+ *   -NoList        Suppress default sidecar .LST listing generation.
  *   -NoWarn65c02    Suppress the default warning issued whenever a 65C02-only
- *                   instruction is assembled in default (6502) CPU mode.
- *   -Strict6502     Treat every 65C02-only instruction as a hard error without 
- *                   needing .opt proc6502 in the source. Overrides 
- *                   -NoWarn65c02 if both are given.
+ *                   instruction is assembled in default (65C02) CPU mode.
+ *   -Strict6502     Treat every 65C02-only instruction as a hard error even in
+ *                   default (65C02) CPU mode, without needing .opt proc6502 in
+ *                   the source. Overrides -NoWarn65c02 if both are given.
  *   --dump-all      After the key-symbol table, print every assembled symbol
  *                   sorted by address.  Useful for detailed size analysis.
  *   --help, -h      Print this help and exit.
@@ -94,8 +98,6 @@
  *                .opt proc6502 / .opt proc65c02
  *                .setcpu "6502" / .setcpu "65C02"
  *                                (switch CPU mode; proc6502 enables 6502-only checks)
- *                .INCLUDE "file.asm" and .INCBIN "file.bin"
- *
  *   Equates    : NAME = expression
  *   Labels     : GLOBAL_LABEL:
  *                @local_label:   (scope resets at each new global label)
@@ -117,13 +119,7 @@
  *
  * Output (normal mode):
  *   No errors.                   (or error list)
- *   Key symbols:
- *     INIT             = $F003
- *     MAIN             = $F006
- *     ...
  *   Reset vector       = $F003
- *   ROM: $F000-$FFFF  (4096 bytes)  3 bytes free before vectors
- *
  */
 
 #include <stdio.h>
@@ -1907,8 +1903,8 @@ static void size_report(void) {
     if (free_v < 0) free_v = 0;
     printf("\nROM footprint: $%04X-$%04X = %d bytes (code before vectors)",
            start, end, used);
-   // if (free_v > 0)
-   //     printf("  (%d bytes free before vectors)", free_v);
+    if (free_v > 0)
+        printf("  (%d bytes free before vectors)", free_v);
     printf("\n");
     if (used <= 2048)
         printf("(%d/2048 = %.1f%% of 2KB)\n", used, 100.0*used/2048);
@@ -2008,7 +2004,7 @@ static int parse_hex_range(const char *s, int *start, int *end) {
 
 static void asm_usage(FILE *out) {
     fprintf(out,
-        "asm65c02 v1.9 — Toy 65C02/6502 two-pass assembler\n"
+        "asm65c02 v1.7 — Toy 65C02/6502 two-pass assembler\n"
         "\n"
         "Copyright Vincent Crabtree 2026, MIT License, See LICENSE file\n"
         "\n"
@@ -2023,6 +2019,8 @@ static void asm_usage(FILE *out) {
         "  -o <file>    Write binary image to <file> (cleaner on Win32 than stdout).\n"
         "  -r <range>   Output only address range (requires --binary or -o).\n"
         "               e.g.  -r $F800-$FFFF   or   -r F000-FFFF\n"
+        "               uBASIC:    asm65c02 uBASIC6502.asm -o rom.bin -r $F800-$FFFF\n"
+        "               4K BASIC:  asm65c02 4kBASIC.asm -o rom.bin -r $F000-$FFFF\n"
         "  -NoList      Suppress default sidecar .LST listing generation.\n"
         "  -NoWarn65c02 Suppress the default warning issued whenever a 65C02-only\n"
         "               instruction is assembled with no .opt proc6502/proc65c02\n"
@@ -2057,10 +2055,14 @@ static void asm_usage(FILE *out) {
         "  With no directive at all, 65C02-only instructions are allowed and warn\n"
         "  by default (see -NoWarn65c02/-Strict6502 above).\n"
         "\n"
+        "Projects:\n"
+        "  uBASIC6502.asm  uBASIC6502  (NMOS 6502, 2 KB ROM at $F800-$FFFF)\n"
+        "  uBASIC.asm      uBASIC      (65C02,     2 KB ROM at $F800-$FFFF)\n"
+        "  4kBASIC.asm     4K BASIC    (65C02,     4 KB ROM at $F000-$FFFF)\n"
         "\n"
         "Build:\n"
         "  gcc -O2 -DASM65C02_MAIN -o asm65c02 asm65c02.c\n"
-        "  TCC -O2 -DASM65C02_MAIN -o asm65c02.exe asm65c02.c\n"
+        "  x86_64-w64-mingw32-gcc -O2 -DASM65C02_MAIN -o asm65c02.exe asm65c02.c\n"
     );
 }
 
@@ -2175,19 +2177,19 @@ int main(int argc, char **argv) {
      * mem[]/syms[] may be incomplete or reflect a truncated pass 2, so
      * showing them was misleading. Suppress the whole block on failure. */
     if (ok) {
-    //    static const char *key_syms[] = {
-    //        "INIT","MAIN","GETLINE","STMT","EXPR","STR_BANNER",
-    //        "DO_PRINT","DO_LET","DO_IF","DO_GOTO","DO_INPUT",
-    //        "DO_END","DO_LIST","DO_RUN","DO_NEW","PRT16","PNUM",
-    //        NULL
-    //    };
+        static const char *key_syms[] = {
+            "INIT","MAIN","GETLINE","STMT","EXPR","STR_BANNER",
+            "DO_PRINT","DO_LET","DO_IF","DO_GOTO","DO_INPUT",
+            "DO_END","DO_LIST","DO_RUN","DO_NEW","PRT16","PNUM",
+            NULL
+        };
         printf("\n------------------------------------------------------------\n");
-    //    printf("Key symbols:\n");
-    //    for (int i = 0; key_syms[i]; i++) {
-    //        int sv;
-    //       if (sym_get(key_syms[i], &sv))
-    //            printf("  %-16s = $%04X\n", key_syms[i], (unsigned)sv);
-    //    }
+ //       printf("Key symbols:\n");
+ //       for (int i = 0; key_syms[i]; i++) {
+ //           int sv;
+ //         if (sym_get(key_syms[i], &sv))
+ //           printf("  %-16s = $%04X\n", key_syms[i], (unsigned)sv);
+ //   }
         int rv = mem[0xFFFC] | (mem[0xFFFD]<<8);
         printf("\n  Reset vector         = $%04X\n", (unsigned)rv);
 

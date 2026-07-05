@@ -1,5 +1,5 @@
 /*
- * sim65c02.c  —  Toy 65C02 simulator  (v7, Jul 2026)
+ * sim65c02.c  —  Toy 65C02 simulator  (v9, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
@@ -10,7 +10,7 @@
  * Build (requires asm65c02.c in the same directory):
  *   gcc -O2 -o sim65c02 sim65c02.c
  *
- * The assembler (asm65c02.c) is #included directly — no Python required.
+ * The assembler (asm65c02.c) is #included directly 
  *
  * Usage:
  *   sim65c02 <file.asm | file.bin> [options]
@@ -20,18 +20,22 @@
  *   --input "line"     Queue a line of input (CR appended); repeatable.
  *                      Multiple --input flags are consumed in order, simulating
  *                      a user typing at the terminal.  Max total 4096 bytes.
- *   --mandelbrot       Queue "RUN\r".  Both ROMs have a pre-loaded showcase
- *                      program at $0200; the showcase ends with a Mandelbrot
- *                      render.  Alias for: --input "RUN"
+ *                      Takes precedence over stdin (see below) whenever given.
  *   --maxcycles N      Cycle limit before forced exit (default 500 000 000).
- *                      Use 800 000 000 for a complete Mandelbrot render.
- *   --plain            Suppress ANSI escape sequences for cursor positioning
- *                      ($E005/$E006 writes become no-ops).  Useful for piped
- *                      output or regression testing.
+ *                      N=0 means UNLIMITED: no cycle cap and no automatic
+ *                      GETCH-idle-exhaustion exit either (see GETCH/PUTCH
+ *                      section below) -- the only ways out are a program-
+ *                      driven halt (BRK/unknown opcode/watchpoint) or
+ *                      Ctrl-C, which now exits gracefully and still prints
+ *                      --stats/-m output (see Ctrl-C section below).
  *   --verbose          Print every instruction as it executes.  Very slow;
  *                      intended for single-instruction debugging only.
  *   --stats            Print cycle count and key zero-page values on exit.
  *   --load-addr 0xNNNN Override auto-detected load address for .bin files.
+ *   --getch-addr 0xNNNN Override the GETCH (input poll) port address
+ *                      (default $E004). See GETCH/PUTCH section below.
+ *   --putch-addr 0xNNNN Override the PUTCH (character output) port address
+ *                      (default $E001). See GETCH/PUTCH section below.
  *   -w 0xADDR          Write watchpoint: log every write to address to stderr,
  *                      continue running. Repeatable.
  *   -W 0xADDR          Write watchpoint: log to stderr and halt on first write.
@@ -41,53 +45,107 @@
  *   --help             Print this help and exit.
  *
  * Typical invocations:
- *   ./sim65c02 ubasic13.asm --input "PRINT 42"
- *   ./sim65c02 4kbasic_v7.asm --input "PRINT 42"
- *   ./sim65c02 4kbasic_v7.asm --mandelbrot --maxcycles 800000000
- *   ./sim65c02 4kbasic_v7.asm --plain --input "NEW" --input "10 PRINT 1+1" --input "RUN"
+ *   ./sim65c02 4kbasic_v7.asm --input "NEW" --input "10 PRINT 1+1" --input "RUN"
  *   ./sim65c02 ubasic13.bin --load-addr 0xF800 --input "PRINT 42"
- *   ./sim65c02 ubasic.asm --plain -w 0x08 -w 0x04 --input \"PRINT 1\" -m 0x08 2
+ *   ./sim65c02 ubasic.asm -w 0x08 -w 0x04 --input \"PRINT 1\" -m 0x08 2
+ *   ./sim65c02 4kbasic_v7.asm < test_script.txt
  *
  * File types:
  *   .asm   Assembled in-process via the embedded asm65c02 assembler.
- *   .bin   Loaded as a raw binary.  Load address auto-detected from size:
- *            2048 bytes → $F800  (uBASIC v13)
- *            4096 bytes → $F000  (4K BASIC v11)
- *           65536 bytes → verbatim full-image load
- *           other size   → placed at top of 64 KB (0x10000 - size)
+ *   .bin   Loaded as a raw binary, placed at top of 64 KB (0x10000 - size).
  *          Override with --load-addr if needed.
  *
  * Kowalski virtual I/O ports:
- *   $E000  write  TERMINAL_CLS    clear screen (ANSI ESC[2J + home)
- *   $E001  write  PUTCH           character output to stdout
+ *   $E001  write  PUTCH           character output to stdout (configurable,
+ *                                 see GETCH/PUTCH section below)
  *   $E004  read   GETCH           non-blocking poll; returns 0 if no char
- *   $E005  write  TERMINAL_X_POS  set cursor column (0-based, ANSI CSI)
- *   $E006  write  TERMINAL_Y_POS  set cursor row    (0-based, ANSI CSI)
+ *                                 (configurable, see below)
+ *   $E007  write  IO_IRQ          any write triggers a maskable hardware IRQ
  *
- * GETCH detection:
- *   The simulator scans ROM from $F000 upward for the 4-byte pattern
- *   LDA $E004 / BEQ ... to locate the GETCH spin loop.  This covers both
- *   ROMs (uBASIC GETCH is in the $FF00 range, 4K BASIC in the $FF00 range).
- *   When input is exhausted and GETCH has been spinning idle for 50 000
- *   consecutive cycles the simulator terminates gracefully.
+ * GETCH/PUTCH addresses and idle-exhaustion detection (v8):
+ *   GETCH ($E004 by default) and PUTCH ($E001 by default) are intercepted.
+ *   Override with --getch-addr and --putch-addr when mapping elsewhere.
+ *   Idle-exhaustion: Every GETCH read that finds no character available 
+ *   (queued-buffer empty, or stdin at EOF) increments a counter - after 
+ *   50,000 consecutive empty reads, the simulator terminates gracefully.
+ *   This check is skipped when --maxcycles 0 where Ctrl-C exit is required.
+ * 
+ * Input source: --input queue vs. live stdin (v8):
+ *   If --input supplied anything at all (even --input ""), that buffer 
+ *   is used as a non-blocking drain, 0 returned once empty. 
+ *   --input ALWAYS takes precedence when given.
  *
- * Reset vector at $FFFC/$FFFD is used to set the initial PC on startup.
+ *   Otherwise, GETCH reads stdin directly: each poll performs a
+ *   BLOCKING fgetc(stdin), so typing is possible while the
+ *   emulated program runs (a single 6502 "cycle" can take arbitrary
+ *   wall-clock time waiting on you to type -- intentional). No isatty()
+ *   check is made; this is attempted whether stdin is a live terminal, a
+ *   pipe, or a redirected file -- which makes `sim65c02 rom.asm <
+ *   script.txt` a simple way to drive a batch test script: put
+ *   BASIC lines/commands one per line in a text file exactly as you'd
+ *   type them interactively (NEW / 10 PRINT ... / RUN / etc.) and
+ *   redirect it in. CRLF is translated to CR here to match the line-
+ *   ending convention the BASIC ROMs expect 
  *
- * Version history:
- *   v1  Initial version for microbasic / uBASIC testing.
- *   v2  Added GOSUB/RETURN, FOR/NEXT, 4K BASIC support.
- *   v3  GETCH detection, --mandelbrot, --input, --maxcycles, --stats.
- *   v4  Archive cleanup.  Fixed --load-addr.  Auto-detect ROM base from file size.
- *   v5  Replaced Python assembler subprocess with direct C call.
- *       asm65c02.c is now #included; no Python runtime required.
- *   v6  Header updated: full option docs, --help flag, --plain documented,
- *       corrected project version references (uBASIC v13, 4K BASIC v11).
- *   v7  Added -w & -W  watches to stderr output
+ *   if stdin hits EOF, maxcycles count kicks in as bore unless 
+ *   --maxcycles 0
+ *
+ * Ctrl-C (SIGINT) handling (v8):
+ *   SIGINT is caught and turned into a graceful loop exit rather than an
+ *   abrupt OS-default process kill, so --stats/-m output still prints
+ *   afterward. 
+ *
+ * * Reset vector at $FFFC/$FFFD is used to set the initial PC on startup.
+ *
+ * Changelog & Version History
+ * =============================================================================
+ *
+ * v9 — Native I/O Clean-up
+ *   - Removed deprecated --mandelbrot and --plain flags.
+ *   - Documented native stdin/script redirection workflow (`sim65c02 rom.asm < script.txt`).
+ *
+ * v8 — Opcode Expansion & I/O Refactor
+ *   - Added execution support for absolute indexed and indirect opcodes: 
+ *     CMP abs,Y ($D9), CMP (zp,X) ($C1), and LSR/ROL/ROR/LDY abs,X ($5E/$3E/$7E/$BC).
+ *   - Updated --maxcycles 0 to denote unlimited execution cycles.
+ *   - Replaced pattern-matching polling scans with clear address hooks 
+ *     (--getch-addr / --putch-addr) intercepted directly within rd()/wr().
+ *   - Tied idle-exhaustion detection to actual GETCH activity instead of PC matching.
+ *   - Added live, blocking stdin fallback with LF->CR translation when --input is omitted.
+ *   - Implemented a custom SIGINT handler for graceful Ctrl-C exits with metrics reporting.
+ *
+ * v7 — Diagnostic Watches
+ *   - Added -w and -W command-line flags to stream memory/register watches to stderr.
+ *
+ * v6 — Documentation & Help
+ *   - Integrated the --help interface and comprehensive command-line option documentation.
+ *   - Baseline alignment with target updates (uBASIC v13, 4K BASIC v11).
+ *
+ * v5 — Embedded Assembler Integration
+ *   - Eliminated the external Python dependency by directly including the C assembler 
+ *     via `#include "asm65c02.c"`.
+ *
+ * v4 — Memory Mapping
+ *   - Added automatic ROM base-address detection derived from the source file size.
+ *   - Resolved configuration issues with the --load-addr parameter.
+ *
+ * v3 — Instrumentation & Constraints
+ *   - Added execution limiters, tracking tools, and early string inputs 
+ *     (--input, --maxcycles, --stats, --mandelbrot).
+ *
+ * v2 — Control Flow Architecture
+ *   - Added hardware stack and control-flow support for GOSUB/RETURN and FOR/NEXT loops 
+ *     to run complex 4K BASIC images.
+ *
+ * v1 — Initial Baseline
+ *   - Initial execution framework for core microbasic / uBASIC interpreter verification.
+ * =============================================================================
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <stdint.h>
 #include <ctype.h>
 
@@ -119,13 +177,38 @@ static uint8_t getch_consume(void) {
 /* ── terminal cursor state (for PRINT AT support) ────────────────────────── */
 static int term_col = 0;     /* current cursor column (0-based) */
 static int term_row = 0;     /* current cursor row    (0-based) */
-static int plain_mode = 0;   /* --plain: suppress cursor-pos escapes; CR→LF */
 
 /* ── memory ─────────────────────────────────────────────────────────────── */
 uint8_t mem[65536];   /* shared with embedded asm65c02.c */
 
 /* Pending hardware IRQ: set by write to $E007, consumed by main loop */
 static int pending_irq = 0;
+
+/*
+ * g_stop_requested (v8)
+ *   Set by on_sigint() when the user presses Ctrl-C. Checked by the main
+ *   run loop's condition so a Ctrl-C produces a graceful loop exit
+ *   (falls through to the normal --stats/dump reporting code) instead of
+ *   the OS's abrupt default SIGINT termination. Declared volatile
+ *   sig_atomic_t per the standard signal-handler-safety requirement --
+ *   this is the only variable touched inside the handler.
+ *   Safe to rely on default-terminate semantics being bypassed here:
+ *   the simulator never writes to disk during the run loop (only at
+ *   startup, loading the ROM/source), so there is nothing that could be
+ *   left half-written by interrupting mid-run.
+ */
+static volatile sig_atomic_t g_stop_requested = 0;
+
+/*
+ * on_sigint (v8)  --  SIGINT handler; see g_stop_requested comment above.
+ *   In:  sig (unused, required by signal() handler signature)
+ *   Out: none
+ *   Clobbers: g_stop_requested
+ */
+static void on_sigint(int sig) {
+    (void)sig;
+    g_stop_requested = 1;
+}
 
 /* ── write watchpoints (-w log-only, -W log+halt) and post-halt dumps (-m) ── */
 #define MAX_WATCH 16
@@ -158,11 +241,92 @@ static void check_watch(uint16_t a, uint8_t v) {
     }
 }
 
+/*
+ * io_getch_addr / io_putch_addr (v8)
+ *   Configurable Kowalski-convention I/O port addresses. Default to the
+ *   traditional $E004 (GETCH, read)/$E001 (PUTCH, write), overridable via
+ *   --getch-addr/--putch-addr for ROMs that map these ports elsewhere.
+ *   Only these two ports are configurable; CLS/cursor-pos/IRQ ($E000,
+ *   $E005-$E007) remain fixed, matching the scope of what was asked for.
+ */
+static uint16_t io_getch_addr = 0xE004;
+static uint16_t io_putch_addr = 0xE001;
+
+/*
+ * use_live_stdin (v8)
+ *   Set once, after CLI parsing, before the run loop starts. True when
+ *   --input supplied no queued input (inbuf_len==0) -- i.e. --input
+ *   always takes precedence over stdin when given (even --input ""
+ *   appends a CR, so this check is unambiguous). When true, rd()'s
+ *   GETCH handling reads real stdin via a blocking fgetc() per poll
+ *   instead of draining the pre-queued inbuf[] buffer -- see rd()'s
+ *   header comment for the read model. No isatty() check is performed:
+ *   stdin is always attempted in this mode, whether it's a live
+ *   terminal, a pipe, or a redirected file.
+ */
+static int use_live_stdin = 0;
+
+/*
+ * getch_idle (v8)
+ *   Consecutive-empty-read counter for the configured GETCH address,
+ *   maintained directly inside rd() at the point of the actual I/O
+ *   event, rather than by matching the CPU's PC against a separately
+ *   located "spin loop address" (the old approach required scanning ROM
+ *   for a specific byte pattern to find where the poll loop lived in
+ *   code; this one doesn't care how the polling loop is written, only
+ *   whether the input port is being read with nothing available).
+ *   Incremented each time rd(io_getch_addr) is called and the input
+ *   queue is empty (queued-buffer mode) or stdin is at EOF (live-stdin
+ *   mode); reset to 0 the moment a real character is returned. Read by
+ *   the main loop in main() to detect "input exhausted" and terminate
+ *   gracefully (see maxcycles==0 handling there for how this interacts
+ *   with unbounded runs -- unaffected by which input source is active).
+ */
+static long long getch_idle = 0;
+
+/*
+ * rd (v8 -- GETCH read model)
+ *   Memory read, intercepting the configured GETCH address.
+ *   In:  a -- address being read
+ *   Out: byte value; for GETCH, either a real character or 0 ("no
+ *        character available right now")
+ *   Clobbers: getch_idle; in live-stdin mode, consumes one byte from
+ *             stdin per GETCH read (blocking -- see use_live_stdin)
+ *
+ *   Two input sources, chosen once at startup via use_live_stdin:
+ *     - Queued buffer (--input given): unchanged from before --
+ *       non-blocking drain of inbuf[], 0 when exhausted.
+ *     - Live stdin (--input not given): each GETCH poll performs a REAL
+ *       BLOCKING fgetc(stdin) read. This means a single 6502 "cycle" can
+ *       now take arbitrary wall-clock time while waiting for the user to
+ *       type -- intentional, this is what makes typing while the
+ *       emulated program runs possible. A terminal's Enter key sends LF
+ *       ('\n'); translated to CR ('\r') here to match the line-ending
+ *       convention the BASIC ROMs expect (same one --input's CR-append
+ *       already uses). Once stdin hits EOF, every subsequent fgetc()
+ *       call returns EOF immediately (standard C stdio behavior, no
+ *       re-blocking), so getch_idle races up and the normal exhaustion
+ *       path fires shortly after -- still subject to being disabled by
+ *       --maxcycles 0 like any other exhaustion, so a piped-input run
+ *       with --maxcycles 0 will busy-spin on instant EOF reads until
+ *       Ctrl-C rather than exit on its own; this is a known, accepted
+ *       consequence of "0 means unlimited, no exceptions" and not a bug.
+ */
 static uint8_t rd(uint16_t a) {
-    if (a == 0xE004) {
+    if (a == io_getch_addr) {
+        if (use_live_stdin) {
+            int c = fgetc(stdin);
+            if (c == EOF) { getch_idle++; return 0; }
+            getch_idle = 0;
+            if (c == '\n') c = '\r';   /* terminal Enter -> BASIC CR convention */
+            return (uint8_t)c;
+        }
         /* poll: if char available consume and return it, else 0 */
-        if (inbuf_pos < inbuf_len)
+        if (inbuf_pos < inbuf_len) {
+            getch_idle = 0;
             return (uint8_t)inbuf[inbuf_pos++];
+        }
+        getch_idle++;
         return 0;
     }
     return mem[a];
@@ -170,28 +334,23 @@ static uint8_t rd(uint16_t a) {
 
 static void wr(uint16_t a, uint8_t v) {
     check_watch(a, v);
+    if (a == io_putch_addr) {   /* PUTCH: character output */
+        putchar(v);
+        fflush(stdout);
+        return;
+    }
     switch (a) {
     case 0xE000:             /* TERMINAL_CLS: clear screen and home cursor */
-        if (!plain_mode) { fputs("\033[2J\033[H", stdout); fflush(stdout); }
+        fputs("\033[2J\033[H", stdout); fflush(stdout);
         term_col = 0; term_row = 0;
-        return;
-    case 0xE001:             /* PUTCH: character output */
-        if (plain_mode) {
-            if (v == '\r') putchar('\n');          /* CR→LF */
-            else if (v >= 0x20 && v <= 0x7e) putchar(v); /* printable ASCII only */
-            /* silently drop other bytes (cursor-pos side effects, etc.) */
-        } else {
-            putchar(v);
-        }
-        fflush(stdout);
         return;
     case 0xE005:             /* TERMINAL_X_POS: set cursor column ($E005) */
         term_col = v;
-        if (!plain_mode) { printf("\033[%d;%dH", term_row + 1, term_col + 1); fflush(stdout); }
+        printf("\033[%d;%dH", term_row + 1, term_col + 1); fflush(stdout);
         return;
     case 0xE006:             /* TERMINAL_Y_POS: set cursor row ($E006) */
         term_row = v;
-        if (!plain_mode) { printf("\033[%d;%dH", term_row + 1, term_col + 1); fflush(stdout); }
+        printf("\033[%d;%dH", term_row + 1, term_col + 1); fflush(stdout);
         return;
     case 0xE007:             /* IO_IRQ: any write triggers a maskable hardware IRQ */
         pending_irq = 1;
@@ -711,7 +870,7 @@ static int assemble_and_load(const char *asm_path) {
 /* ── main ────────────────────────────────────────────────────────────────── */
 static void sim_usage(FILE *out) {
     fprintf(out,
-        "sim65c02 v7 — 65C02 simulator for uBASIC v13 and 4K BASIC v11\n"
+        "sim65c02 v9 — 65C02 simulator for uBASIC v13 and 4K BASIC v11\n"
         "\n"
         "Usage:\n"
         "  sim65c02 <file.asm | file.bin> [options]\n"
@@ -719,13 +878,16 @@ static void sim_usage(FILE *out) {
         "\n"
         "Options:\n"
         "  --input \"line\"     Queue a line of input (CR appended); repeatable.\n"
-        "  --mandelbrot       Queue \"RUN\\r\" (showcase + Mandelbrot pre-loaded at $0200).\n"
+        "                     Takes precedence over stdin (below) whenever given.\n"
         "  --maxcycles N      Cycle limit before forced exit (default 500000000).\n"
-        "                     Use 800000000 for a complete Mandelbrot render.\n"
-        "  --plain            Suppress ANSI cursor-position escapes (for piped output).\n"
+        "                     N=0 means UNLIMITED: no cycle cap, and the GETCH-idle-\n"
+        "                     exhaustion auto-exit is skipped too -- Ctrl-C or a\n"
+        "                     program-driven halt are the only ways out.\n"
         "  --verbose          Print every instruction executed (very slow).\n"
         "  --stats            Print cycle count and ZP state on exit.\n"
         "  --load-addr 0xNNNN Override auto-detected load address for .bin files.\n"
+        "  --getch-addr 0xNNNN Override the GETCH (input poll) port (default $E004).\n"
+        "  --putch-addr 0xNNNN Override the PUTCH (char output) port (default $E001).\n"
         "  -w 0xADDR          Write watchpoint: log every write to address to stderr,\n"
         "                     continue running. Repeatable.\n"
         "  -W 0xADDR          Write watchpoint: log to stderr and halt on first write.\n"
@@ -736,9 +898,27 @@ static void sim_usage(FILE *out) {
         "\n"
         "Examples:\n"
         "  sim65c02 ubasic13.asm --input \"PRINT 42\"\n"
-        "  sim65c02 4kbasic_v7.asm --mandelbrot --maxcycles 800000000\n"
-        "  sim65c02 4kbasic_v7.asm --plain --input \"NEW\" --input \"10 PRINT 1+1\" --input \"RUN\"\n"
-        "  sim65c02 basic.asm --plain -w 0x08 -w 0x04 --input \"PRINT 1\" -m 0x08 2\n"
+        "  sim65c02 4kbasic_v7.asm --input \"NEW\" --input \"10 PRINT 1+1\" --input \"RUN\"\n"
+        "  sim65c02 basic.asm -w 0x08 -w 0x04 --input \"PRINT 1\" -m 0x08 2\n"
+        "  echo -e \"PRINT 1+1\\r\" | sim65c02 basic.asm            (piped stdin, no --input given)\n"
+        "  sim65c02 4kbasic_v7.asm < test_script.txt              (redirected test script, see below)\n"
+        "\n"
+        "Test scripts via stdin redirect: if --input is not given, GETCH reads real\n"
+        "stdin directly (blocking per poll, so you can type while the program runs;\n"
+        "Enter's LF -- or a text file's line ending -- is translated to the CR the\n"
+        "BASIC ROMs expect). This means a plain text file of BASIC lines/commands,\n"
+        "one per line exactly as you'd type them, can be redirected straight in:\n"
+        "  NEW\n"
+        "  10 PRINT \"HELLO WORLD\"\n"
+        "  20 GOTO 10\n"
+        "  RUN\n"
+        "EOF on stdin feeds the same idle-exhaustion exit as a queued buffer running\n"
+        "out, so it is likewise disabled by --maxcycles 0. A script that ends in an\n"
+        "infinite loop (like the GOTO above) requires Ctrl-C regardless of\n"
+        "--maxcycles, since the program is legitimately running, not idle-polling.\n"
+        "\n"
+        "Ctrl-C (SIGINT) exits the run loop gracefully -- --stats/-m output still\n"
+        "prints afterward, since nothing is written to disk during the run.\n"
         "\n"
         "Build:\n"
         "  gcc -O2 -o sim65c02 sim65c02.c      (asm65c02.c must be in same directory)\n"
@@ -773,10 +953,11 @@ int main(int argc, char **argv) {
                 inbuf[inbuf_len++]='\r'; /* CR */
             }
         }
-        else if(!strcmp(argv[i],"--plain"))    { plain_mode=1; }
         else if(!strcmp(argv[i],"--verbose")) { verbose=1; }
         else if(!strcmp(argv[i],"--stats"))   { show_stats=1; }
         else if(!strcmp(argv[i],"--load-addr") && i+1<argc) { bin_load_addr=(uint32_t)strtoul(argv[++i],NULL,0); }
+        else if(!strcmp(argv[i],"--getch-addr") && i+1<argc) { io_getch_addr=(uint16_t)strtoul(argv[++i],NULL,0); }
+        else if(!strcmp(argv[i],"--putch-addr") && i+1<argc) { io_putch_addr=(uint16_t)strtoul(argv[++i],NULL,0); }
         else if(!strcmp(argv[i],"-w") && i+1<argc) {
             if(nwatch<MAX_WATCH){ watch_addr[nwatch]=(uint16_t)strtoul(argv[++i],NULL,0); watch_halt[nwatch]=0; nwatch++; }
             else { i++; }
@@ -790,12 +971,6 @@ int main(int argc, char **argv) {
             int len=atoi(argv[i+2]);
             i+=2;
             if(ndump<MAX_DUMP && len>0){ dump_addr[ndump]=a; dump_len[ndump]=len; ndump++; }
-        }
-        else if(!strcmp(argv[i],"--mandelbrot")) {
-            /* showcase is pre-loaded; RUN runs it (Mandelbrot is its final section) */
-            const char *cmd="RUN\r";
-            int n=strlen(cmd);
-            if(inbuf_len+n<INBUF_MAX){ memcpy(inbuf+inbuf_len,cmd,n); inbuf_len+=n; }
         }
         else if(argv[i][0]!='-'){
             /* positional: .asm or .bin */
@@ -825,33 +1000,40 @@ int main(int argc, char **argv) {
     cpu.I=1;
     cpu.PC = mem[0xFFFC] | (mem[0xFFFD]<<8);
     if(cpu.PC==0){ fprintf(stderr,"[SIM] Reset vector is $0000 - bad ROM?\n"); return 1; }
-    fprintf(stderr,"[SIM] Reset PC=$%04X  maxcycles=%lld\n",cpu.PC,maxcycles);
+    if (maxcycles==0)
+        fprintf(stderr,"[SIM] Reset PC=$%04X  maxcycles=0 (unlimited)\n",cpu.PC);
+    else
+        fprintf(stderr,"[SIM] Reset PC=$%04X  maxcycles=%lld\n",cpu.PC,maxcycles);
 
-    /* detect GETCH address dynamically: scan for LDA $E004 / BEQ sequence */
-    uint16_t getch_addr = 0;
-    for(int ga=0xF000; ga<0xFFFF-3; ga++) {
-        if(mem[ga]==0xAD && mem[ga+1]==0x04 && mem[ga+2]==0xE0 &&
-           mem[ga+3]==0xF0) { /* BEQ */
-            getch_addr = ga;
-            break;
-        }
-    }
-    fprintf(stderr,"[SIM] GETCH detected at $%04X\n", getch_addr);
+    /* v8: --input always takes precedence when given; fall back to live
+     * stdin only if it supplied nothing (see use_live_stdin header
+     * comment). inbuf_len is final by this point. */
+    use_live_stdin = (inbuf_len == 0);
+
+    /* v8: GETCH/PUTCH are configured addresses (see io_getch_addr/
+     * io_putch_addr, --getch-addr/--putch-addr), not scanned or detected
+     * -- always shown here since there's nothing left to "detect". */
+    fprintf(stderr,"[SIM] GETCH addr=$%04X  PUTCH addr=$%04X  input=%s\n",
+            io_getch_addr, io_putch_addr,
+            use_live_stdin ? "stdin (live)" : "--input queue");
+
+    /* v8: catch Ctrl-C so the run loop exits gracefully (falls through to
+     * --stats/-m reporting below) instead of an abrupt OS-default kill.
+     * See g_stop_requested comment for why this is safe to do. */
+    signal(SIGINT, on_sigint);
 
     /* run */
     long long cycles=0;
-    long long getch_idle=0;
-    while(cycles < maxcycles){
-        /* detect spinning in GETCH loop with empty input queue → terminate */
-        if(getch_addr && cpu.PC==getch_addr && inbuf_pos >= inbuf_len) {
-            if(++getch_idle > 50000) {
-                fprintf(stderr,"\n[SIM] Input exhausted after %lld cycles\n",cycles);
-                break;
-            }
-        } else {
-            if(cpu.PC != getch_addr) getch_idle=0;
+    while(!g_stop_requested && (maxcycles==0 || cycles < maxcycles)){
+        /* v8: idle-exhaustion is driven directly by rd()'s getch_idle
+         * counter now (see its header comment) -- no PC-matching needed.
+         * When maxcycles==0 (unlimited), this check is skipped entirely:
+         * unlimited means unlimited, with no automatic exit other than a
+         * program-driven halt (BRK/unknown opcode/watchpoint) or Ctrl-C. */
+        if(maxcycles!=0 && getch_idle > 50000) {
+            fprintf(stderr,"\n[SIM] Input exhausted after %lld cycles\n",cycles);
+            break;
         }
-
 
         int r=step(&cpu);
         cycles++;
@@ -875,7 +1057,9 @@ int main(int argc, char **argv) {
             cpu.PC = (uint16_t)mem[0xFFFE] | ((uint16_t)mem[0xFFFF] << 8);
         }
     }
-    if(cycles>=maxcycles)
+    if(g_stop_requested)
+        fprintf(stderr,"\n[SIM] Interrupted by user (Ctrl-C) after %lld cycles\n",cycles);
+    else if(maxcycles!=0 && cycles>=maxcycles)
         fprintf(stderr,"\n[SIM] Cycle limit %lld reached\n",maxcycles);
 
     if(show_stats){
