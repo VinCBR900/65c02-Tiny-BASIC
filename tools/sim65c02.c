@@ -10,7 +10,7 @@
  * Build (requires asm65c02.c in the same directory):
  *   gcc -O2 -o sim65c02 sim65c02.c
  *
- * The assembler (asm65c02.c) is #included directly 
+ * The assembler (asm65c02.c) is #included directly — no Python required.
  *
  * Usage:
  *   sim65c02 <file.asm | file.bin> [options]
@@ -45,101 +45,133 @@
  *   --help             Print this help and exit.
  *
  * Typical invocations:
+ *   ./sim65c02 ubasic13.asm --input "PRINT 42"
  *   ./sim65c02 4kbasic_v7.asm --input "NEW" --input "10 PRINT 1+1" --input "RUN"
  *   ./sim65c02 ubasic13.bin --load-addr 0xF800 --input "PRINT 42"
  *   ./sim65c02 ubasic.asm -w 0x08 -w 0x04 --input \"PRINT 1\" -m 0x08 2
  *   ./sim65c02 4kbasic_v7.asm < test_script.txt
+ *       (test_script.txt is a plain text file of BASIC lines/commands, one
+ *        per line, exactly as you'd type them -- see "Input source" below.
+ *        A script ending in a GOTO loop runs forever; Ctrl-C stops it.)
  *
  * File types:
  *   .asm   Assembled in-process via the embedded asm65c02 assembler.
- *   .bin   Loaded as a raw binary, placed at top of 64 KB (0x10000 - size).
+ *   .bin   Loaded as a raw binary.  Load address auto-detected from size:
+ *            2048 bytes → $F800  (uBASIC v13)
+ *            4096 bytes → $F000  (4K BASIC v11)
+ *           65536 bytes → verbatim full-image load
+ *           other size   → placed at top of 64 KB (0x10000 - size)
  *          Override with --load-addr if needed.
  *
  * Kowalski virtual I/O ports:
+ *   $E000  write  TERMINAL_CLS    clear screen (ANSI ESC[2J + home)
  *   $E001  write  PUTCH           character output to stdout (configurable,
  *                                 see GETCH/PUTCH section below)
  *   $E004  read   GETCH           non-blocking poll; returns 0 if no char
  *                                 (configurable, see below)
+ *   $E005  write  TERMINAL_X_POS  set cursor column (0-based, ANSI CSI)
+ *   $E006  write  TERMINAL_Y_POS  set cursor row    (0-based, ANSI CSI)
  *   $E007  write  IO_IRQ          any write triggers a maskable hardware IRQ
  *
  * GETCH/PUTCH addresses and idle-exhaustion detection (v8):
- *   GETCH ($E004 by default) and PUTCH ($E001 by default) are intercepted.
- *   Override with --getch-addr and --putch-addr when mapping elsewhere.
- *   Idle-exhaustion: Every GETCH read that finds no character available 
- *   (queued-buffer empty, or stdin at EOF) increments a counter - after 
- *   50,000 consecutive empty reads, the simulator terminates gracefully.
- *   This check is skipped when --maxcycles 0 where Ctrl-C exit is required.
- * 
- * Input source: --input queue vs. live stdin (v8):
- *   If --input supplied anything at all (even --input ""), that buffer 
- *   is used as a non-blocking drain, 0 returned once empty. 
- *   --input ALWAYS takes precedence when given.
+ *   GETCH ($E004 by default) and PUTCH ($E001 by default) are plain
+ *   configured memory addresses -- intercepted directly by rd()/wr() --
+ *   not detected or scanned for in any way. Override with --getch-addr/
+ *   --putch-addr for a ROM that maps these ports elsewhere. This works
+ *   identically whether the image came from assembling a .asm source or
+ *   loading a raw .bin (there is no dependency on symbols or on any
+ *   particular polling-loop code shape).
  *
- *   Otherwise, GETCH reads stdin directly: each poll performs a
- *   BLOCKING fgetc(stdin), so typing is possible while the
+ *   Idle-exhaustion: every read of the GETCH address that finds no
+ *   character available (queued-buffer empty, or stdin at EOF in live
+ *   mode -- see below) increments a counter (reset to 0 the moment a
+ *   real character is returned); once that counter passes 50 000
+ *   consecutive empty reads, the simulator concludes input is exhausted
+ *   and terminates gracefully. This check is itself skipped when
+ *   --maxcycles 0 is given (see --maxcycles above) -- unlimited mode is
+ *   unlimited, full stop, Ctrl-C is the only way out short of a program-
+ *   driven halt.
+ *
+ * Input source: --input queue vs. live stdin (v8):
+ *   If --input supplied anything at all (even --input ""), that queued
+ *   buffer is used exactly as before -- a non-blocking drain, 0 returned
+ *   once empty. --input ALWAYS takes precedence when given.
+ *
+ *   Otherwise, GETCH reads real stdin directly: each poll performs a
+ *   genuine BLOCKING fgetc(stdin), so typing is possible while the
  *   emulated program runs (a single 6502 "cycle" can take arbitrary
  *   wall-clock time waiting on you to type -- intentional). No isatty()
  *   check is made; this is attempted whether stdin is a live terminal, a
  *   pipe, or a redirected file -- which makes `sim65c02 rom.asm <
- *   script.txt` a simple way to drive a batch test script: put
+ *   script.txt` a plain, direct way to drive a batch test script: put
  *   BASIC lines/commands one per line in a text file exactly as you'd
  *   type them interactively (NEW / 10 PRINT ... / RUN / etc.) and
- *   redirect it in. CRLF is translated to CR here to match the line-
- *   ending convention the BASIC ROMs expect 
+ *   redirect it in. A terminal's Enter key (or a text file's line
+ *   ending) sends LF; it's translated to CR here to match the line-
+ *   ending convention the BASIC ROMs expect (the same one --input's own
+ *   CR-append already uses).
  *
- *   if stdin hits EOF, maxcycles count kicks in as bore unless 
- *   --maxcycles 0
+ *   Once stdin hits EOF, every later fgetc() returns EOF immediately (no
+ *   re-blocking), so the idle counter races up and the normal
+ *   exhaustion path above fires shortly after -- still subject to being
+ *   disabled by --maxcycles 0 like any other exhaustion. That means a
+ *   redirected/piped-input run with --maxcycles 0 will busy-spin on
+ *   instant EOF reads until Ctrl-C rather than exit on its own -- a
+ *   known, accepted consequence of "0 means unlimited, no exceptions,"
+ *   not a bug. This also applies if the script itself never ends (e.g.
+ *   ends on a GOTO loop): Ctrl-C is required to stop it regardless of
+ *   --maxcycles, since the program is still legitimately running, not
+ *   idle-polling for input.
  *
  * Ctrl-C (SIGINT) handling (v8):
  *   SIGINT is caught and turned into a graceful loop exit rather than an
  *   abrupt OS-default process kill, so --stats/-m output still prints
- *   afterward. 
+ *   afterward. This is safe because the simulator never writes to disk
+ *   during the run loop (only at startup, reading the ROM/source), so
+ *   there's nothing an abrupt interruption could leave half-written.
  *
- * * Reset vector at $FFFC/$FFFD is used to set the initial PC on startup.
+ * Reset vector at $FFFC/$FFFD is used to set the initial PC on startup.
  *
- * Changelog & Version History
- * =============================================================================
- *
- * v9 — Native I/O Clean-up
- *   - Removed deprecated --mandelbrot and --plain flags.
- *   - Documented native stdin/script redirection workflow (`sim65c02 rom.asm < script.txt`).
- *
- * v8 — Opcode Expansion & I/O Refactor
- *   - Added execution support for absolute indexed and indirect opcodes: 
- *     CMP abs,Y ($D9), CMP (zp,X) ($C1), and LSR/ROL/ROR/LDY abs,X ($5E/$3E/$7E/$BC).
- *   - Updated --maxcycles 0 to denote unlimited execution cycles.
- *   - Replaced pattern-matching polling scans with clear address hooks 
- *     (--getch-addr / --putch-addr) intercepted directly within rd()/wr().
- *   - Tied idle-exhaustion detection to actual GETCH activity instead of PC matching.
- *   - Added live, blocking stdin fallback with LF->CR translation when --input is omitted.
- *   - Implemented a custom SIGINT handler for graceful Ctrl-C exits with metrics reporting.
- *
- * v7 — Diagnostic Watches
- *   - Added -w and -W command-line flags to stream memory/register watches to stderr.
- *
- * v6 — Documentation & Help
- *   - Integrated the --help interface and comprehensive command-line option documentation.
- *   - Baseline alignment with target updates (uBASIC v13, 4K BASIC v11).
- *
- * v5 — Embedded Assembler Integration
- *   - Eliminated the external Python dependency by directly including the C assembler 
- *     via `#include "asm65c02.c"`.
- *
- * v4 — Memory Mapping
- *   - Added automatic ROM base-address detection derived from the source file size.
- *   - Resolved configuration issues with the --load-addr parameter.
- *
- * v3 — Instrumentation & Constraints
- *   - Added execution limiters, tracking tools, and early string inputs 
- *     (--input, --maxcycles, --stats, --mandelbrot).
- *
- * v2 — Control Flow Architecture
- *   - Added hardware stack and control-flow support for GOSUB/RETURN and FOR/NEXT loops 
- *     to run complex 4K BASIC images.
- *
- * v1 — Initial Baseline
- *   - Initial execution framework for core microbasic / uBASIC interpreter verification.
- * =============================================================================
+ * Version history:
+ *   v1  Initial version for microbasic / uBASIC testing.
+ *   v2  Added GOSUB/RETURN, FOR/NEXT, 4K BASIC support.
+ *   v3  GETCH detection, --mandelbrot, --input, --maxcycles, --stats.
+ *   v4  Archive cleanup.  Fixed --load-addr.  Auto-detect ROM base from file size.
+ *   v5  Replaced Python assembler subprocess with direct C call.
+ *       asm65c02.c is now #included; no Python runtime required.
+ *   v6  Header updated: full option docs, --help flag, --plain documented,
+ *       corrected project version references (uBASIC v13, 4K BASIC v11).
+ *   v7  Added -w & -W  watches to stderr output
+ *   v8  Added CMP abs,Y ($D9) and CMP (zp,X) ($C1) execution -- newly
+ *       reachable once asm65c02.c v1.9 could emit them. Added execution
+ *       for LSR/ROL/ROR/LDY abs,X ($5E/$3E/$7E/$BC), same reason.
+ *       --maxcycles 0 now means unlimited (previously would run zero
+ *       cycles, since the loop test was cycles<maxcycles with cycles
+ *       starting at 0). GETCH/PUTCH replaced the old ROM byte-pattern
+ *       scan (fragile: only matched one specific polling-loop shape,
+ *       and never worked at all for raw .bin loads) with plain
+ *       configurable addresses (--getch-addr/--putch-addr) intercepted
+ *       directly in rd()/wr(); idle-exhaustion detection now keys off
+ *       actual GETCH-read activity instead of PC-address matching, and
+ *       is itself skipped when --maxcycles 0 is given. Added a SIGINT
+ *       handler so Ctrl-C exits the run loop gracefully (prints
+ *       --stats/-m output) instead of an abrupt kill. When --input
+ *       supplies no input, GETCH now reads real stdin directly (blocking
+ *       fgetc() per poll, LF->CR translation, EOF feeds the same idle-
+ *       exhaustion path) instead of always requiring pre-queued --input;
+ *       --input still takes precedence whenever given.
+ *   v9  Removed --mandelbrot and --plain: both were demo/display
+ *       conveniences from before real stdin support existed (--mandelbrot
+ *       was just --input "RUN"; --plain suppressed ANSI cursor escapes
+ *       for piped output). Now that any text file can be redirected in
+ *       directly (`sim65c02 rom.asm < script.txt`, one BASIC line/command
+ *       per line, exactly as you'd type it), both are redundant --
+ *       terminal/cursor output always uses ANSI escapes unconditionally
+ *       now (the behavior --plain used to opt OUT of). Documented the
+ *       stdin-redirect-as-test-script workflow explicitly, including
+ *       that a script ending in an infinite loop (e.g. GOTO) requires
+ *       Ctrl-C regardless of --maxcycles, since the program is
+ *       legitimately running, not idle-polling for input.
  */
 
 #include <stdio.h>
