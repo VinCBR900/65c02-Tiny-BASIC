@@ -1,31 +1,60 @@
 /*
- * J Bell Sumulator JB-sim65c02.c  —  Toy 6502 simulator  (v8, Jun 2026)
+ * JB-sim65c02.c  —  Toy NMOS 6502 simulator  (v2, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
  * Canonical simulator for:
- *   uBASIC6502.asm  v1.4  John Bell Engineering PN 80-153 port
+ *   JB-uBASIC6502.asm    John Bell Engineering PN 80-153 port
  *                         (2 KB ROM at $F800-$FFFF, 1 KB RAM $0000-$03FF)
+ *                         Real hardware: NMOS 6502, NOT 65C02 -- see
+ *                         "NMOS strictness" section below.
  *
  * Build (requires asm65c02.c in the same directory):
- *   gcc -O2 -o sim65c02 sim65c02.c
+ *   gcc -O2 -o JB-sim65c02 JB-sim65c02.c
  *
  * The assembler (asm65c02.c) is #included directly — no Python required.
  *
  * Usage:
- *   sim65c02 <file.asm | file.bin> [options]
- *   sim65c02 --help
+ *   JB-sim65c02 <file.asm | file.bin> [options]
+ *   JB-sim65c02 --help
  *
  * Options:
  *   --input "line"     Queue a line of input (CR appended); repeatable.
  *                      Multiple --input flags are consumed in order, simulating
  *                      a user typing at the terminal.  Max total 4096 bytes.
+ *                      Takes precedence over stdin (see below) whenever given.
  *   --maxcycles N      Cycle limit before forced exit (default 500 000 000).
+ *                      N=0 means UNLIMITED: no cycle cap and no automatic
+ *                      GETCH-idle-exhaustion exit either (see GETCH idle
+ *                      detection section below) -- the only ways out are a
+ *                      program-driven halt (BRK/unknown/illegal-65C02
+ *                      opcode) or Ctrl-C, which exits gracefully and still
+ *                      prints --stats output (see Ctrl-C section below).
+ *   --allow-65c02      Execute 65C02-only opcodes instead of halting on them.
+ *                      See "NMOS strictness" below. Off by default: this is
+ *                      real NMOS 6502 hardware.
  *   --plain            Suppress ANSI escape sequences; CR→LF.
  *   --verbose          Print every instruction as it executes.  Very slow.
  *   --stats            Print cycle count and key zero-page values on exit.
  *   --load-addr 0xNNNN Override auto-detected load address for .bin files.
  *   --help             Print this help and exit.
+ *
+ * NMOS strictness (v2):
+ *   The real board is an NMOS 6502 -- it does not have STZ, PHX/PLX/
+ *   PHY/PLY, INC A/DEC A, (zp) indirect without an index, BIT #imm, BRA,
+ *   BBR/BBS, RMB/SMB, JMP (abs,X), or TSB/TRB. Those opcode VALUES exist
+ *   on real NMOS silicon too, but as undocumented/illegal opcodes with
+ *   different (and chip-revision-dependent) behavior -- not the 65C02
+ *   meaning. By default this simulator halts with a clear message if the
+ *   ROM ever executes one of these, rather than silently running 65C02
+ *   semantics real hardware would never produce. This also means: if
+ *   JB-uBASIC6502.asm is assembled with asm65c02.c's default (65C02)
+ *   mode instead of ".opt proc6502"/"--Strict6502", any accidental use
+ *   of a 65C02-only mnemonic will now be caught here at run time (it
+ *   should ideally be caught at assemble time instead -- consider
+ *   building this ROM with -Strict6502 or ".opt proc6502" in the
+ *   source). --allow-65c02 restores the old always-execute behavior, for
+ *   comparing against a hypothetical 65C02 build or while porting code.
  *
  * Bell SBC I/O model (6522 VIA bitbang UART):
  *   $1C03  write  VIA_DDRA   silently accepted (direction register)
@@ -39,31 +68,92 @@
  *   JSR to either address is intercepted and treated as an instant RTS,
  *   making IO fast without altering any other behaviour.
  *
- * GETCH idle detection:
- *   Scans ROM for the Bell GETCH spin pattern:
- *     LDA $1C0F ($AD $0F $1C) / AND #$02 ($29 $02) / BNE ...
- *   When input is exhausted and PC is at this address for 50 000 consecutive
- *   cycles the simulator terminates gracefully.
+ * GETCH idle detection (v2 -- rewritten):
+ *   Previously this scanned ROM for one exact GETCH byte pattern
+ *   (LDA $1C0F / AND #$02 / BNE) and matched the CPU's PC against it --
+ *   fragile, since it only recognized that one code shape. Idle-
+ *   exhaustion is now driven directly by actual VIA_ORA poll activity:
+ *   every "waiting for a start bit" poll (rx not currently mid-byte)
+ *   that finds nothing available increments a counter (reset to 0 the
+ *   instant a start bit is actually signalled); once that counter passes
+ *   50 000 consecutive empty polls, the simulator concludes input is
+ *   exhausted and terminates gracefully. Skipped entirely when
+ *   --maxcycles 0 is given -- unlimited mode is unlimited, full stop.
+ *
+ * Input source: --input queue vs. live stdin (v2):
+ *   If --input supplied anything at all (even --input ""), that queued
+ *   buffer is used exactly as before -- a non-blocking drain. --input
+ *   ALWAYS takes precedence when given.
+ *
+ *   Otherwise, the "waiting for a start bit" poll reads real stdin
+ *   directly: a genuine BLOCKING fgetc(stdin), so typing is possible
+ *   while the emulated program runs. No isatty() check is made; this is
+ *   attempted whether stdin is a live terminal, a pipe, or a redirected
+ *   file -- which makes `JB-sim65c02 rom.asm < script.txt` a plain way
+ *   to drive a batch test script (BASIC lines/commands one per line,
+ *   exactly as you'd type them). A terminal's Enter key (or a text
+ *   file's line ending) sends LF; translated to CR here to match the
+ *   line-ending convention the BASIC ROM expects (the same one
+ *   --input's own CR-append already uses).
+ *
+ *   Once stdin hits EOF, every later fgetc() returns EOF immediately (no
+ *   re-blocking), so the idle counter races up and the exhaustion path
+ *   above fires shortly after -- still subject to being disabled by
+ *   --maxcycles 0. A redirected/piped-input run with --maxcycles 0 will
+ *   busy-spin on instant EOF reads until Ctrl-C rather than exit on its
+ *   own -- a known, accepted consequence of "0 means unlimited, no
+ *   exceptions," not a bug. Likewise, a script that never ends (e.g. a
+ *   BASIC GOTO loop) requires Ctrl-C regardless of --maxcycles, since the
+ *   program is legitimately running, not idle-polling for input.
+ *
+ * Ctrl-C (SIGINT) handling (v2):
+ *   SIGINT is caught and turned into a graceful loop exit rather than an
+ *   abrupt OS-default process kill, so --stats output still prints
+ *   afterward. This is safe because the simulator never writes to disk
+ *   during the run loop (only at startup, reading the ROM/source), so
+ *   there's nothing an abrupt interruption could leave half-written.
  *
  * Reset vector at $FFFC/$FFFD is used to set the initial PC on startup.
  *
  * Typical invocations:
- *   ./sim65c02 uBASIC6502.asm --plain --input "PRINT 6*7"
- *   ./sim65c02 uBASIC6502.asm --plain --input "10 PRINT 42" --input "RUN"
- *   ./sim65c02 uBASIC6502.asm --plain --input "LIST"
+ *   ./JB-sim65c02 uBASIC6502.asm --plain --input "PRINT 6*7"
+ *   ./JB-sim65c02 uBASIC6502.asm --plain --input "10 PRINT 42" --input "RUN"
+ *   ./JB-sim65c02 uBASIC6502.asm --plain --input "LIST"
+ *   ./JB-sim65c02 uBASIC6502.asm --plain < test_script.txt
+ *   ./JB-sim65c02 uBASIC6502.asm --plain --maxcycles 0    (Ctrl-C to stop)
  *
  * Version history:
- *   v1-v6  Kowalski/uBASIC simulator (see sim65c02_kowalski_archive.c).
- *   v7     Header updated; --plain documented.
- *   v8     Ported to John Bell Engineering PN 80-153 I/O model.
+ *   v1     Sim65c02.c V7 Ported to John Bell Engineering PN 80-153 I/O model.
  *          Replaced Kowalski virtual ports ($E000-$E007) with 6522 VIA
  *          bitbang UART at $1C03/$1C0F.  Added TX bit accumulator,
  *          DELAY_BIT/DELAY_HALF symbol interception, updated GETCH pattern scan.
+ *   v2     Correctness review + debugging support:
+ *          - Added --allow-65c02 (default OFF): 65C02-only opcodes now
+ *            halt with a clear "invalid on NMOS 6502" message instead of
+ *            silently executing, since this is real NMOS hardware.
+ *          - Added real NMOS opcodes that were simply missing (inherited
+ *            from the pre-v8 sim65c02.c fork, same bugs already fixed on
+ *            that branch): SBC/AND/ORA/EOR (zp,X); CMP abs,Y and (zp,X);
+ *            LDY abs,X; LSR/ROL/ROR abs,X.
+ *          - --maxcycles 0 now means unlimited (previously would run
+ *            zero cycles, since the loop test was cycles<maxcycles with
+ *            cycles starting at 0).
+ *          - GETCH idle detection rewritten: replaced the ROM byte-
+ *            pattern scan (fragile, one exact code shape only) with
+ *            idle-tracking driven directly by VIA_ORA poll activity in
+ *            rd(); also skipped when --maxcycles 0 is given.
+ *          - Added a SIGINT handler so Ctrl-C exits the run loop
+ *            gracefully (prints --stats output) instead of an abrupt kill.
+ *          - Added live stdin support when --input supplies no input
+ *            (blocking fgetc() per start-bit poll, LF->CR translation,
+ *            EOF feeds the same idle-exhaustion path), enabling
+ *            `JB-sim65c02 rom.asm < script.txt` for batch test scripts.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <stdint.h>
 #include <ctype.h>
 
@@ -95,6 +185,32 @@ static uint8_t getch_consume(void) {
 /* ── terminal cursor state ───────────────────────────────────────────────── */
 static int plain_mode = 0;   /* --plain: suppress ANSI escapes; CR→LF */
 
+/*
+ * g_stop_requested (v2)
+ *   Set by on_sigint() when the user presses Ctrl-C. Checked by the main
+ *   run loop's condition so a Ctrl-C produces a graceful loop exit
+ *   (falls through to the normal --stats reporting code) instead of the
+ *   OS's abrupt default SIGINT termination. Declared volatile
+ *   sig_atomic_t per the standard signal-handler-safety requirement --
+ *   this is the only variable touched inside the handler.
+ *   Safe to rely on default-terminate semantics being bypassed here:
+ *   the simulator never writes to disk during the run loop (only at
+ *   startup, loading the ROM/source), so there is nothing that could be
+ *   left half-written by interrupting mid-run.
+ */
+static volatile sig_atomic_t g_stop_requested = 0;
+
+/*
+ * on_sigint (v2)  --  SIGINT handler; see g_stop_requested comment above.
+ *   In:  sig (unused, required by signal() handler signature)
+ *   Out: none
+ *   Clobbers: g_stop_requested
+ */
+static void on_sigint(int sig) {
+    (void)sig;
+    g_stop_requested = 1;
+}
+
 /* ── memory ──────────────────────────────────────────────────────────────── */
 uint8_t mem[65536];   /* shared with embedded asm65c02.c */
 
@@ -123,19 +239,84 @@ static uint8_t rx_char     = 0;   /* character currently being received */
 static uint16_t delay_bit_addr  = 0;
 static uint16_t delay_half_addr = 0;
 
+/*
+ * use_live_stdin (v2)
+ *   Set once, after CLI parsing, before the run loop starts. True when
+ *   --input supplied no queued input (inbuf_len==0) -- --input always
+ *   takes precedence over stdin when given (even --input "" appends a
+ *   CR, so this check is unambiguous). When true, rd()'s "waiting for a
+ *   start bit" check reads real stdin via a blocking fgetc() instead of
+ *   draining inbuf[]. No isatty() check: stdin is always attempted,
+ *   whether it's a live terminal, a pipe, or a redirected file.
+ */
+static int use_live_stdin = 0;
+
+/*
+ * getch_idle (v2)
+ *   Consecutive-empty-poll counter, maintained directly inside rd() at
+ *   the point of the actual "waiting for a start bit" event, rather
+ *   than by scanning ROM for a specific byte pattern to find where the
+ *   poll loop lives in code and then matching the CPU's PC against it
+ *   (the old GC_WAIT approach -- fragile, and it only ever worked for
+ *   one exact GETCH code shape). Incremented each time rd(VIA_ORA_ADDR)
+ *   is polled with !rx_serving and no character available (queued
+ *   buffer empty, or stdin at EOF in live mode); reset to 0 the moment
+ *   a start bit is actually signalled. NOT incremented while mid-byte
+ *   (rx_serving==1) -- that's forward progress, not idle. Read by the
+ *   main loop to detect "input exhausted" and terminate gracefully
+ *   (see maxcycles==0 handling there for unbounded-run interaction).
+ */
+static long long getch_idle = 0;
+
+/*
+ * rd (v2 -- RX read model)
+ *   Memory read, intercepting VIA_ORA (bitbang RX/TX shared register).
+ *   In:  a -- address being read
+ *   Out: byte value; for VIA_ORA, PA1 reflects idle/mark, start bit, or
+ *        the current data bit depending on rx_serving/rx_bit_phase
+ *   Clobbers: rx_serving, rx_bit_phase, rx_char, getch_idle; in
+ *             live-stdin mode, consumes one byte from stdin per
+ *             "waiting for start bit" poll (blocking -- see
+ *             use_live_stdin)
+ *
+ *   Two input sources, chosen once at startup via use_live_stdin:
+ *     - Queued buffer (--input given): unchanged from before --
+ *       non-blocking drain of inbuf[], idle (PA1=1) when exhausted.
+ *     - Live stdin (--input not given): the "waiting for start bit"
+ *       check performs a REAL BLOCKING fgetc(stdin). A terminal's Enter
+ *       key (or a text file's line ending) sends LF; translated to CR
+ *       here to match the line-ending convention the BASIC ROM expects
+ *       (the same one --input's own CR-append already uses). Once
+ *       stdin hits EOF, every later fgetc() returns EOF immediately (no
+ *       re-blocking), so getch_idle races up and the exhaustion path
+ *       fires shortly after -- still subject to being disabled by
+ *       --maxcycles 0 like any other exhaustion.
+ */
 static uint8_t rd(uint16_t a) {
     if (a == VIA_ORA_ADDR) {
         /* GETCH polls VIA_ORA, ANDs with VIA_RX_BIT ($02), BNEs if set.
          * Idle (mark) = PA1=1 → return $02.  Start bit = PA1=0 → return $00.
          * Once a start bit is signalled, rx_serving drives the byte delivery. */
         if (!rx_serving) {
+            if (use_live_stdin) {
+                int c = fgetc(stdin);
+                if (c == EOF) { getch_idle++; return VIA_RX_BIT; }
+                getch_idle = 0;
+                if (c == '\n') c = '\r';   /* terminal Enter -> BASIC CR convention */
+                rx_char      = (uint8_t)c;
+                rx_serving   = 1;
+                rx_bit_phase = 0;
+                return 0x00;
+            }
             if (inbuf_pos < inbuf_len) {
                 /* Start bit: PA1 goes low.  Latch the char and begin serving. */
+                getch_idle   = 0;
                 rx_char      = (uint8_t)inbuf[inbuf_pos++];
                 rx_serving   = 1;
                 rx_bit_phase = 0;
                 return 0x00;   /* PA1=0: start bit detected */
             }
+            getch_idle++;
             return VIA_RX_BIT; /* PA1=1: idle/mark, no char */
         } else {
             /* Mid-receive: return the current data bit on PA1 (bit 1).
@@ -311,12 +492,67 @@ static uint16_t branch(uint16_t pc, uint8_t off) {
 /* ── single step ─────────────────────────────────────────────────────────── */
 static long long cycle_count = 0;
 
+/*
+ * allow_65c02 (v2)
+ *   0 (default): strict NMOS 6502 -- opcode_is_65c02_only() opcodes halt
+ *   with a distinct message instead of being executed. This machine has
+ *   a real NMOS 6502, not a 65C02, so these opcode values don't mean
+ *   what this simulator's dispatch table says they mean on real
+ *   hardware (undocumented/illegal opcodes, chip-revision-dependent).
+ *   1 (--allow-65c02 given): execute them anyway with 65C02 semantics,
+ *   exactly as before this option existed. Useful for comparing against
+ *   a 65C02 build of the same ROM, or while porting code across targets.
+ */
+static int allow_65c02 = 0;
+
+/*
+ * opcode_is_65c02_only (v2)
+ *   In:  op -- opcode byte about to be dispatched
+ *   Out: return 1 if op only exists on 65C02 (STZ, PHX/PLX/PHY/PLY,
+ *        INC A/DEC A, (zp) indirect w/o index, BIT #imm, BRA, BBR/BBS,
+ *        RMB/SMB, JMP (abs,X), TSB/TRB); 0 otherwise (either a real
+ *        NMOS opcode, or a genuinely unknown/illegal byte -- the latter
+ *        still falls through to step()'s normal "Unknown opcode" halt).
+ *   Clobbers: none
+ */
+static int opcode_is_65c02_only(uint8_t op) {
+    switch (op) {
+    case 0xB2: case 0x92:                                   /* LDA/STA (zp) */
+    case 0x72: case 0xF2: case 0x32: case 0x12: case 0x52:  /* ADC/SBC/AND/ORA/EOR (zp) */
+    case 0x64: case 0x74: case 0x9C: case 0x9E:             /* STZ */
+    case 0xDA: case 0xFA: case 0x5A: case 0x7A:             /* PHX/PLX/PHY/PLY */
+    case 0x1A: case 0x3A:                                   /* INC A/DEC A */
+    case 0x89:                                               /* BIT #imm */
+    case 0x80:                                               /* BRA */
+    case 0x0F: case 0x1F: case 0x2F: case 0x3F:             /* BBR0-3 */
+    case 0x4F: case 0x5F: case 0x6F: case 0x7F:             /* BBR4-7 */
+    case 0x8F: case 0x9F: case 0xAF: case 0xBF:             /* BBS0-3 */
+    case 0xCF: case 0xDF: case 0xEF: case 0xFF:             /* BBS4-7 */
+    case 0x07: case 0x17: case 0x27: case 0x37:             /* RMB0-3 */
+    case 0x47: case 0x57: case 0x67: case 0x77:             /* RMB4-7 */
+    case 0x87: case 0x97: case 0xA7: case 0xB7:             /* SMB0-3 */
+    case 0xC7: case 0xD7: case 0xE7: case 0xF7:             /* SMB4-7 */
+    case 0x7C:                                               /* JMP (abs,X) */
+    case 0x04: case 0x0C: case 0x14: case 0x1C:             /* TSB/TRB */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 /* returns 0=ok, 1=BRK/unknown */
 static int step(CPU *cpu) {
     uint16_t pc = cpu->PC;
     uint8_t  op = mem[pc];
     cpu->PC++;
     cycle_count++;
+
+    if (!allow_65c02 && opcode_is_65c02_only(op)) {
+        fprintf(stderr,
+            "\n[SIM] $%02X at $%04X is a 65C02-only opcode, invalid on NMOS 6502"
+            " (use --allow-65c02 to permit)\n", op, pc);
+        return 1;
+    }
 
 #define RD(a)    rd(a)
 #define WR(a,v)  wr(a,v)
@@ -363,6 +599,7 @@ static int step(CPU *cpu) {
     case 0xA4: cpu->Y=RD(ZP);    cpu->PC+=1; set_nz(cpu,cpu->Y); return 0;
     case 0xB4: cpu->Y=RD(ZPX);   cpu->PC+=1; set_nz(cpu,cpu->Y); return 0;
     case 0xAC: cpu->Y=RD(ABS);   cpu->PC+=2; set_nz(cpu,cpu->Y); return 0;
+    case 0xBC: cpu->Y=RD(ABSX);  cpu->PC+=2; set_nz(cpu,cpu->Y); return 0;   /* v2: was missing */
 
     /* ── STA ── */
     case 0x85: WR(ZP,   cpu->A); cpu->PC+=1; return 0;
@@ -445,6 +682,7 @@ static int step(CPU *cpu) {
     case 0xFD: do_sbc(cpu,RD(ABSX));   cpu->PC+=2; return 0;
     case 0xF9: do_sbc(cpu,RD(ABSY));   cpu->PC+=2; return 0;
     case 0xF1: do_sbc(cpu,RD(INDY));   cpu->PC+=1; return 0;
+    case 0xE1: do_sbc(cpu,RD(INDX));   cpu->PC+=1; return 0;   /* v2: was missing */
     case 0xF2: do_sbc(cpu,RD(INDZP));  cpu->PC+=1; return 0; /* 65C02: SBC (zp) */
 
     /* ── AND ── */
@@ -453,6 +691,7 @@ static int step(CPU *cpu) {
     case 0x35: cpu->A&=RD(ZPX);    cpu->PC+=1; set_nz(cpu,cpu->A); return 0;
     case 0x2D: cpu->A&=RD(ABS);    cpu->PC+=2; set_nz(cpu,cpu->A); return 0;
     case 0x31: cpu->A&=RD(INDY);   cpu->PC+=1; set_nz(cpu,cpu->A); return 0;
+    case 0x21: cpu->A&=RD(INDX);   cpu->PC+=1; set_nz(cpu,cpu->A); return 0;   /* v2: was missing */
     case 0x32: cpu->A&=RD(INDZP);  cpu->PC+=1; set_nz(cpu,cpu->A); return 0; /* 65C02 */
 
     /* ── ORA ── */
@@ -461,6 +700,7 @@ static int step(CPU *cpu) {
     case 0x15: cpu->A|=RD(ZPX);    cpu->PC+=1; set_nz(cpu,cpu->A); return 0;
     case 0x0D: cpu->A|=RD(ABS);    cpu->PC+=2; set_nz(cpu,cpu->A); return 0;
     case 0x11: cpu->A|=RD(INDY);   cpu->PC+=1; set_nz(cpu,cpu->A); return 0;
+    case 0x01: cpu->A|=RD(INDX);   cpu->PC+=1; set_nz(cpu,cpu->A); return 0;   /* v2: was missing */
     case 0x12: cpu->A|=RD(INDZP);  cpu->PC+=1; set_nz(cpu,cpu->A); return 0; /* 65C02 */
 
     /* ── EOR ── */
@@ -469,6 +709,7 @@ static int step(CPU *cpu) {
     case 0x55: cpu->A^=RD(ZPX);    cpu->PC+=1; set_nz(cpu,cpu->A); return 0;
     case 0x4D: cpu->A^=RD(ABS);    cpu->PC+=2; set_nz(cpu,cpu->A); return 0;
     case 0x51: cpu->A^=RD(INDY);   cpu->PC+=1; set_nz(cpu,cpu->A); return 0;
+    case 0x41: cpu->A^=RD(INDX);   cpu->PC+=1; set_nz(cpu,cpu->A); return 0;   /* v2: was missing */
     case 0x52: cpu->A^=RD(INDZP);  cpu->PC+=1; set_nz(cpu,cpu->A); return 0; /* 65C02 */
 
     /* ── CMP ── */
@@ -478,6 +719,8 @@ static int step(CPU *cpu) {
     case 0xCD: do_cmp(cpu,cpu->A,RD(ABS));  cpu->PC+=2; return 0;
     case 0xD1: do_cmp(cpu,cpu->A,RD(INDY)); cpu->PC+=1; return 0;
     case 0xDD: do_cmp(cpu,cpu->A,RD(ABSX)); cpu->PC+=2; return 0;
+    case 0xD9: do_cmp(cpu,cpu->A,RD(ABSY)); cpu->PC+=2; return 0;   /* v2: was missing */
+    case 0xC1: do_cmp(cpu,cpu->A,RD(INDX)); cpu->PC+=1; return 0;   /* v2: was missing */
 
     /* ── CPX ── */
     case 0xE0: do_cmp(cpu,cpu->X,IMM);    cpu->PC+=1; return 0;
@@ -513,18 +756,21 @@ static int step(CPU *cpu) {
     case 0x46: { uint8_t v=mem[ZP]; cpu->C=v&1; v>>=1; WR(ZP,v); cpu->PC+=1; set_nz(cpu,v); return 0; }
     case 0x56: { uint8_t v=mem[ZPX];cpu->C=v&1; v>>=1; WR(ZPX,v);cpu->PC+=1; set_nz(cpu,v); return 0; }
     case 0x4E: { uint8_t v=RD(ABS); cpu->C=v&1; v>>=1; WR(ABS,v);cpu->PC+=2; set_nz(cpu,v); return 0; }
+    case 0x5E: { uint8_t v=RD(ABSX);cpu->C=v&1; v>>=1; WR(ABSX,v);cpu->PC+=2;set_nz(cpu,v); return 0; } /* v2: was missing */
 
     /* ── ROL ── */
     case 0x2A: { uint8_t c=cpu->C; cpu->C=cpu->A>>7; cpu->A=(cpu->A<<1)|c; set_nz(cpu,cpu->A); return 0; }
     case 0x26: { uint8_t v=mem[ZP]; uint8_t c=cpu->C; cpu->C=v>>7; v=(v<<1)|c; WR(ZP,v); cpu->PC+=1; set_nz(cpu,v); return 0; }
     case 0x36: { uint8_t v=mem[ZPX];uint8_t c=cpu->C; cpu->C=v>>7; v=(v<<1)|c; WR(ZPX,v);cpu->PC+=1; set_nz(cpu,v); return 0; }
     case 0x2E: { uint8_t v=RD(ABS); uint8_t c=cpu->C; cpu->C=v>>7; v=(v<<1)|c; WR(ABS,v);cpu->PC+=2; set_nz(cpu,v); return 0; }
+    case 0x3E: { uint8_t v=RD(ABSX);uint8_t c=cpu->C; cpu->C=v>>7; v=(v<<1)|c; WR(ABSX,v);cpu->PC+=2; set_nz(cpu,v); return 0; } /* v2: was missing */
 
     /* ── ROR ── */
     case 0x6A: { uint8_t c=cpu->C; cpu->C=cpu->A&1; cpu->A=(cpu->A>>1)|(c<<7); set_nz(cpu,cpu->A); return 0; }
     case 0x66: { uint8_t v=mem[ZP]; uint8_t c=cpu->C; cpu->C=v&1; v=(v>>1)|(c<<7); WR(ZP,v); cpu->PC+=1; set_nz(cpu,v); return 0; }
     case 0x76: { uint8_t v=mem[ZPX];uint8_t c=cpu->C; cpu->C=v&1; v=(v>>1)|(c<<7); WR(ZPX,v);cpu->PC+=1; set_nz(cpu,v); return 0; }
     case 0x6E: { uint8_t v=RD(ABS); uint8_t c=cpu->C; cpu->C=v&1; v=(v>>1)|(c<<7); WR(ABS,v);cpu->PC+=2; set_nz(cpu,v); return 0; }
+    case 0x7E: { uint8_t v=RD(ABSX);uint8_t c=cpu->C; cpu->C=v&1; v=(v>>1)|(c<<7); WR(ABSX,v);cpu->PC+=2; set_nz(cpu,v); return 0; } /* v2: was missing */
 
     /* ── BIT ── */
     case 0x24: { uint8_t v=mem[ZP];  cpu->Z=((cpu->A&v)==0); cpu->N=(v>>7); cpu->V=(v>>6)&1; cpu->PC+=1; return 0; }
@@ -694,15 +940,21 @@ static int assemble_and_load(const char *asm_path) {
 /* ── main ────────────────────────────────────────────────────────────────── */
 static void sim_usage(FILE *out) {
     fprintf(out,
-        "sim65c02 v8 -- 65C02 simulator for uBASIC6502 v1.4 (John Bell Engineering SBC)\n"
+        "JB-sim65c02 v2 -- NMOS 6502 simulator for uBASIC6502 v1.4 (John Bell Engineering SBC)\n"
         "\n"
         "Usage:\n"
-        "  sim65c02 <file.asm | file.bin> [options]\n"
-        "  sim65c02 --help\n"
+        "  JB-sim65c02 <file.asm | file.bin> [options]\n"
+        "  JB-sim65c02 --help\n"
         "\n"
         "Options:\n"
         "  --input \"line\"     Queue a line of input (CR appended); repeatable.\n"
+        "                     Takes precedence over stdin (below) whenever given.\n"
         "  --maxcycles N      Cycle limit before forced exit (default 500000000).\n"
+        "                     N=0 means UNLIMITED: no cycle cap, and the GETCH-idle-\n"
+        "                     exhaustion auto-exit is skipped too -- Ctrl-C or a\n"
+        "                     program-driven halt are the only ways out.\n"
+        "  --allow-65c02      Execute 65C02-only opcodes instead of halting on them.\n"
+        "                     Off by default -- this is real NMOS 6502 hardware.\n"
         "  --plain            CR->LF translation; drop non-printable (for piped output).\n"
         "  --verbose          Print every instruction executed (very slow).\n"
         "  --stats            Print cycle count and ZP state on exit.\n"
@@ -710,12 +962,36 @@ static void sim_usage(FILE *out) {
         "  --help             Print this help and exit.\n"
         "\n"
         "Examples:\n"
-        "  sim65c02 uBASIC6502.asm --plain --input \"PRINT 6*7\"\n"
-        "  sim65c02 uBASIC6502.asm --plain --input \"10 PRINT 42\" --input \"RUN\"\n"
-        "  sim65c02 uBASIC6502.asm --plain --input \"10 FOR I=1 TO 5\" --input \"20 PRINT I\" --input \"30 NEXT I\" --input \"RUN\"\n"
+        "  JB-sim65c02 uBASIC6502.asm --plain --input \"PRINT 6*7\"\n"
+        "  JB-sim65c02 uBASIC6502.asm --plain --input \"10 PRINT 42\" --input \"RUN\"\n"
+        "  JB-sim65c02 uBASIC6502.asm --plain --input \"10 FOR I=1 TO 5\" --input \"20 PRINT I\" --input \"30 NEXT I\" --input \"RUN\"\n"
+        "  JB-sim65c02 uBASIC6502.asm --plain < test_script.txt        (redirected test script)\n"
+        "  JB-sim65c02 uBASIC6502.asm --plain --maxcycles 0            (run forever, Ctrl-C to stop)\n"
+        "\n"
+        "Test scripts via stdin redirect: if --input is not given, the RX poll reads\n"
+        "real stdin directly (blocking, so you can type while the program runs;\n"
+        "Enter's LF -- or a text file's line ending -- is translated to the CR the\n"
+        "BASIC ROM expects). A plain text file of BASIC lines/commands, one per line\n"
+        "exactly as you'd type them, can be redirected straight in:\n"
+        "  NEW\n"
+        "  10 PRINT \"HELLO WORLD\"\n"
+        "  20 GOTO 10\n"
+        "  RUN\n"
+        "EOF on stdin feeds the same idle-exhaustion exit as a queued buffer running\n"
+        "out, so it is likewise disabled by --maxcycles 0. A script that ends in an\n"
+        "infinite loop (like the GOTO above) requires Ctrl-C regardless of\n"
+        "--maxcycles, since the program is legitimately running, not idle-polling.\n"
+        "\n"
+        "Ctrl-C (SIGINT) exits the run loop gracefully -- --stats output still\n"
+        "prints afterward, since nothing is written to disk during the run.\n"
+        "\n"
+        "NMOS strictness: 65C02-only opcodes (STZ, PHX/PLX/PHY/PLY, INC A/DEC A,\n"
+        "(zp) indirect, BIT #imm, BRA, BBR/BBS, RMB/SMB, JMP (abs,X), TSB/TRB) halt\n"
+        "with a distinct message by default, since real NMOS 6502 silicon doesn't\n"
+        "have them. Use --allow-65c02 to execute them anyway.\n"
         "\n"
         "Build:\n"
-        "  gcc -O2 -o sim65c02 sim65c02.c      (asm65c02.c must be in same directory)\n"
+        "  gcc -O2 -o JB-sim65c02 JB-sim65c02.c   (asm65c02.c must be in same directory)\n"
     );
 }
 
@@ -748,6 +1024,7 @@ int main(int argc, char **argv) {
             }
         }
         else if(!strcmp(argv[i],"--plain"))    { plain_mode=1; }
+        else if(!strcmp(argv[i],"--allow-65c02")) { allow_65c02=1; }
         else if(!strcmp(argv[i],"--verbose")) { verbose=1; }
         else if(!strcmp(argv[i],"--stats"))   { show_stats=1; }
         else if(!strcmp(argv[i],"--load-addr") && i+1<argc) { bin_load_addr=(uint32_t)strtoul(argv[++i],NULL,0); }
@@ -779,7 +1056,10 @@ int main(int argc, char **argv) {
     cpu.I=1;
     cpu.PC = mem[0xFFFC] | (mem[0xFFFD]<<8);
     if(cpu.PC==0){ fprintf(stderr,"[SIM] Reset vector is $0000 - bad ROM?\n"); return 1; }
-    fprintf(stderr,"[SIM] Reset PC=$%04X  maxcycles=%lld\n",cpu.PC,maxcycles);
+    if (maxcycles==0)
+        fprintf(stderr,"[SIM] Reset PC=$%04X  maxcycles=0 (unlimited)\n",cpu.PC);
+    else
+        fprintf(stderr,"[SIM] Reset PC=$%04X  maxcycles=%lld\n",cpu.PC,maxcycles);
 
     /* locate DELAY_BIT and DELAY_HALF via symbol table (populated by assembler).
      * JSR to these addresses is intercepted in step() and treated as instant RTS,
@@ -800,38 +1080,29 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* detect GC_WAIT: scan ROM for Bell GETCH spin pattern
-     *   LDA $1C0F ($AD $0F $1C) / AND #$02 ($29 $02) / BNE ... ($D0)  */
-    uint16_t getch_addr = 0;
-    for(int ga=0xF000; ga<0xFFFF-5; ga++) {
-        if(mem[ga  ]==0xAD && mem[ga+1]==0x0F && mem[ga+2]==0x1C &&
-           mem[ga+3]==0x29 && mem[ga+4]==0x02 &&
-           mem[ga+5]==0xD0) {
-            getch_addr = ga;
-            break;
-        }
-    }
-    if (getch_addr)
-        fprintf(stderr,"[SIM] GC_WAIT detected at $%04X\n", getch_addr);
-    else
-        fprintf(stderr,"[SIM] GC_WAIT not found - idle termination disabled\n");
+    /* v2: --input always takes precedence when given; fall back to live
+     * stdin only if it supplied nothing (see use_live_stdin header
+     * comment). inbuf_len is final by this point. */
+    use_live_stdin = (inbuf_len == 0);
+    fprintf(stderr,"[SIM] VIA_ORA addr=$%04X  input=%s\n",
+            VIA_ORA_ADDR, use_live_stdin ? "stdin (live)" : "--input queue");
+
+    /* v2: catch Ctrl-C so the run loop exits gracefully (falls through to
+     * --stats reporting below) instead of an abrupt OS-default kill. See
+     * g_stop_requested comment for why this is safe to do. */
+    signal(SIGINT, on_sigint);
 
     /* run */
     long long cycles=0;
-    long long getch_idle=0;
-    while(cycles < maxcycles){
-        /* detect spinning in GC_WAIT with empty input queue -> terminate.
-         * The GETCH function spans getch_addr .. delay_bit_addr-1; we count
-         * idle cycles whenever PC is anywhere in that range with no input left,
-         * and only reset the counter when PC leaves the function entirely. */
-        if(getch_addr && inbuf_pos >= inbuf_len && !rx_serving &&
-           cpu.PC >= getch_addr && (delay_bit_addr==0 || cpu.PC < delay_bit_addr)) {
-            if(++getch_idle > 50000) {
-                fprintf(stderr,"\n[SIM] Input exhausted after %lld cycles\n",cycles);
-                break;
-            }
-        } else if(delay_bit_addr && cpu.PC >= delay_bit_addr) {
-            getch_idle = 0;  /* PC left the GETCH region */
+    while(!g_stop_requested && (maxcycles==0 || cycles < maxcycles)){
+        /* v2: idle-exhaustion is driven directly by rd()'s getch_idle
+         * counter now (see its header comment) -- no ROM scan or PC-
+         * range matching needed. Skipped entirely when maxcycles==0:
+         * unlimited means unlimited, no automatic exit other than a
+         * program-driven halt or Ctrl-C. */
+        if(maxcycles!=0 && getch_idle > 50000) {
+            fprintf(stderr,"\n[SIM] Input exhausted after %lld cycles\n",cycles);
+            break;
         }
 
         int r=step(&cpu);
@@ -844,7 +1115,9 @@ int main(int argc, char **argv) {
         /* NMI/IRQ: Bell port uses NMI for Break pushbutton, IRQ for 6522 peripherals.
          * Simulator does not generate either; vectors are intact in ROM if needed. */
     }
-    if(cycles>=maxcycles)
+    if(g_stop_requested)
+        fprintf(stderr,"\n[SIM] Interrupted by user (Ctrl-C) after %lld cycles\n",cycles);
+    else if(maxcycles!=0 && cycles>=maxcycles)
         fprintf(stderr,"\n[SIM] Cycle limit %lld reached\n",maxcycles);
 
     if(show_stats){
