@@ -121,28 +121,14 @@ BS       = $08               ; ASCII backspace
 ;
 ; TERMINATION: the last byte of every string has bit 7 set (value |= $80).
 ; =============================================================================
-STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string and keyword addresses
+STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string/keyword addresses
 
-; ---- bit-7 terminal-character constants -------------------------------------
+; ---- bit-7 terminated character constants - few needed as 2 word KW match ---
 ; Naming: T_<char>  where <char> is the ASCII letter or symbol.
 T_LF  = 138              ; $0A + $80  (LF  -- final byte of STR_CRLF)
 T_SP  = 160              ; $20 + $80  (' ' -- final byte of STR_IN)
-T_D   = 196              ; $44 + $80  ('D' -- END)
 T_E   = 197              ; $45 + $80  ('E' -- NE, RE, LE, PE)
-T_F   = 198              ; $46 + $80  ('F' -- IF)
-T_H   = 200              ; $48 + $80  ('H' -- TH, CH)
-T_I   = 201              ; $49 + $80  ('I' -- LI)
 T_K   = 203              ; $4B + $80  ('K' -- BREAK, PEEK)
-T_M   = 205              ; $4D + $80  ('M' -- REM)
-T_N   = 206              ; $4E + $80  ('N' -- RUN, THEN)
-T_O   = 207              ; $4F + $80  ('O' -- GO, PO)
-T_P   = 208              ; $50 + $80
-T_R   = 210              ; $52 + $80  ('R' -- USR)
-T_S   = 211              ; $53 + $80  ('S' -- US)
-T_T   = 212              ; $54 + $80
-T_U   = 213              ; $55 + $80  ('U' -- RU)
-T_W   = 215              ; $57 + $80  ('W' -- NEW)
-T_DS  = 164              ; $24 + $80  ('$' -- CHR$)
 
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
@@ -155,7 +141,6 @@ STR_FREE:   .DB " Bytes FRE", T_E
 ; ---- keyword strings --------------------------------------------------------
 ; Two uppercase ASCII bytes per keyword (no bit-7 terminator).
 ; MTCHKW compares a 16-bit prefix and then skips trailing letters in input.
-KW_TABLE:
 KW_PRINT:   .DB 'P','R'
 KW_IF:      .DB 'I','F'
 KW_GOTO:    .DB 'G','O'
@@ -324,10 +309,8 @@ DO_INPUT:
          STA VARS,X           ; store result into variable
          LDA T0+1
          STA VARS+1,X
-; DO_IN_DN and ST_NOP are adjacent because DO_INPUT and the REM handler both
-; want a plain RTS and this is the nearest one.
 DO_IN_DN:
-ST_NOP:  RTS
+         RTS
 
 ; =============================================================================
 ; GETLINE  --  read one line from the terminal into IBUF; set IP = IBUF
@@ -353,7 +336,7 @@ GETLINE_I:
          JSR PUTCH
          LDA #' '
          JSR PUTCH
-GETLINE:
+; Can jump in here with no prompt
          LDX #0
 GL_LP:   STX GCHRX            ; save buffer index X across GETCH (ZP, keeps A free)
          JSR GETCH            ; read one char (GETCH echoes it; clobbers X)
@@ -378,9 +361,6 @@ GL_DONE: STA IBUF,X           ; store CR as in-band terminator
          STA IP
          LDA #>IBUF
          STA IP+1
-; PN_DN is the RTS for both GETLINE (falls off the end here) and PNUM (branches
-; here when the first non-digit is seen).  They share because this is the
-; nearest RTS to both call sites.
 PN_DN:   RTS
 
 ; =============================================================================
@@ -543,7 +523,7 @@ EL_INS:  JSR WPEEK             ; skip spaces + peek (no consume) first body char
 ;   Out: new line written; PE advanced by line size
 ;   Clobbers: A X Y T0 T1 IP LP PE
 ; =============================================================================
-INSLINE:
+; INSLINE: ; not actually called anywhere
          LDY #0
 IN_CNT:  LDA (IP),Y            ; find body length
          INY
@@ -681,7 +661,7 @@ DP_AFT:  JSR WPEEK
          BNE DP_TOP		; always taken
 
 ; =============================================================================
-; PRNL / PUTSTR / PUTSTRZP  --  print a bit-7-terminated string
+; PRNL / PUTSTR   --  print a bit-7-terminated string
 ;
 ;   Three entry points sharing one body:
 ;     PRNL      -- prints STR_CRLF (CR+LF); no argument needed
@@ -706,7 +686,6 @@ DP_AFT:  JSR WPEEK
 PRNL:
 DP_NL:   LDA #<STR_CRLF       ; load CR+LF string address, then fall into PUTSTR
 PUTSTR:  STA T2               ; store lo-byte; hi-byte set below
-PUTSTRZP:
          LDA #STR_PAGE
          STA T2+1             ; hi-byte is always STR_PAGE
          LDY #0
@@ -758,8 +737,8 @@ DO_REM_CHK:
          AND #$DF             ; uppercase
          CMP #'T'
          BNE PS_DN            ; not RETURN: REM is a no-op
-         ; fall through into DO_RETURN
-DO_RETURN:
+
+         ; fall through into DO_RETURN:
          LDX GOSUB_SP
          CPX #GOSUB_TOP       ; stack empty (nothing was ever pushed)?
          BEQ DO_ERR_GS           ; Branch on empty straight to error exit
@@ -1122,8 +1101,8 @@ RL_IS_LT:
 
 RL_TEST: AND OP               ; result bit AND operator mask
          BEQ REL_F            ; no overlap -> false
-REL_T:   LDA #$FF
-	 .DB $2C              ; Executes "BIT $00A9" (swallows LDA #0)
+         LDA #$FF             ; must be true
+	     .DB $2C              ; Executes "BIT $00A9" (swallows LDA #0)
 REL_F:   LDA #0
          STA T0
          STA T0+1
@@ -1132,9 +1111,8 @@ REL_F:   LDA #0
 RL_NONE: ; No relop found: discard the stacked copy of left (T0 already correct)
          PLA                  ; discard saved T0+1
          PLA                  ; discard saved T0
-EXPR_RT: RTS
-REL_MASK: .DB 1, 2, 4         ; Tuck this 3-byte table right before EXPR_ADD
-
+         RTS
+REL_MASK: .DB 1, 2, 4         ; Mask tab
 ; =============================================================================
 ; EXPR_ADD  --  additive level: + and -
 ;
@@ -1179,7 +1157,6 @@ EA_SUM:  CLC
 
 ; =============================================================================
 ; EXPR1  --  multiplicative level: * / %  (merged MUL/DIV/MOD kernel)
-;
 ;   In:  IP -> expression text
 ;   Out: T0 = result; IP advanced
 ;   Clobbers: A X Y T0 T1 T2 OP IP
@@ -1188,10 +1165,6 @@ EA_SUM:  CLC
 ;   preamble and postamble serves all three operations.  '/' and '%' both use
 ;   the DIV kernel; they differ only in which of quotient (T1) or remainder
 ;   (T2) is copied to T0 as the result.
-;
-;   EA_RTS and E1_RET share the same physical RTS byte: EXPR_ADD's loop exit
-;   (EA_RTS) and EXPR1's loop exit (E1_RET) both branch here when no matching
-;   operator is found.
 ; =============================================================================
 EXPR1:
          JSR EXPR2
@@ -1203,8 +1176,7 @@ E1_LP:   JSR WPEEK
          CMP #'%'
          BEQ E1_MD
 ; EA_RTS and E1_RET are the same physical RTS byte, shared by EXPR_ADD and EXPR1.
-EA_RTS:
-E1_RET:  RTS
+EA_RTS:  RTS
 
 ; --- DIV kernel ---------------------------------------------------------------
 ;   In:  T1 = dividend (positive), T0 = divisor (positive), Y = 16, T2 = 0
@@ -1394,7 +1366,6 @@ E2_NOT_USR:
 ; =============================================================================
 ;   16-bit Galois LFSR in RND_SEED, tap $B4 (x^16+x^14+x^13+x^11+1),
 ;   Shuffles on every call, better on a timer but we dont have one 
-E2_RND:
          LSR RND_SEED+1       ; shift hi byte right, MSB = 0
          ROR RND_SEED         ; shift lo byte right, MSB = old hi bit 0
 
@@ -1615,7 +1586,7 @@ UCIP:    LDY #0
          JMP UC
 
 ; =============================================================================
-; WSKIP_NS / WSKIP / WPEEK  --  skip spaces; return first non-space in A
+; WSKIP / WPEEK  --  skip spaces; return first non-space in A
 ;
 ;   In:  IP -> text (may start with spaces)
 ;   Out: A = first non-space char; IP advanced past any leading spaces
@@ -1623,11 +1594,9 @@ UCIP:    LDY #0
 ;   Clobbers: A
 ;
 ;   Three labels for the same entry point (names document caller intent):
-;     WSKIP_NS  -- "no side-effects" alias used by MTCHKW
 ;     WSKIP     -- skip side-effect is desired
 ;     WPEEK     -- intent is to inspect without consuming
 ; =============================================================================
-WSKIP_NS:
 WSKIP:
 WPEEK:   LDY #0
          LDA (IP),Y
@@ -1854,7 +1823,7 @@ MK_OK:   LDY #0
 MK_OK_RET:
          CLC                  ; C=0: match
          RTS
-MK_FAIL_LAST:
+
 MK_FAIL: LDA LP               ; restore IP to saved position
          STA IP
          LDA LP+1
