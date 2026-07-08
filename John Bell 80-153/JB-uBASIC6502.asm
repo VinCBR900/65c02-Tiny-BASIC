@@ -2,30 +2,33 @@
 ; JB-uBASIC6502 v1.2  --  2 KB Tiny BASIC (NMOS 6502) for John Bell 80-153 SBC
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
+; Note: Due to bitbang serial IO, this is not compatible with Kowalski simulator.
+;   Instead use the JB-Sim65c02 simulator.
+;
 ;   CPU    : NMOS 6502 @ 1 MHz
 ;   ROM    : 2716 EPROM  2 KB  $F800-$FFFF
 ;   RAM    : 2x2114 SRAM 1 KB  $0000-$03FF
 ;   I/O    : 6522 VIA  PA0=TX (bitbang), PA1=RX (bitbang), 1200 baud
-;   IRQ    : 6522 IRW line is NOT connected to CPU on PN 80-153.
-;            Break key (pushbutton) wires directly to IRQ pin.
+;   IRQ    : 6522 IRQ line NOT connected to CPU on PN 80-153.
+;            Instead Break key (pushbutton) wires directly to IRQ pin.
 ;   NMI    : NMI is unused. 
 ;
 ; RAM layout for 1 KB target:
-;   $0000-$008B  zero-page (IP/CURLN/PE/LP/T0-T2/RUN/OP/IBUF/RXCHAR/TXCHAR/
+;   $0000-$008B  zero-page (IP/CURLN/PE/LP/T0-T2/RUN/OP/IBUF/T3
 ;                GCHRX/VARS/RUNSP/T3/GOSUB_SP/GOSUB stack)
 ;   $0100-$017F  Hardware stack (page 1, mandatory)
 ;   $0180-$03FF  BASIC program store (RAM_TOP=$0400)
 ;
 ; Statements accepted (full or 2-letter prefix):
-;   END  FREE  GOSUB  GOTO  IF..THEN  INPUT  LET  POKE  PRINT  REM  RETURN    
-;   LIST NEW RUN
+;   END  GOSUB  GOTO  IF..THEN  INPUT  LET  POKE  PRINT  REM  RETURN    
+;   FREE  LIST NEW RUN
 ;
 ; Expressions:
 ;   + - * / %   = < > <= >= <>   unary -
 ;   PEEK(addr)   USR(addr)   A-Z variables
 ;
 ; Numbers      : signed 16-bit  (-32768 .. 32767)
-; String print : "literals", `;`, TAB(n) and CHR$() only; no string variables
+; String print : "literals", `;`, TAB(n) and CHR$(char); no string variables
 ;
 ; Error codes (printed as "?N"):
 ;   ?0  syntax / bad expression
@@ -46,7 +49,7 @@
 ;
 ; ---- version lineage --------------------------------------------------------
 ; 6502 base:
-;   V1.2 (Jul 2026)   29 bytes free before vectors. Ported GOSUB/RETURN, RND 
+;   V1.2 (Jul 2026)   34 bytes free before vectors. Ported GOSUB/RETURN, RND 
 ;                     from uBASIC6502 1.9. Refactor PNUM/DELINE/INSLINE/EDITLN
 ;                     for size/correctness. GOTOL updates CURLN bugfix.Refactor
 ;                     DO_NEW. Remove partial ':' multi-statement support. 
@@ -67,32 +70,6 @@ RAM_TOP  = $0400             ; first address above usable SRAM (1 KB: 2x 2114)
 HWSTACK  = $7f               ; Give more space to PROG
 PROG     = $0180             ; = $101 + HWSTACK; hardcoded due to assembler barf 
 
-; ---- zero-page symbols -------------------------------------------------------
-; Note IP and CURLN must be sequential for GOSUB/RETURN stack push
-IP       = $00               ; 16-bit: interpreter pointer
-CURLN    = $02               ; 16-bit: currently-executing line number
-PE       = $04               ; 16-bit: program end (one past last byte)
-LP       = $06               ; 16-bit: line pointer / multi-purpose scratch
-T0       = $08               ; 16-bit: primary scratch word / expression result
-T1       = $0A               ; 16-bit: secondary scratch word
-T2       = $0C               ; 16-bit: tertiary scratch word / STMT jump target
-RUN      = $0E               ; 8-bit:  run flag ($00 = immediate, $FF = running)
-OP       = $0F               ; 8-bit:  saved operator for MUL/DIV/MOD ('*'/'/'/'%')
-IBUF     = $10               ; 32-byte input line buffer
-RXCHAR   = $30               ; 8-bit:  bitbang UART scratch (RX assemble)
-TXCHAR   = $31               ; 8-bit:  bitbang UART scratch (TX shift reg)
-GCHRX    = $32               ; 8-bit:  GETLINE: buffer index X saved across JSR GETCH
-VARS     = $33               ; 52-byte variable store (A-Z, 2 bytes each), $33-$66
-RUNSP    = $67               ; 8-bit:  stack-pointer snapshot for GOTO/BREAK unwind
-T3       = $68               ; 8-bit:  PNUM x10-multiply scratch (digit-seeded hi byte)
-GOSUB_SP = $69               ; 8-bit:  GOSUB/RETURN stack pointer (holds a ZP address directly)
-GOSUB_LO = $6A               ; base of the 8-level GOSUB return-frame stack (32 bytes, $6A-$89)
-GOSUB_TOP = $89             ; initial/empty GOSUB_SP value (topmost stack byte, = GOSUB_LO+31)
-RND_SEED = $8A               ; 16-bit: Galois LFSR state for RND (lo=$8A, hi=$8B)
-
-; flags (not addresses)
-GOSUB_FULL = $6D             ; lowest X for which a full 4-byte push still fits ($6A-$6D)
-
 ; ---- error codes -------------------------------------------------------------
 ERR_SN   = 0                 ; syntax / bad expression
 ERR_UL   = 1                 ; undefined line number
@@ -101,17 +78,40 @@ ERR_OM   = 3                 ; out of memory
 ERR_UK   = 4                 ; bad variable name in LET
 ERR_RET  = 5                 ; RETURN without GOSUB
 
-; ---- miscellaneous constants -------------------------------------------------
+; ---- zero-page symbols -------------------------------------------------------
+        .ORG 0
+; Note IP and CURLN must be sequential for GOSUB/RETURN stack push
+T0:         .RES 2              ; 16-bit: primary scratch word / expression result
+T1:         .RES 2              ; 16-bit: secondary scratch word
+T2:         .RES 2              ; 16-bit: tertiary scratch word / STMT jump target
+T3:         .RES 2              ; 16-bit: PNUM x10-multiply scratch, RXCHAR/TXCHAR
+T4:         .RES 2              ; 16-bit: Used in DO_POKE, free for others
+IP:         .RES 2              ; 16-bit: interpreter pointer
+CURLN:      .RES 2              ; 16-bit: currently-executing line number
+PE:         .RES 2              ; 16-bit: program end (one past last byte)
+LP:         .RES 2              ; 16-bit: line pointer / multi-purpose scratch
+RND_SEED:   .RES 2              ; 16-bit: Galois LFSR state for RND (lo=$8A, hi=$8B)
+RUN:        .RES 1              ; 8-bit:  run flag ($00 = immediate, $FF = running)
+OP:         .RES 1              ; 8-bit:  saved operator for MUL/DIV/MOD ('*'/'/'/'%')
+GCHRX:      .RES 1              ; 8-bit:  GETLINE: buffer index X saved across JSR GETCH
+RUNSP:      .RES 1              ; 8-bit:  stack-pointer snapshot for GOTO/BREAK unwind
+GOSUB_SP:   .RES 1              ; 8-bit:  GOSUB/RETURN stack pointer (holds a ZP address directly)
+GOSUB_LO:   .RES 32             ; base of the 8-level GOSUB return-frame stack (32 bytes)
+VARS:       .RES 52             ; 52-byte variable store (A-Z, 2 bytes each)
+IBUF:       .RES 32             ; 32-byte input line buffer - coudl be bigger
+
+; ---- Misc constants -------------------------------------------------
 IBUF_MAX = 31                ; highest valid index into IBUF
-VARS_MAX = $33               ; highest X index for variable clear loop ($33..$66)
 CR       = $0D               ; ASCII carriage return
 LF       = $0A               ; ASCII line feed
 BS       = $08               ; ASCII backspace
+GOSUB_FULL = (GOSUB_LO+3)    ; lowest X for which a full 4-byte push still fits 
+GOSUB_TOP  = (GOSUB_LO+31)   ; initial/empty GOSUB_SP value (topmost stack byte)
 
 ; =============================================================================
 ; ROM START  ($F800)
-; =============================================================================
          .ORG $F800
+
 ; =============================================================================
 ; STRING / KEYWORD TABLE  (page $F8)
 ;
@@ -182,17 +182,10 @@ INIT:
          LDA #VIA_TX          ; TX line idles HIGH (mark = logic 1)
          STA VIA_ORA
 
-         ;Setup RND_SEED to a fixed nonzero constant for a Galois LFSR 
-         LDA #$E1              ; nonzero LFSR seed ($ACE1 -- an all-zero seed
-         STA RND_SEED          ; is a fixed point for a Galois LFSR and would
-         LDA #$AC              ; make RND return 0 forever
-         STA RND_SEED+1
-         ; ---
-
          CLI                  ; enable maskable IRQs (Break pushbutton on IRQ pin)
-         JSR DO_NEW           ; setup PE and PROG
+         JSR DO_NEW           ; setup PE and PROG; also (re-)seeds RND_SEED
 
-        ;  
+        ;  STR_BANNER
          LDA #<STR_BANNER
          JSR PUTSTR           ; print banner + CR+LF
          JSR DO_FREE
@@ -703,18 +696,18 @@ PS_LAST: AND #$7F             ; strip bit 7 from last character
 ;   Syntax: POKE <expr>, <expr>
 ;   In:  IP -> address expression
 ;   Out: byte written; IP advanced past statement
-;   Clobbers: A, Hijacks RXCHAR TXCHAR which are sequential
+;   Clobbers: A, T3
 ; =============================================================================
 DO_POKE:
          JSR EXPR              ; evaluate address -> T0
          LDA T0                ; Save address LO byte
-         STA RXCHAR            
+         STA T4            
          LDA T0+1              ; Save address LO byte
-         STA TXCHAR            
+         STA T4+1            
          JSR EAT_EXPR          ; skip spaces, consume ',', evaluate value -> T0
          LDA T0                ; value byte, ignore High byte
          LDY #0
-         STA (RXCHAR),Y            ; write value to address
+         STA (T4),Y            ; write value to address
 ; PUTSTR (end-of-string path) both want a plain RTS here.
 PS_DN:   RTS
 
@@ -915,7 +908,7 @@ RUNGO:   JSR STMT               ; execute the statement on this line
 SK_LP:   JSR GETCI            ; advance IP past CR (SKIPEOL inlined)
          CMP #CR
          BNE SK_LP
- 	     BEQ RUNLP		; always taken
+ 	 BEQ RUNLP		; always taken
 
 ; =============================================================================
 ; DO_NEW  --  NEW  :  clear program store and all variables
@@ -925,10 +918,16 @@ SK_LP:   JSR GETCI            ; advance IP past CR (SKIPEOL inlined)
 ;   Clobbers: A X PE Zero Page(e.g. VARS)
 ; =============================================================================
 DO_NEW:
+         LDX #$ff
          LDA #0
 INIT_Z:  STA 0,X              ; clear zero-page byte at X
          DEX
          BNE INIT_Z
+
+         LDA #$E1              ; nonzero LFSR seed ($ACE1 -- an all-zero seed
+         STA RND_SEED          ; is a fixed point for a Galois LFSR and would
+         LDA #$AC              ; make RND return 0 forever; re-seed here so
+         STA RND_SEED+1        ; every NEW (not just boot) leaves RND usable
 
          LDA #<PROG
          STA PE
@@ -956,6 +955,63 @@ RUNEND:  LDA #0
          RTS
 
 ; =============================================================================
+; MTCHKW  --  case-insensitive keyword match at IP
+;
+;   In:  A = lo-byte of keyword string (hi-byte = STR_PAGE, always)
+;   Out: C=0  matched -- IP advanced past the keyword
+;        C=1  no match -- IP restored to entry value
+;   Clobbers: A Y T1  (T2 is NOT clobbered -- caller may hold STMT jump addr)
+;
+;   IP is saved in LP on entry and restored on failure.
+;   Leading spaces at IP are skipped before attempting the match.
+;   Keyword entries are 2-byte uppercase prefixes; MTCHKW then skips any
+;   remaining trailing alphabetic characters so full BASIC keywords work.
+; =============================================================================
+MTCHKW:
+         STA T1               ; keyword address lo
+         LDA #STR_PAGE
+         STA T1+1             ; keyword address hi (always STR_PAGE)
+         LDA IP
+         STA LP               ; save IP in LP for restore on failure
+         LDA IP+1
+         STA LP+1
+
+         ; compare first keyword character
+         JSR WPEEK_UC
+         LDY #0
+         CMP (T1),Y
+         BNE MK_FAIL
+         JSR GETCI
+         
+         ; compare second keyword character
+         JSR UCIP
+         LDY #1
+         CMP (T1),Y
+         BNE MK_FAIL
+         JSR GETCI
+
+         ; matched prefix: skip remaining letters for full BASIC keywords
+MK_SKIP: JSR UCIP
+         SEC
+         SBC #'A'              ; shift 'A'-'Z' down to 0-25; remainder kept in A
+         CMP #26
+         BCS MK_OK             ; not a letter: exit, A still holds the remainder
+         JSR GETCI
+         BNE MK_SKIP           ; always taken (token chars are nonzero)
+MK_OK:   CMP #$E3              ; remainder == '$'-'A' (mod 256)? reuses A, no re-peek
+         BNE GT_R              ; not '$': clear carry, return success
+         JSR GETCI             ; it IS '$': consume it
+         BNE GT_R              ; A = '$' ($24), always nonzero -- return success
+
+MK_FAIL: LDA LP               ; restore IP to saved position
+         STA IP
+         LDA LP+1
+         STA IP+1
+MK_SEC:         
+         SEC                  ; C=1: no match
+         RTS
+
+; =============================================================================
 ; GOTOL  --  find line by number in program store
 ;
 ;   In:  T0 = 16-bit target line number
@@ -970,7 +1026,7 @@ GT_SC:   LDA IP               ; test IP == PE (end of store)
          BNE GT_GO
          LDA IP+1
          CMP PE+1
-         BEQ GT_ERR           ; not found
+         BEQ MK_SEC           ; not found
 GT_GO:   LDY #0
          LDA (IP),Y           ; read line-number lo
          CMP T0               ; compare line-number lo
@@ -1002,8 +1058,6 @@ GT_OK:   LDA T0               ; T0 already == the matched line number
          BCC GT_R
          INC IP+1
 GT_R:    CLC
-         RTS
-GT_ERR:  SEC
          RTS
 
 ; =============================================================================
@@ -1661,7 +1715,7 @@ PRT16PRNT:
 ;   written value is masked by DDRA and only PA0 is driven.
 ; =============================================================================
 PUTCH:
-         STA TXCHAR             ; save character to shift out
+         STA T3             ; save character to shift out
 
          ; --- Start bit: TX = 0 ---
          LDA #$00
@@ -1670,7 +1724,7 @@ PUTCH:
 
          ; --- 8 data bits, LSB first ---
          LDX #8
-PC_LOOP: LSR TXCHAR             ; bit 0 -> carry
+PC_LOOP: LSR T3             ; bit 0 -> carry
          LDA #$00
          ADC #$00             ; A = 0 + carry = 0 or 1 (the bit to send)
          STA VIA_ORA
@@ -1682,6 +1736,25 @@ PC_LOOP: LSR TXCHAR             ; bit 0 -> carry
          ; Note: stop-bit delay omitted; caller overhead provides >1 bit period
          LDA #VIA_TX
          STA VIA_ORA
+         RTS
+
+; =============================================================================
+; DELAY_BIT / DELAY_HALF  --  serial timing delays for 1200 baud @ 1 MHz
+;
+;   In:  -- (entry point selects delay count)
+;   Out: Y = 0 on return
+;   Clobbers: Y
+;
+;   Inner loop: DEY (2 cy) + BNE (3 cy taken, 2 cy exit) = ~5 cy/iter.
+;   JSR overhead ~12 cy included in totals above.
+;   Timing is approximate; adjust BAUD_FULL / BAUD_HALF for exact match.
+; =============================================================================
+DELAY_BIT:
+         JSR DELAY_HALF       ; full bit period (~833 cy at 1 MHz)
+DELAY_HALF:
+         LDY #80              ; half bit period (~417 cy at 1 MHz)
+DL_LOOP: DEY
+         BNE DL_LOOP
          RTS
 
 ; =============================================================================
@@ -1707,45 +1780,22 @@ GC_WAIT: LDA VIA_ORA
          JSR DELAY_HALF       ; 0.5 bit: reach mid-point of start bit
          JSR DELAY_BIT        ; 1.0 bit: advance to centre of data bit 0
 
-         ; --- Sample 8 data bits LSB first into RXCHAR ---
+         ; --- Sample 8 data bits LSB first into T3 ---
          LDX #8
 GC_LOOP: LDA VIA_ORA         ; read port
          LSR                  ; PA0 -> carry (TX bit discarded)
          LSR                  ; PA1 -> carry (RX data bit)
-         ROR RXCHAR           ; carry -> MSB of TEMP; shift right
+         ROR T3+1           ; carry -> MSB of TEMP; shift right
          JSR DELAY_BIT        ; advance to centre of next bit
          DEX
          BNE GC_LOOP
-         ; After 8 RORs: RXCHAR holds the received byte (LSB-first serial,
-         ; ROR accumulates from MSB down -> correct byte in RXCHAR).
+         ; After 8 RORs: T3 holds the received byte (LSB-first serial,
+         ; ROR accumulates from MSB down -> correct byte in T3).
 
          ; --- Echo, then restore caller's X and return char in A ---
-         LDA RXCHAR
+         LDA T3+1
          JSR PUTCH            ; echo
-         LDA RXCHAR
-         RTS
-
-; =============================================================================
-; DELAY_BIT / DELAY_HALF  --  serial timing delays for 1200 baud @ 1 MHz
-;
-;   DELAY_BIT:  ~833 cycles (1 bit period)   -- LDY #160
-;   DELAY_HALF: ~417 cycles (0.5 bit period) -- LDY #80
-;
-;   In:  -- (entry point selects delay count)
-;   Out: Y = 0 on return
-;   Clobbers: Y
-;
-;   Inner loop: DEY (2 cy) + BNE (3 cy taken, 2 cy exit) = ~5 cy/iter.
-;   JSR overhead ~12 cy included in totals above.
-;   Timing is approximate; adjust BAUD_FULL / BAUD_HALF for exact match.
-; =============================================================================
-DELAY_BIT:
-         LDY #160             ; full bit period (~833 cy at 1 MHz)
-         .DB $2C              ; BIT abs: skip next 2 bytes (LDY #80 operand)
-DELAY_HALF:
-         LDY #80              ; half bit period (~417 cy at 1 MHz)
-DL_LOOP: DEY
-         BNE DL_LOOP
+         LDA T3+1
          RTS
 
 ; =============================================================================
@@ -1771,65 +1821,7 @@ ST_TAB:
          .DB <KW_FREE,  <(DO_FREE-1),  >(DO_FREE-1)
          .DB $FF  ; sentinel: fall through to implicit assign
 
-; =============================================================================
-; MTCHKW  --  case-insensitive keyword match at IP
-;
-;   In:  A = lo-byte of keyword string (hi-byte = STR_PAGE, always)
-;   Out: C=0  matched -- IP advanced past the keyword
-;        C=1  no match -- IP restored to entry value
-;   Clobbers: A Y T1  (T2 is NOT clobbered -- caller may hold STMT jump addr)
-;
-;   IP is saved in LP on entry and restored on failure.
-;   Leading spaces at IP are skipped before attempting the match.
-;   Keyword entries are 2-byte uppercase prefixes; MTCHKW then skips any
-;   remaining trailing alphabetic characters so full BASIC keywords work.
-; =============================================================================
-MTCHKW:
-         STA T1               ; keyword address lo
-         LDA #STR_PAGE
-         STA T1+1             ; keyword address hi (always STR_PAGE)
-         LDA IP
-         STA LP               ; save IP in LP for restore on failure
-         LDA IP+1
-         STA LP+1
 
-         ; compare first keyword character
-         JSR WPEEK_UC
-         LDY #0
-         CMP (T1),Y
-         BNE MK_FAIL
-         JSR GETCI
-         
-         ; compare second keyword character
-         JSR UCIP
-         LDY #1
-         CMP (T1),Y
-         BNE MK_FAIL
-         JSR GETCI
-         
-         ; matched prefix: skip remaining letters for full BASIC keywords
-MK_SKIP: JSR UCIP
-         CMP #'A'
-         BCC MK_OK
-         CMP #'Z'+1
-         BCS MK_OK
-         JSR GETCI
-         BNE MK_SKIP           ; always taken (token chars are nonzero)
-MK_OK:   LDY #0
-         LDA (IP),Y
-         CMP #'$'              ; allow full CHR$ spelling after 2-char CH prefix
-         BNE MK_OK_RET
-         JSR GETCI
-MK_OK_RET:
-         CLC                  ; C=0: match
-         RTS
-
-MK_FAIL: LDA LP               ; restore IP to saved position
-         STA IP
-         LDA LP+1
-         STA IP+1
-         SEC                  ; C=1: no match
-         RTS
 ROMEND: ; for auditing
 
 ; =============================================================================
