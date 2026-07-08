@@ -1,5 +1,5 @@
 ; =============================================================================
-; 4K Integer BASIC v15.5 for the 65C02
+; 4K Integer BASIC v15.7 for the 65C02
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -71,24 +71,63 @@
 ;   $E004  read  = character input  (GETCH, non-blocking poll; 0 = no char)
 ;
 ; =============================================================================
-; RECENT CHANGE HISTORY
+; Changelog & Version History (Newest First)
 ;
-; v15.5 (Jul 2026) - 156 bytes free
-; Core Memory & Editor Refactors from uBASIC6502.asm
-;   - Ported optimized INSLINE: Replaced the byte-counter loop with direct pointer 
-;     comparisons against LP, eliminating T2 usage and hardware-stack juggling.
-;   - Inlined T2DEC helperinside DELINE, Streamlined OOM check
-; Zero Page & Control Flow Reorg
-;   - Reordered Zero Page: Grouped FVAR, FLIM, and FSTEP immediately before CURLN to 
-;     mirror the FOR_STK frame layout.
-;   - Optimized DO_FOR to stage variables directly in ZP and execute stack pushes 
-;     via a tight indexed copy loop, eliminating 7 unrolled LDA/STA sequences.
-;   - Consolidated duplicate line-update and error tail-code from DO_GOTO and 
-;     DO_GOSUB into a unified entry point (DO_go_common).
-; Critical Core Fixes
-;   - FIXED: Cold-start Zero Page clear loop condition corrected from BPL to BNE.
-;   - FIXED: Enabled single-line colon-chained FOR/NEXT execution via new SKIP_STMT logic.
-;   - FIXED: Resolved trailing colon evaluation bugs within PRINT statement streams.
+; v15.7 (Jul 2026) — 110 bytes free
+;   - OPTIMIZED: Streamlined DO_FOR variable validation via GETCI and a one-sided 
+;     range check (SEC/SBC #'A'/CMP #26), discarding complex pre-peek bounds checks.
+;   - OPTIMIZED: Consolidated DO_FOR step-storage paths into a shared assignment 
+;     point (DO_for_havestep); the no-STEP path simply pre-loads a (1,0) default.
+;   - OPTIMIZED: Eliminated redundant FSTK array index reloads inside DO_FOR and 
+;     DO_NEXT by utilizing the index already resident in the accumulator.
+;   - OPTIMIZED: Converted DO_NEXT optional variable name tracking to match the 
+;     fast one-sided range validation pattern (SEC/SBC #'A'/CMP #26).
+;   - OPTIMIZED: Leveraged 65C02 accumulator decrement (DEC A, $3A) for loop frame 
+;     indexing, saving cycles over NMOS-style explicit subtraction sequences.
+;   - OPTIMIZED: Redesigned DO_NEXT sign evaluation into a unified 29-byte signed 
+;     compare (diff = var - limit) using sign bit XOR logic, replacing a bulky 
+;     67-byte conditional dual-branch architecture.
+;   - REJECTED: Retained explicit DN_end stack management; bypassing it via 
+;     RUNEND would corrupt loop nesting depths on trailing program boundaries.
+;   * Operational Note: Immediate-mode GOTO directives targeting inactive FOR loops 
+;     silently drop out without errors; runtime-based execution is unaffected.
+;
+; v15.6 — 51 bytes free
+;   - ADDED: Extended LIST statement syntax to support bounded range queries (LIST n,m).
+;   - OPTIMIZED: Implemented a token-aware line skip mechanism (LS_skip_body) that 
+;     filters strictly on literal ($FF) and EOL ($0D) markers, skipping keyword table parses.
+;   - OPTIMIZED: Factored out GET_TWO_ARGS (<expr>,<expr>) as a shared parser utility, 
+;     reducing DO_POKE footprint from 25 down to 10 bytes.
+;   - OPTIMIZED: Relocated active range-check boundaries to the CORDIC scratch space (CY) 
+;     to protect parameters from keyword detokenizer corruption inside T2.
+;   - FIXED: Hardcoded absolute byte thresholds (#$0E) in place of evaluating mathematical 
+;     expressions in immediate operands (CMP #$0D+1) due to assembler evaluation limits.
+;   - FIXED: Corrected default bounding high-byte limits from $7F00 to $7FFF.
+;   * Operational Note: NEW commands currently do not flush existing buffer regions; 
+;     source merges may result. Remediation is deferred to subsequent passes.
+;
+; v15.5 — Editor & Memory Optimization Pass
+;   - OPTIMIZED: Ported enhanced INSLINE routines, executing moving string pointer shifts 
+;     via direct comparisons against LP to clear stack overhead and T2 reliance.
+;   - OPTIMIZED: Purged the redundant T2DEC helper subroutine, inlining its single 
+;     surviving dependency within the DELINE workspace.
+;   - OPTIMIZED: Trimmed out-of-memory allocations down to a page-aligned, high-byte-only 
+;     comparison sequence against RAM_TOP ($1000).
+;   - OPTIMIZED: Introduced 65C02 branch-always (BRA) opcodes in line-copy loop vectors 
+;     to break dependencies on explicit internal string length bounds.
+;
+; v15.4 — Zero Page & Core Control Refactor
+;   - OPTIMIZED: Linearized zero-page geometry, clustering FVAR, FLIM, and FSTEP right 
+;     before CURLN to feed stack allocations via a single indexed copy loop.
+;   - OPTIMIZED: Unified line-pointer modifications and error traps from DO_GOTO and 
+;     DO_GOSUB branches into a central, shared execution segment (DO_go_common).
+;   - OPTIMIZED: Subverted assembler mnemonic tracking deficiencies via direct opcode 
+;     injection (.DB $19) to realize absolute indexed bitmask logic (ORA abs,Y).
+;   - FIXED: Shifted cold-start clear-loop evaluations from positive checks (BPL) to 
+;     explicit non-zero boundaries (BNE).
+;   - FIXED: Restored support for inline, colon-separated loop blocks via SKIP_STMT logic.
+;   - FIXED: Resolved structural trailing-colon runtime parsing drops inside PRINT lists.
+;   * Operational Constraint: Consecutive inline FOR declarations remain unsupported.
 ;
 ; v15.2 (Jul 2026) - 67 bytes free (ROM unaffected)
 ;   - Rewrote pre-loaded RAM showcase to an 805-byte self-checking test suite.
@@ -353,7 +392,7 @@ SHOWCASE_END:               ; assembles to $0200+805 = $0525
 ; STRING TABLE (all strings on same page)
 ; =============================================================================
 STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string/kw addresses
-STR_BANNER: .DB "4K BASIC v15.5"        ; drop through (trimmed ".0" -- saves 2 bytes)
+STR_BANNER: .DB "4K BASIC v15.7"        ; drop through (trimmed ".0" -- saves 2 bytes)
 STR_CRLF:   .DB $0D,$8A             ; CR, LF|$80 = $8A
 STR_BYTES:  .DB " BYTES FREE",$0D,$8A  ; last LF has high-bit
 STR_ERROR:  .DB " ER",$D2           ; 'R'|$80 = $D2
@@ -1253,10 +1292,37 @@ DO_END:
 RUNEND: STZ RUN
         RTS
 ; =============================================================================
-; DO_LIST ? list all program lines, de-tokenising on the fly
+; DO_LIST ? LIST [n,m] : list program lines, optional line-number range,
+; de-tokenising on the fly
+;   Syntax:  LIST         -- all lines
+;            LIST n,m     -- lines n..m inclusive (n,m may be expressions)
+;   In:  IP -> first char after "LIST"; PE = program end
+;   Out: matching lines printed; IP advanced
 ;   Clobbers: A X Y T0 T1 T2 LP
+;   T1 = lo-bound, T2 = hi-bound; defaulted to the full range (0..$7FFF) for
+;   a bare LIST, or set via GET_TWO_ARGS.
+;   Lines below the lo-bound are walked (to correctly locate the next line)
+;   via a separate, minimal token-aware skip loop (LS_skip_body) that never
+;   calls PUTCH/PRT16/PRNL, so the shared print primitives need no
+;   suppression flag. Lines are stored in ascending order, so a current
+;   line number above the hi-bound stops the whole scan immediately.
 ; =============================================================================
 DO_LIST:
+        STZ T1                ; default lo-bound = 0
+        STZ T1+1
+        LDA #$FF
+        STA CY                 ; default hi-bound = $7FFF (CY used, not T2:
+        LDA #$7F               ;  T2 is clobbered by the KW_TABLE walk below)
+        STA CY+1
+        JSR WPEEK             ; peek first non-space char after LIST
+        CMP #$0E              ; <= CR (handles CR and the $00 sentinel)?
+        BCC LS_scan           ; yes: bare LIST, defaults above stand
+        JSR GET_TWO_ARGS      ; args present: T1 = n (lo), T0 = m
+        LDA T0                ; move m into hi-bound (CY)
+        STA CY
+        LDA T0+1
+        STA CY+1
+LS_scan:
         LDA #<PROG
         STA LP
         LDA #>PROG
@@ -1267,13 +1333,27 @@ LS_ln:  LDA LP               ; end of program?
         LDA LP+1
         CMP PE+1
         BNE LS_go
-        RTS                  ; ? DONE: nearest RTS used as LS_DONE return point
+        JMP LS_done
 LS_go:
         LDA (LP)             ; 65C02: lo byte of line number
         STA T0
         LDY #1
         LDA (LP),y           ; hi byte
         STA T0+1
+        LDA CY                ; stop if current > hi-bound (CY - T0 borrows)
+        CMP T0
+        LDA CY+1
+        SBC T0+1
+        BCS LS_in_hi         ; T2 >= T0: still within hi-bound
+        JMP LS_done
+LS_in_hi:
+        LDA T0               ; skip if current < lo-bound (T0 - T1 borrows)
+        CMP T1
+        LDA T0+1
+        SBC T1+1
+        BCS LS_in_lo         ; T0 >= T1: within lo-bound
+        JMP LS_skip_hdr
+LS_in_lo:
         JSR PRT16            ; print line number
         LDA #' '
         JSR PUTCH
@@ -1317,13 +1397,13 @@ LS_pkl_norm:
 LS_pkd: JSR LS_adv
         LDA #' '
         JSR PUTCH
-        BRA LS_body
+        JMP LS_body
 LS_lit: JSR PUTCH            ; literal character: print and advance
         JSR LS_adv
-        BRA LS_body
+        JMP LS_body
 LS_eol: JSR LS_adv
         JSR PRNL             ; CR+LF
-        BRA LS_ln
+        JMP LS_ln
 LS_num: JSR LS_adv           ; skip $FF token
         LDA (LP)             ; 65C02: lo byte
         STA T0
@@ -1334,7 +1414,31 @@ LS_num: JSR LS_adv           ; skip $FF token
         JSR PRT16
         LDA #' '
         JSR PUTCH
-        BRA LS_body
+        JMP LS_body
+; -- below-lo-bound path: advance LP past header, then skip body silently --
+LS_skip_hdr:
+        LDA LP
+        CLC
+        ADC #2
+        STA LP
+        BCC LS_skip_body
+        INC LP+1
+LS_skip_body:
+        LDA (LP)
+        CMP #$0D
+        BEQ LS_skip_eol
+        CMP #TOK_NUM
+        BNE LS_skip_adv
+        JSR LS_adv           ; skip the $FF marker
+        JSR LS_adv           ; skip the lo byte
+LS_skip_adv:
+        JSR LS_adv           ; skip this byte (or the literal's hi byte)
+        BRA LS_skip_body
+LS_skip_eol:
+        JSR LS_adv           ; skip the CR itself
+        JMP LS_ln
+LS_done:
+        RTS
 ; =============================================================================
 ; LS_ADV ? advance list pointer LP by one byte
 ;   In:  LP   pointer into program store
@@ -1429,28 +1533,29 @@ FSTK_BASE:
 
 ; =============================================================================
 ; DO_FOR ? FOR var = start TO limit [STEP step]
+;   In:  IP -> variable letter
+;   Out: loop frame pushed onto FOR_STK; VARS[var] = start
+;   Clobbers: A X Y T0 T2 LP
 ;   Stages var_slot/limit/step into FVAR/FLIM/FSTEP, which sit immediately
 ;   before CURLN in zero page (see equates) forming one contiguous 7-byte
 ;   run [FVAR,FLIM,FLIM+1,FSTEP,FSTEP+1,CURLN,CURLN+1] matching the FOR_STK
 ;   frame layout exactly. CURLN already holds the correct loop_line value
 ;   (set once per line before STMT runs), so no separate copy is needed for
 ;   it. The final push is one indexed loop instead of 7 unrolled stores.
-;   Clobbers: A X Y T0 LP
+;   Variable letter is consumed before validation (not peeked): safe because
+;   DO_ERROR never returns to its caller (ends in JMP MAIN), so IP's exact
+;   position after an aborted statement is never examined.
 ; =============================================================================
 DO_FOR:
-        JSR WPEEK_UC
-        CMP #'A'
-        BCC DO_for_sn
-        CMP #'Z'+1
-        BCC DO_for_ok
-DO_for_sn:
-        LDA #ERR_SN
-        JMP DO_ERROR
-DO_for_ok:
-        JSR GETCI            ; consume variable letter
+        JSR GETCI            ; consume variable letter directly
         JSR UC
         SEC
         SBC #'A'
+        CMP #26               ; 0-25 = valid letter
+        BCC DO_for_ok
+        LDA #ERR_SN
+        JMP DO_ERROR
+DO_for_ok:
         ASL                  ; byte offset into VARS
         STA FVAR             ; stage var_slot directly (no stack juggling)
         JSR EAT_EXPR         ; evaluate start value -> T0
@@ -1470,17 +1575,15 @@ DO_for_ok:
         JSR GETCI            ; consume STEP token
         JSR EXPR             ; evaluate step -> T0
         LDA T0
-        STA FSTEP            ; stage step directly
-        LDA T0+1
-        STA FSTEP+1
+        LDX T0+1
         BRA DO_for_havestep
 DO_for_nostep:
         LDA #1               ; default step = 1
-        STA FSTEP
-        STZ FSTEP+1
+        LDX #0
 DO_for_havestep:
-        LDA FSTEP            ; step of zero is illegal
-        ORA FSTEP+1
+        STA FSTEP            ; stage step (shared store for both paths)
+        STX FSTEP+1
+        ORA FSTEP+1          ; step of zero is illegal
         BNE DO_for_szok
         LDA #ERR_ST
         JMP DO_ERROR
@@ -1490,8 +1593,7 @@ DO_for_szok:
         BCC DO_for_push
         JMP DO_ERR_NR        ; ? shared error stub
 DO_for_push:
-        LDA FSTK
-        JSR FSTK_BASE        ; LP = FOR_STK + FSTK*7  (clobbers T2 only)
+        JSR FSTK_BASE        ; LP = FOR_STK + FSTK*7 (A already holds FSTK)
         LDY #6
 DO_for_cp:
         LDA FVAR,y           ; copy FVAR,FLIM,FLIM+1,FSTEP,FSTEP+1,CURLN,CURLN+1
@@ -1503,13 +1605,23 @@ DO_for_cp:
 
 ; =============================================================================
 ; DO_NEXT ? NEXT [var]
-;   Clobbers: A X Y T0 T1 T2 LP
+;   In:  IP -> optional variable name (consumed but not checked against the
+;        FOR variable; NEXT always closes the innermost active loop)
+;   Out: loop variable advanced; branches back into the loop body or falls
+;        through to the statement after NEXT once the limit is crossed
+;   Clobbers: A X Y T0 T2 LP
+;   Comparison is a single unified signed test: diff = var - limit. If
+;   diff==0 the limit is met exactly (inclusive: always loop once more).
+;   Otherwise XOR diff's sign with the step's sign -- differing signs means
+;   the limit has not yet been reached (keep looping); matching signs means
+;   it has been crossed (stop). Replaces separate mirrored branches for
+;   positive- and negative-step loops with one shared path.
 ; =============================================================================
 DO_NEXT:
         JSR WPEEK_UC         ; consume optional variable name (ignored)
-        CMP #'A'
-        BCC DO_next_novar
-        CMP #'Z'+1
+        SEC
+        SBC #'A'
+        CMP #26               ; 0-25 = valid letter
         BCS DO_next_novar
         JSR GETCI
 DO_next_novar:
@@ -1517,9 +1629,8 @@ DO_next_novar:
         BNE DO_next_ok
         JMP DO_ERR_NR        ; ? shared error stub
 DO_next_ok:
-        LDA FSTK
-        SEC
-        SBC #1
+        DEC A                ; 65C02: top frame index = FSTK - 1 (A already
+                              ;  holds FSTK from the check above)
         JSR FSTK_BASE        ; LP = base of top frame
         LDA (LP)             ; 65C02 zp-indirect: [0] var_slot
         TAX
@@ -1533,45 +1644,24 @@ DO_next_ok:
         LDA (LP),y           ; [4] step_hi
         ADC VARS+1,x
         STA VARS+1,x
-        ; load limit into T0
+        ; unified signed compare: diff = var - limit
         LDY #1
-        LDA (LP),y           ; [1] limit_lo
-        STA T0
-        INY
-        LDA (LP),y           ; [2] limit_hi
-        STA T0+1
-        ; signed compare ? direction depends on step sign
-        LDY #4
-        LDA (LP),y           ; [4] step_hi
-        BMI DN_neg_step
-DN_pos_step:                 ; positive step: loop while var <= limit
         LDA VARS,x
         SEC
-        SBC T0
+        SBC (LP),y           ; [1] limit_lo
+        STA T0
+        INY
         LDA VARS+1,x
-        SBC T0+1
-        BMI DN_loop          ; var < limit: keep looping
-        LDA VARS,x           ; var == limit: loop one more time
-        CMP T0
-        BNE DN_done
-        LDA VARS+1,x
-        CMP T0+1
-        BEQ DN_loop
-        BRA DN_done
-DN_neg_step:                 ; negative step: loop while var >= limit
-        LDA T0
-        SEC
-        SBC VARS,x
-        LDA T0+1
-        SBC VARS+1,x
-        BMI DN_loop          ; limit < var: keep looping
-        LDA T0
-        CMP VARS,x
-        BNE DN_done
-        LDA T0+1
-        CMP VARS+1,x
-        BEQ DN_loop
-        BRA DN_done
+        SBC (LP),y           ; [2] limit_hi
+        TAX                  ; X = diff hi byte
+        ORA T0               ; Z reflects 16-bit "diff == 0"
+        BEQ DN_loop          ; var == limit: always loop once more
+        TXA                  ; restore diff hi byte (restores N flag)
+        LDY #4
+        EOR (LP),y           ; XOR with [4] step_hi
+        BMI DN_loop          ; differing signs: limit not yet crossed
+        DEC FSTK             ; matching signs: limit crossed, done
+        RTS
 DN_loop:                     ; branch back to body: load loop line, run it
         LDY #5
         LDA (LP),y           ; [5] loop_line_lo
@@ -1606,35 +1696,48 @@ DN_samel:                    ; colon-chained: resume right after ':' on same lin
         LDA T0+1
         STA CURLN+1
         JMP RUNGO             ; re-enter statement dispatch mid-line (no header)
-DN_done:
-        DEC FSTK
-        RTS
 DN_ul:
         JMP DO_ERR_UL        ; ? shared error stub
-; DN_end and RUNEND share the same body (clear RUN and return).
-; Two adjacent labels: DN_end is the NEXT-loop EOF landing, RUNEND is
-; already defined earlier; we can't duplicate ? use RUNEND directly.
+; DN_end must stay separate from RUNEND: RUNEND only clears RUN, it does
+; NOT decrement FSTK. A program ending on the last line of a bare FOR/NEXT
+; needs FSTK decremented here; branching to RUNEND directly would leave
+; the FOR-nesting counter permanently wrong for the rest of execution.
 DN_end: DEC FSTK
         STZ RUN
+        RTS
+; =============================================================================
+; GET_TWO_ARGS ? parse two comma-separated expressions; shared by DO_POKE
+; and DO_LIST
+;   Syntax: <expr> , <expr>
+;   In:  IP -> first expression
+;   Out: T1 = first argument (16-bit); T0 = second argument (16-bit)
+;   Clobbers: A T0 T1
+;   The first result is carried across the second EXPR call via the
+;   hardware stack rather than left in T1 directly, because EXPR's own
+;   binary-operator evaluation (relational/add-sub/mul-div tiers) uses T1
+;   as scratch for its left operand.
+; =============================================================================
+GET_TWO_ARGS:
+        JSR EXPR              ; first arg -> T0
+        LDA T0+1
+        PHA                   ; save hi byte
+        LDA T0
+        PHA                   ; save lo byte
+        JSR EAT_EXPR          ; consume ',' then evaluate second arg -> T0
+        PLA
+        STA T1                ; pull first arg lo
+        PLA
+        STA T1+1              ; pull first arg hi
         RTS
 ; =============================================================================
 ; DO_POKE ? POKE addr, value
 ;   Clobbers: A Y T0 T1
 ; =============================================================================
 DO_POKE:
-        JSR EXPR             ; addr -> T0
-        LDA T0
-        PHA
-        LDA T0+1
-        PHA
-        JSR EAT_EXPR         ; consume ',' then value -> T0
-        PLA
-        STA T1+1             ; T1 = address
-        PLA
-        STA T1
+        JSR GET_TWO_ARGS      ; T1 = addr, T0 = value
         LDA T0
         LDY #0
-        STA (T1),y           ; POKE the value  (STA (zp),y with Y=0)
+        STA (T1),y            ; POKE the value  (STA (zp),y with Y=0)
         RTS
 
 ; =============================================================================
