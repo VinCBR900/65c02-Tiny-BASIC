@@ -49,7 +49,7 @@
 ;
 ; ---- version lineage --------------------------------------------------------
 ; 6502 base:
-;   V1.2 (Jul 2026)   52 bytes free before vectors. Ported GOSUB/RETURN, RND 
+;   V1.2 (Jul 2026)   60 bytes free before vectors. Ported GOSUB/RETURN, RND 
 ;                     from uBASIC6502 1.9. Refactor PNUM/DELINE/INSLINE/EDITLN
 ;                     for size/correctness. GOTOL updates CURLN bugfix.Refactor
 ;                     DO_NEW. Remove partial ':' multi-statement support. 
@@ -845,18 +845,15 @@ F_OK:    LDY #0
          INC LP+1
 FE_RTS:  RTS
 
-; Prog to IP and LP helpers
-PROG2IP:	
-         LDA #<PROG
-         STA IP
+; Prog to IP/LP/PE helper -- IP,CURLN,PE,LP are consecutive in zero page
+; (IP+0, PE+4, LP+6), so one indexed routine covers all three targets.
+; PROG2LP is the free entry (most call sites want LP); IP/PE go through
+; PROG2X directly with an explicit LDX.
+PROG2LP: LDX #6
+PROG2X:  LDA #<PROG
+         STA IP,X
          LDA #>PROG
-         STA IP+1
-         RTS
-PROG2LP:         
-         LDA #<PROG
-         STA LP
-         LDA #>PROG
-         STA LP+1
+         STA IP+1,X
          RTS
 
 ; =============================================================================
@@ -904,7 +901,8 @@ LSK_RTS: RTS
 ;   RUNGO: mid-loop entry used by GOTO (after IP is already set to body).
 ; =============================================================================
 DO_RUN:
-         JSR PROG2IP
+         LDX #0
+         JSR PROG2X
          LDA #$FF
          STA RUN              ; set run flag ($FF = running)
 RUNLP:   TSX
@@ -945,10 +943,8 @@ INIT_Z:  STA 0,X              ; clear zero-page byte at X
          LDA #$AC              ; make RND return 0 forever; re-seed here so
          STA RND_SEED+1        ; every NEW (not just boot) leaves RND usable
 
-         LDA #<PROG
-         STA PE
-         LDA #>PROG
-         STA PE+1
+         LDX #4
+         JSR PROG2X            ; PE = PROG
 
          LDA #GOSUB_TOP
          STA GOSUB_SP          ; empty call stack (immediate-mode GOSUB unwind)
