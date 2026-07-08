@@ -49,7 +49,7 @@
 ;
 ; ---- version lineage --------------------------------------------------------
 ; 6502 base:
-;   V1.2 (Jul 2026)   34 bytes free before vectors. Ported GOSUB/RETURN, RND 
+;   V1.2 (Jul 2026)   52 bytes free before vectors. Ported GOSUB/RETURN, RND 
 ;                     from uBASIC6502 1.9. Refactor PNUM/DELINE/INSLINE/EDITLN
 ;                     for size/correctness. GOTOL updates CURLN bugfix.Refactor
 ;                     DO_NEW. Remove partial ':' multi-statement support. 
@@ -461,12 +461,8 @@ EDITLN:
          ;LDA #>PROG
          ;STA LP+1
          JSR PROG2LP
-EL_FL:   LDA LP               ; is LP == PE? (reached end of store)
-         CMP PE
-         BNE EL_GO
-         LDA LP+1
-         CMP PE+1
-         BEQ EL_INS           ; yes: insert at end
+EL_FL:   JSR PE_CMP            ; is LP == PE? (reached end of store)
+         BEQ EL_INS            ; yes: insert at end
 EL_GO:   LDY #1               ; compare stored line number hi-byte first
          LDA (LP),Y
          CMP CURLN+1
@@ -480,18 +476,8 @@ EL_GO:   LDY #1               ; compare stored line number hi-byte first
          ; JMP EL_INS
 	    BNE EL_INS		; always taken
 	
-EL_SKIP: LDY #2                ; advance LP to next line: scan for CR
-EL_LEN:  LDA (LP),Y
-         INY
-         CMP #CR
-         BNE EL_LEN
-         TYA
-         CLC
-         ADC LP
-         STA LP
-         BCC EL_FL
-         INC LP+1
-         BCS EL_FL            ; unconditional (if BCC fell through, C=1)
+EL_SKIP: JSR LSKIP             ; advance LP to next line (shared w/ GOTOL)
+         JMP EL_FL
 EL_FND:  LDA LP                ; save the deletion point -- DELINE returns
          STA T1                ; with LP == new PE (see DELINE's header), but
          LDA LP+1               ; INSLINE below needs the *original* LP to
@@ -847,11 +833,7 @@ LS_EOL:  JSR PRNL              ; print CR+LF
 ;   return-address bytes (discarded) and then executing RTS pops the NEXT
 ;   frame instead -- i.e. returns from DO_LIST itself, not just from FETCH.
 ; =============================================================================
-FETCH:   LDA LP
-         CMP PE
-         BNE F_OK
-         LDA LP+1
-         CMP PE+1
+FETCH:   JSR PE_CMP
          BNE F_OK
          PLA                   ; discard FETCH's own return address (lo)
          PLA                   ; discard FETCH's own return address (hi)
@@ -876,6 +858,40 @@ PROG2LP:
          LDA #>PROG
          STA LP+1
          RTS
+
+; =============================================================================
+; PE_CMP  --  compare LP against PE (shared by EDITLN, GOTOL, DO_LIST/FETCH)
+;
+;   In:  LP
+;   Out: Z=1 if LP == PE, Z=0 otherwise
+;   Clobbers: A
+; =============================================================================
+PE_CMP:  LDA LP
+         CMP PE
+         BNE PC_NE
+         LDA LP+1
+         CMP PE+1
+PC_NE:   RTS
+
+; =============================================================================
+; LSKIP  --  advance LP past the current line (shared by EDITLN, GOTOL)
+;
+;   In:  LP -> start of a line's 2-byte header
+;   Out: LP -> start of the next line (past this line's CR terminator)
+;   Clobbers: A Y LP
+; =============================================================================
+LSKIP:   LDY #2
+LSK_LP:  LDA (LP),Y
+         INY
+         CMP #CR
+         BNE LSK_LP
+         TYA
+         CLC
+         ADC LP
+         STA LP
+         BCC LSK_RTS
+         INC LP+1
+LSK_RTS: RTS
 
 ; =============================================================================
 ; DO_RUN  --  RUN  :  execute program starting from the first line
@@ -1017,46 +1033,39 @@ MK_SEC:
 ;   In:  T0 = 16-bit target line number
 ;   Out: C=0  found -- IP points to body (past 2-byte header); CURLN = T0
 ;        C=1  not found -- IP = PE; CURLN unchanged
-;   Clobbers: A Y IP CURLN
+;   Clobbers: A Y IP LP CURLN
+;
+;   Scans using LP (shared PE_CMP/LSKIP routines with EDITLN, which also
+;   scan via LP); only converts to IP once, at the success point, since
+;   that's the only place the documented output contract needs it. Safe:
+;   GOTOL's only caller (DO_GO) explicitly doesn't need LP preserved across
+;   this call ("LP no longer needed" once EXPR has parsed the target line).
 ; =============================================================================
 GOTOL:
-         JSR PROG2IP
-GT_SC:   LDA IP               ; test IP == PE (end of store)
-         CMP PE
-         BNE GT_GO
-         LDA IP+1
-         CMP PE+1
-         BEQ MK_SEC           ; not found
+         JSR PROG2LP
+GT_SC:   JSR PE_CMP            ; test LP == PE (end of store)
+         BEQ MK_SEC            ; not found
 GT_GO:   LDY #0
-         LDA (IP),Y           ; read line-number lo
+         LDA (LP),Y           ; read line-number lo
          CMP T0               ; compare line-number lo
          BNE GT_NX
          LDY #1
-         LDA (IP),Y
+         LDA (LP),Y
          CMP T0+1             ; compare line-number hi
          BEQ GT_OK
-GT_NX:   LDY #2               ; skip line: scan for CR from body start
-GT_SK:   LDA (IP),Y
-         INY
-         CMP #CR
-         BNE GT_SK
-         TYA
-         CLC
-         ADC IP               ; IP += line length
-         STA IP
-         BCC GT_SC
-         INC IP+1
-         BNE GT_SC            ; always taken here (program store never wraps to page $00)
+GT_NX:   JSR LSKIP             ; advance LP to next line (shared w/ EDITLN)
+         JMP GT_SC
 GT_OK:   LDA T0               ; T0 already == the matched line number
          STA CURLN
          LDA T0+1
          STA CURLN+1
-         LDA IP
+         LDA LP                ; IP = LP + 2 (advance past 2-byte header)
          CLC
-         ADC #2               ; advance IP past 2-byte header
+         ADC #2
          STA IP
-         BCC GT_R
-         INC IP+1
+         LDA LP+1
+         ADC #0
+         STA IP+1
 GT_R:    CLC
          RTS
 
