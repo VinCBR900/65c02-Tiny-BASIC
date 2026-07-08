@@ -1,5 +1,5 @@
 /*
- * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.9, Jul 2026)
+ * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.10, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
@@ -152,6 +152,11 @@
  *           an assembler-side OPTAB typo, now corrected to M_ZPY,0xB6.
  *       STP ($DB) / WAI ($CB) remain explicitly OUT OF SCOPE for this
  *       pass per user direction -- not implemented.
+ * v1.10 (Jul 2026): Added .RS as an alias for .RES (Kowalski assembler
+ *       convention), normalized alongside the existing .DB->.BYTE and
+ *       .DW->.WORD aliases -- same mechanism, same single normalization
+ *       site, so it's recognized everywhere .RES already is (pass 1
+ *       sizing, pass 2 emission, .LST listing).
  *
  * Build (standalone):
  *   gcc -O2 -DASM65C02_MAIN -o asm65c02 asm65c02.c
@@ -188,7 +193,7 @@
  *   Directives : .ORG addr
  *                .DB / .BYTE  val[,val,...]   (values or "string literals")
  *                .DW / .WORD  val[,val,...]   (16-bit little-endian)
- *                .RES  n[,fill]               (reserve n bytes, optional fill)
+ *                .RES / .RS  n[,fill]            (reserve n bytes, optional fill)
  *                .opt proc6502 / .opt proc65c02
  *                .setcpu "6502" / .setcpu "65C02"
  *                                (switch CPU mode; proc6502 enables 6502-only checks)
@@ -1547,6 +1552,7 @@ static int assemble(const char *source) {
         char mn[LINE_LEN]; str_lower(mn, mnem);
         if (!strcmp(mn, ".db"))  strcpy(mn, ".byte");
         if (!strcmp(mn, ".dw"))  strcpy(mn, ".word");
+        if (!strcmp(mn, ".rs"))  strcpy(mn, ".res");   /* v1.10: Kowalski-convention alias */
 
         /* store normalised mnem now — directives all 'continue' before line 800 */
         strncpy(info->mnem, mn, LINE_LEN-1);

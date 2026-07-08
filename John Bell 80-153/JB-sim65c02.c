@@ -1,5 +1,5 @@
 /*
- * JB-sim65c02.c  —  Toy NMOS 6502 simulator  (v2, Jul 2026)
+ * JB-sim65c02.c  —  Toy NMOS 6502 simulator  (v3, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
@@ -63,10 +63,17 @@
  *   $1C0F  read   VIA_ORA    bitbang RX: return $02 (PA1=mark/idle) when no
  *                             char ready; serve one char per GETCH call cycle
  *
- * Bitbang timing bypass:
- *   After assembly, sym_get() locates DELAY_BIT and DELAY_HALF symbols.
- *   JSR to either address is intercepted and treated as an instant RTS,
- *   making IO fast without altering any other behaviour.
+ * Bitbang timing (v3 -- no bypass needed):
+ *   The real ROM's DELAY_BIT/DELAY_HALF loops burn real 6502 cycles to
+ *   hit a target baud rate on actual 1980s hardware. This simulator has
+ *   no notion of wall-clock-per-cycle timing at all, and a modern host
+ *   executes those loops billions of times faster than the original
+ *   NMOS 6502 -- so they just run at full simulated speed like any
+ *   other code, with no need to special-case or intercept them. (An
+ *   earlier version of this file did intercept JSRs to those two
+ *   symbols and treat them as instant RTS; removed as unnecessary and
+ *   fragile -- it depended on the ROM naming its delay routines exactly
+ *   "DELAY_BIT"/"DELAY_HALF".)
  *
  * GETCH idle detection (v2 -- rewritten):
  *   Previously this scanned ROM for one exact GETCH byte pattern
@@ -148,6 +155,13 @@
  *            (blocking fgetc() per start-bit poll, LF->CR translation,
  *            EOF feeds the same idle-exhaustion path), enabling
  *            `JB-sim65c02 rom.asm < script.txt` for batch test scripts.
+ *   v3     Removed the DELAY_BIT/DELAY_HALF JSR interception entirely.
+ *          It depended on the ROM's delay routines being named exactly
+ *          those two symbols -- fragile, and unnecessary: this simulator
+ *          has no wall-clock-per-cycle timing model at all, and a modern
+ *          host runs those loops billions of times faster than the
+ *          original NMOS 6502, so they execute at full simulated speed
+ *          like any other code with no special-casing needed.
  */
 
 #include <stdio.h>
@@ -234,10 +248,6 @@ static uint8_t tx_shift = 0;      /* accumulates received data bits */
 static int     rx_serving  = 0;   /* 1 while a byte is being 'received' */
 static int     rx_bit_phase= 0;   /* 0-7: next bit to deliver to ROR TEMP */
 static uint8_t rx_char     = 0;   /* character currently being received */
-
-/* Delay loop addresses - populated after assembly */
-static uint16_t delay_bit_addr  = 0;
-static uint16_t delay_half_addr = 0;
 
 /*
  * use_live_stdin (v2)
@@ -835,14 +845,6 @@ static int step(CPU *cpu) {
     /* ── JSR / RTS / RTI ── */
     case 0x20: {
         uint16_t target=ABS;
-        /* Intercept JSR to DELAY_BIT or DELAY_HALF: treat as instant RTS.
-         * Without this the bitbang timing loops consume millions of simulated
-         * cycles per character making IO unusably slow. */
-        if ((delay_bit_addr  && target == delay_bit_addr) ||
-            (delay_half_addr && target == delay_half_addr)) {
-            cpu->PC += 2;   /* skip the 2-byte operand; PC now past JSR */
-            return 0;        /* no push/pop: instant return */
-        }
         uint16_t ret=cpu->PC+1;
         PUSH(cpu,(ret>>8)&0xFF);
         PUSH(cpu,ret&0xFF);
@@ -940,7 +942,7 @@ static int assemble_and_load(const char *asm_path) {
 /* ── main ────────────────────────────────────────────────────────────────── */
 static void sim_usage(FILE *out) {
     fprintf(out,
-        "JB-sim65c02 v2 -- NMOS 6502 simulator for uBASIC6502 v1.4 (John Bell Engineering SBC)\n"
+        "JB-sim65c02 v3 -- NMOS 6502 simulator for uBASIC6502 v1.4 (John Bell Engineering SBC)\n"
         "\n"
         "Usage:\n"
         "  JB-sim65c02 <file.asm | file.bin> [options]\n"
@@ -1061,26 +1063,7 @@ int main(int argc, char **argv) {
     else
         fprintf(stderr,"[SIM] Reset PC=$%04X  maxcycles=%lld\n",cpu.PC,maxcycles);
 
-    /* locate DELAY_BIT and DELAY_HALF via symbol table (populated by assembler).
-     * JSR to these addresses is intercepted in step() and treated as instant RTS,
-     * making bitbang IO fast without altering any other behaviour. */
-    {
-        int v = 0;
-        if (sym_get("DELAY_BIT",  &v)) {
-            delay_bit_addr  = (uint16_t)v;
-            fprintf(stderr,"[SIM] DELAY_BIT  at $%04X (intercepted)\n", delay_bit_addr);
-        } else {
-            fprintf(stderr,"[SIM] DELAY_BIT  not found - bitbang IO will be slow\n");
-        }
-        if (sym_get("DELAY_HALF", &v)) {
-            delay_half_addr = (uint16_t)v;
-            fprintf(stderr,"[SIM] DELAY_HALF at $%04X (intercepted)\n", delay_half_addr);
-        } else {
-            fprintf(stderr,"[SIM] DELAY_HALF not found - bitbang IO will be slow\n");
-        }
-    }
-
-    /* v2: --input always takes precedence when given; fall back to live
+    /* v3: --input always takes precedence when given; fall back to live
      * stdin only if it supplied nothing (see use_live_stdin header
      * comment). inbuf_len is final by this point. */
     use_live_stdin = (inbuf_len == 0);
