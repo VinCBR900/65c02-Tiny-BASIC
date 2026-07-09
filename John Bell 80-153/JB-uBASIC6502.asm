@@ -21,11 +21,11 @@
 ;
 ; Statements accepted (full or 2-letter prefix):
 ;   END  GOSUB  GOTO  IF..THEN  INPUT  LET  POKE  PRINT  REM  RETURN    
-;   FREE  LIST NEW RUN
+;   LIST [n,m]  NEW  RUN
 ;
 ; Expressions:
 ;   + - * / %   = < > <= >= <>   unary -
-;   PEEK(addr)   USR(addr)   A-Z variables
+;   FREE   PEEK(addr)   USR(addr)   A-Z variables
 ;
 ; Numbers      : signed 16-bit  (-32768 .. 32767)
 ; String print : "literals", `;`, TAB(n) and CHR$(char); no string variables
@@ -49,7 +49,7 @@
 ;
 ; ---- version lineage --------------------------------------------------------
 ; 6502 base:
-;   V1.2 (Jul 2026)   60 bytes free before vectors. Ported GOSUB/RETURN, RND 
+;   V1.2 (Jul 2026)   29 bytes free before vectors. Ported GOSUB/RETURN, RND 
 ;                     from uBASIC6502 1.9. Refactor PNUM/DELINE/INSLINE/EDITLN
 ;                     for size/correctness. GOTOL updates CURLN bugfix.Refactor
 ;                     DO_NEW. Remove partial ':' multi-statement support. 
@@ -65,10 +65,16 @@ VIA_ORA  = $1C0F             ; 6522 Port A Output/Input Register (no handshake)
 VIA_TX   = $01               ; PA0 = TX output bit mask
 VIA_RX   = $02               ; PA1 = RX input  bit mask
 
-; ---- RAM ceiling -------------------------------------------------------------
+; ---- Constants -------------------------------------------------------------
 RAM_TOP  = $0400             ; first address above usable SRAM (1 KB: 2x 2114)
 HWSTACK  = $7f               ; Give more space to PROG
 PROG     = $0180             ; = $101 + HWSTACK; hardcoded due to assembler barf 
+IBUF_MAX = 31                ; highest valid index into IBUF
+CR       = $0D               ; ASCII carriage return
+LF       = $0A               ; ASCII line feed
+BS       = $08               ; ASCII backspace
+GOSUB_FULL = (GOSUB_LO+3)    ; lowest X for which a full 4-byte push still fits 
+GOSUB_TOP  = (GOSUB_LO+31)   ; initial/empty GOSUB_SP value (topmost stack byte)
 
 ; ---- error codes -------------------------------------------------------------
 ERR_SN   = 0                 ; syntax / bad expression
@@ -98,15 +104,9 @@ RUNSP:      .RES 1              ; 8-bit:  stack-pointer snapshot for GOTO/BREAK 
 GOSUB_SP:   .RES 1              ; 8-bit:  GOSUB/RETURN stack pointer (holds a ZP address directly)
 GOSUB_LO:   .RES 32             ; base of the 8-level GOSUB return-frame stack (32 bytes)
 VARS:       .RES 52             ; 52-byte variable store (A-Z, 2 bytes each)
-IBUF:       .RES 32             ; 32-byte input line buffer - coudl be bigger
+IBUF:       .RES (IBUF_MAX+1)   ; 32-byte input line buffer - coudl be bigger
 
 ; ---- Misc constants -------------------------------------------------
-IBUF_MAX = 31                ; highest valid index into IBUF
-CR       = $0D               ; ASCII carriage return
-LF       = $0A               ; ASCII line feed
-BS       = $08               ; ASCII backspace
-GOSUB_FULL = (GOSUB_LO+3)    ; lowest X for which a full 4-byte push still fits 
-GOSUB_TOP  = (GOSUB_LO+31)   ; initial/empty GOSUB_SP value (topmost stack byte)
 
 ; =============================================================================
 ; ROM START  ($F800)
@@ -136,7 +136,6 @@ STR_BANNER: .DB "JB uBASIC v1.2"  ; startup banner, rolls into free
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
 STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
-STR_FREE:   .DB " Bytes FRE", T_E
 
 ; ---- keyword strings --------------------------------------------------------
 ; Two uppercase ASCII bytes per keyword (no bit-7 terminator).
@@ -188,7 +187,6 @@ INIT:
         ;  STR_BANNER
          LDA #<STR_BANNER
          JSR PUTSTR           ; print banner + CR+LF
-         JSR DO_FREE
          ; fall through into MAIN
 
 ; =============================================================================
@@ -214,25 +212,6 @@ MAIN:
 MAIN_DIR:
          JSR STMT              ; execute as immediate statement
          JMP MAIN
-
-; =============================================================================
-; DO_FREE  --  FREE  :  print free program-store bytes
-;   In:  PE = current program end pointer
-;   Out: "<N>\r\n" printed to terminal
-;   Clobbers: A T0
-; =============================================================================
-DO_FREE:
-         SEC
-         LDA #<RAM_TOP
-         SBC PE
-         STA T0
-         LDA #>RAM_TOP
-         SBC PE+1
-         STA T0+1
-         JSR PRT16            ; print free count
-         LDA #<STR_FREE
-         JSR PUTSTR           ; print banner + CR+LF
-         JMP PRNL             ; print CR+LF and return (tail call)
 
 ; =============================================================================
 ; Check for proper variable access
@@ -296,12 +275,7 @@ DO_INPUT:
          STA IP               ; restore IP
          PLA
          STA IP+1
-         PLA
-         TAX                  ; X = VARS offset
-         LDA T0
-         STA VARS,X           ; store result into variable
-         LDA T0+1
-         STA VARS+1,X
+         JMP STORE_VAR         ; tail call: pop var_offset, store T0, RTS
 DO_IN_DN:
          RTS
 
@@ -456,10 +430,6 @@ EDITLN:
          STA CURLN
          LDA T0+1
          STA CURLN+1
-         ;LDA #<PROG
-         ;STA LP
-         ;LDA #>PROG
-         ;STA LP+1
          JSR PROG2LP
 EL_FL:   JSR PE_CMP            ; is LP == PE? (reached end of store)
          BEQ EL_INS            ; yes: insert at end
@@ -473,8 +443,7 @@ EL_GO:   LDY #1               ; compare stored line number hi-byte first
          CMP CURLN
          BCC EL_SKIP
          BEQ EL_FND            ; exact match: delete existing then (re)insert
-         ; JMP EL_INS
-	    BNE EL_INS		; always taken
+	 BNE EL_INS		; always taken
 	
 EL_SKIP: JSR LSKIP             ; advance LP to next line (shared w/ GOTOL)
          JMP EL_FL
@@ -530,11 +499,7 @@ IN_OK:   LDA PE                ; T0 = old PE
          LDA T1+1
          STA PE+1
          LDY #0
-         LDA T0                ; if old PE == LP, nothing to shift upward
-         CMP LP
-         BNE IN_BK
-         LDA T0+1
-         CMP LP+1
+         JSR T0_CMP_LP         ; if old PE == LP, nothing to shift upward
          BEQ IN_HDR
 IN_BK:   LDA T0                ; pre-decrement source (T0)
          BNE IN_D0
@@ -546,23 +511,14 @@ IN_D0:   DEC T0
 IN_D1:   DEC T1
          LDA (T0),Y            ; backward copy loop
          STA (T1),Y
-         LDA T0                ; stop exactly when T0 == LP
-         CMP LP
-         BNE IN_BK
-         LDA T0+1
-         CMP LP+1
+         JSR T0_CMP_LP         ; stop exactly when T0 == LP
          BNE IN_BK
 IN_HDR:  LDA CURLN             ; write line number lo
          STA (LP),Y            ; Y is 0 here
          INY
          LDA CURLN+1           ; write line number hi
          STA (LP),Y
-         LDA LP                ; advance LP by 2 for the payload
-         CLC
-         ADC #2
-         STA LP
-         BCC IN_L2
-         INC LP+1
+         JSR ADD2_LP           ; advance LP by 2 for the payload
 IN_L2:   LDY #0
 IN_CP:   LDA (IP),Y            ; copy payload from IBUF
          STA (LP),Y
@@ -617,7 +573,7 @@ DP_TAB:  LDA #<KW_TAB
          JSR MTCHKW           ; matched "TAB"?
          BCS DP_NORM
          JSR E2_COMMON        ; Yes it is, Swallow `(`, get value, and swallow closing `)`
-	     LDA T0
+	 LDA T0
     	 BEQ DP_AFT           ; If TAB(0), skip printing spaces entirely
          STA GCHRX            ; counter in ZP: PUTCH clobbers X, can't loop on X
 DP_TLOOP:	 
@@ -658,8 +614,7 @@ DP_AFT:  JSR WPEEK
 ;   strips it, PUTCH prints it, then the routine returns.
 ;
 ;   Co-located labels:
-;     PS_DN (end of PUTSTR) is a plain RTS; DO_LIST now returns via FETCH's
-;     own stack-skip trick instead of branching to a shared label here.
+;     PS_DN (end of PUTSTR) is a plain RTS.
 ;     DO_PRINT falls into DP_NL / PRNL rather than using JSR+RTS.
 ; =============================================================================
 PRNL:
@@ -685,12 +640,7 @@ PS_LAST: AND #$7F             ; strip bit 7 from last character
 ;   Clobbers: A, T3
 ; =============================================================================
 DO_POKE:
-         JSR EXPR              ; evaluate address -> T0
-         LDA T0                ; Save address LO byte
-         STA T4            
-         LDA T0+1              ; Save address LO byte
-         STA T4+1            
-         JSR EAT_EXPR          ; skip spaces, consume ',', evaluate value -> T0
+         JSR GET_TWO_ARGS      ; T4 = address, T0 = value
          LDA T0                ; value byte, ignore High byte
          LDY #0
          STA (T4),Y            ; write value to address
@@ -792,58 +742,84 @@ GO_DO:   JSR GOTOL            ; find line: C=0 found, C=1 not found
          JMP RUNGO            ; jump into run loop
 
 ; =============================================================================
-; DO_LIST  --  LIST  :  print all program lines in source form
-;
-;   In:  PE = current program end
-;   Out: all lines printed as "<linenum> <body>"
-;   Clobbers: A Y T0 LP
-;
-;   v1.1: Added LP>=PE safety guard inside LS_BODY to prevent infinite loop
-;         if a line is missing its CR terminator (corrupted program store).
+; GET_TWO_ARGS  --  shared helper: parse "expr,expr"; 
+; first -> T4, second -> T0
 ; =============================================================================
-DO_LIST:
-         JSR PROG2LP
-LS_LN:   JSR FETCH             ; read line number lo (checks EOF)
-         STA T0
-         JSR FETCH             ; read line number hi (checks EOF)
-         STA T0+1
-         JSR PRT16             ; print line number
-         LDA #' '
-         JSR PUTCH
-LS_BODY: JSR FETCH             ; read one body character (checks EOF)
-         CMP #CR
-         BEQ LS_EOL            ; CR: line done
-         JSR PUTCH
-         JMP LS_BODY
-LS_EOL:  JSR PRNL              ; print CR+LF
-         JMP LS_LN             ; next line
+GET_TWO_ARGS:
+         JSR EXPR              ; first arg -> T0
+         LDA T0
+         STA T4
+         LDA T0+1
+         STA T4+1
+         JSR EAT_EXPR          ; skip spaces, eat ',', second arg -> T0
+         RTS
 
 ; =============================================================================
-; FETCH  --  read one byte at LP for DO_LIST; checks for end-of-program
+; DO_LIST  --  LIST [n,m]  :  print program lines, optional range
 ;
-;   In:  LP -> next byte to read; PE -> one past last program byte
-;   Out: if LP != PE: A = byte at LP; LP advanced by 1
-;        if LP == PE: returns directly to DO_LIST's caller (see note below),
-;                     bypassing the rest of DO_LIST entirely
-;   Clobbers: A Y LP
-;
-;   EOF trick: FETCH is only ever JSR'd directly from within DO_LIST's own
-;   body, so the hardware stack, top-down, holds [FETCH's own return addr]
-;   then [DO_LIST's caller's return addr]. On EOF, popping FETCH's own 2
-;   return-address bytes (discarded) and then executing RTS pops the NEXT
-;   frame instead -- i.e. returns from DO_LIST itself, not just from FETCH.
+;   Peeks each line's header via LP without consuming (matches GOTOL's
+;   convention) so the skip-path can reuse the shared LSKIP routine; only
+;   advances LP past the header when a line is actually going to be printed.
 ; =============================================================================
-FETCH:   JSR PE_CMP
-         BNE F_OK
-         PLA                   ; discard FETCH's own return address (lo)
-         PLA                   ; discard FETCH's own return address (hi)
-         RTS                   ; returns from DO_LIST to DO_LIST's caller
-F_OK:    LDY #0
-         LDA (LP),Y            ; read byte
-         INC LP                ; advance LP (16-bit; INC does not affect A)
-         BNE FE_RTS
+DO_LIST:
+         LDA #0                 ; T1 is default low bound of zero
+         STA T1
+         STA T1+1
+         STA T4                 ; default high bound is $7f00 in T4
+         LDA #$7F
+         STA T4+1
+         JSR WPEEK
+         CMP #CR+1              ; check for CR
+         BCC LS_SCAN            ; wide range 
+         JSR GET_TWO_ARGS      ; T4 = n (lo-bound), T0 = m (hi-bound)
+         LDA T4                ; T1 = lo-bound (read T4 before it's reused below)
+         STA T1
+         LDA T4+1
+         STA T1+1
+         LDA T0                ; T4 now is hi-bound
+         STA T4
+         LDA T0+1
+         STA T4+1
+LS_SCAN: JSR PROG2LP
+LS_LN:   JSR PE_CMP
+         BEQ LS_DONE
+         LDY #0
+         LDA (LP),Y            ; peek line number lo (LP not yet advanced)
+         STA T0
+         LDY #1
+         LDA (LP),Y            ; peek line number hi
+         STA T0+1
+         LDA T4                ; stop if current > hi-bound
+         CMP T0
+         LDA T4+1
+         SBC T0+1
+         BCC LS_DONE
+         LDA T0                ; skip if current < lo-bound
+         CMP T1
+         LDA T0+1
+         SBC T1+1
+         BCC LS_SKIP
+         JSR PRT16             ; in range: print it
+         LDY #0                ; PRT16's contract doesn't guarantee Y on exit
+         LDA #' '
+         JSR PUTCH
+         JSR ADD2_LP            ; advance LP past the 2-byte header for the body walk
+LS_BODY: LDY #0
+         LDA (LP),Y
+         JSR BUMP_LP
+         CMP #CR
+         BEQ LS_EOL
+         JSR PUTCH
+         JMP LS_BODY
+LS_EOL:  JSR PRNL
+         JMP LS_LN
+LS_SKIP: JSR LSKIP              ; LP still at header start -- matches LSKIP's contract
+         JMP LS_LN
+LS_DONE: RTS
+BUMP_LP: INC LP
+         BNE BUMP_RTS
          INC LP+1
-FE_RTS:  RTS
+BUMP_RTS:RTS
 
 ; Prog to IP/LP/PE helper -- IP,CURLN,PE,LP are consecutive in zero page
 ; (IP+0, PE+4, LP+6), so one indexed routine covers all three targets.
@@ -889,6 +865,36 @@ LSK_LP:  LDA (LP),Y
          BCC LSK_RTS
          INC LP+1
 LSK_RTS: RTS
+
+; =============================================================================
+; T0_CMP_LP  --  compare T0 against LP (shared by INSLINE's two checks)
+;
+;   In:  T0
+;   Out: Z=1 if T0 == LP, Z=0 otherwise
+;   Clobbers: A
+; =============================================================================
+T0_CMP_LP:
+         LDA T0
+         CMP LP
+         BNE TCL_NE
+         LDA T0+1
+         CMP LP+1
+TCL_NE:  RTS
+
+; =============================================================================
+; ADD2_LP  --  LP += 2 (shared by INSLINE and DO_LIST, skip a 2-byte header)
+;
+;   In:  LP
+;   Out: LP advanced by 2
+;   Clobbers: A
+; =============================================================================
+ADD2_LP: LDA LP
+         CLC
+         ADC #2
+         STA LP
+         BCC A2L_RTS
+         INC LP+1
+A2L_RTS: RTS
 
 ; =============================================================================
 ; DO_RUN  --  RUN  :  execute program starting from the first line
@@ -1393,7 +1399,9 @@ E2_POS:  JSR GETCI            ; consume unary '+', then fall through
 EXPR2:
          JSR WPEEK
          CMP #'('
-         BEQ E2_PAR
+         BNE E2_NOTPAR
+         JMP E2_PAR
+E2_NOTPAR:
          CMP #'-'
          BEQ E2_NEG
          CMP #'+'
@@ -1442,6 +1450,19 @@ E2_RND_SK:
          RTS
 
 E2_NOT_RND:
+         LDA #<KW_FREE
+         JSR MTCHKW           ; matched "FREE"?
+         BCS E2_NOT_FREE      ; nope
+         SEC                  ; T0 = RAM_TOP - PE (free program-store bytes)
+         LDA #<RAM_TOP
+         SBC PE
+         STA T0
+         LDA #>RAM_TOP
+         SBC PE+1
+         STA T0+1
+         RTS
+
+E2_NOT_FREE:
          LDY #0
          LDA (IP),Y           ; peek next char without consuming
          CMP #'0'
@@ -1453,7 +1474,7 @@ E2_NOT_RND:
 E2_BAD:  JMP REL_F
 
 E2_VAR:  JSR PARSE_VAR               ; variable name (single letter A-Z)?
-	     BCS E2_BAD
+	 BCS E2_BAD
          TAX
          LDA VARS,X
          STA T0
@@ -1566,6 +1587,15 @@ DO_LET:
          BNE DL_POP           ; no '=': bad assignment
          JSR GETCI            ; consume '='
          JSR EXPR             ; evaluate RHS -> T0
+         ; falls through into STORE_VAR (JMP would be free but fallthrough is 0 bytes)
+; =============================================================================
+; STORE_VAR  --  shared tail: pop var_offset pushed by caller, store T0 there
+;
+;   In:  T0 = value to store; hardware stack top = var_offset (from PARSE_VAR)
+;   Out: VARS[var_offset] = T0; RTS to caller's caller
+;   Clobbers: A X
+; =============================================================================
+STORE_VAR:
          PLA
          TAX
          LDA T0
@@ -1823,7 +1853,6 @@ ST_TAB:
          .DB <KW_END,   <(DO_END-1),   >(DO_END-1)
          .DB <KW_LET,   <(DO_LET-1),   >(DO_LET-1)
          .DB <KW_POKE,  <(DO_POKE-1),  >(DO_POKE-1)
-         .DB <KW_FREE,  <(DO_FREE-1),  >(DO_FREE-1)
          .DB $FF  ; sentinel: fall through to implicit assign
 
 
