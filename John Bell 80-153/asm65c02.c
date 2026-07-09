@@ -1,5 +1,5 @@
 /*
- * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.10, Jul 2026)
+ * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.11, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
@@ -157,6 +157,37 @@
  *       .DW->.WORD aliases -- same mechanism, same single normalization
  *       site, so it's recognized everywhere .RES already is (pass 1
  *       sizing, pass 2 emission, .LST listing).
+ * v1.11 (Jul 2026): Added conditional assembly: .IF expr / .ELSE / .ENDIF
+ *       (Kowalski convention -- no .DEFINE/.IFDEF). Nesting supported
+ *       (depth 16, same cap as .INCLUDE). Also added == and != to
+ *       eval_expr() (lowest precedence, below + -), needed for .IF
+ *       conditions; no conflict with the existing single-char '<'/'>'
+ *       low/high-byte PREFIX operators. .REF() (Kowalski's "was this
+ *       label ever referenced" check) is NOT implemented -- it would
+ *       need the answer before the rest of the file has been scanned,
+ *       a worse chicken-and-egg problem than the one below. >, <, >=,
+ *       <= comparisons also not implemented (scope decision, not a
+ *       technical blocker -- == and != cover the common cases).
+ *
+ *       IMPORTANT DESIGN NOTE: because this is a two-pass assembler, each
+ *       .IF's condition is evaluated exactly ONCE, during pass 1; pass
+ *       1.5 and pass 2 both just replay the stored per-line skip flag
+ *       rather than re-evaluating anything (see the conditional-assembly
+ *       block right above assemble() for the full rationale and the
+ *       IfFrame/if_active()/if_push()/if_else()/if_pop() implementation).
+ *       Consequence: .IF conditions may only reference symbols already
+ *       fully and finally resolved earlier in the source -- numeric
+ *       literals, or equates/labels defined via a plain, non-forward-
+ *       referencing definition. A forward reference in a .IF condition
+ *       is a hard error, by design, rather than a silent miscompile.
+ *
+ *       Known interaction, not fixed here: .INCLUDE is expanded by
+ *       expand_includes() as a preprocessing step before pass 1 -- and
+ *       therefore before any .IF state exists. An .INCLUDE inside a
+ *       false .IF branch is still opened and spliced in; a missing file
+ *       still errors even though the code it contains would never
+ *       actually be assembled. Fixing this would mean merging include-
+ *       expansion and conditional-tracking into a single pass.
  *
  * Build (standalone):
  *   gcc -O2 -DASM65C02_MAIN -o asm65c02 asm65c02.c
@@ -194,6 +225,9 @@
  *                .DB / .BYTE  val[,val,...]   (values or "string literals")
  *                .DW / .WORD  val[,val,...]   (16-bit little-endian)
  *                .RES / .RS  n[,fill]            (reserve n bytes, optional fill)
+ *                .IF expr / .ELSE / .ENDIF     (conditional assembly; see
+ *                                v1.11 changelog above for the forward-
+ *                                reference restriction and other caveats)
  *                .opt proc6502 / .opt proc65c02
  *                .setcpu "6502" / .setcpu "65C02"
  *                                (switch CPU mode; proc6502 enables 6502-only checks)
@@ -208,7 +242,8 @@
  *                  BBRn/BBSn zp,target  (n=0-7, TWO comma-separated operands)
  *                relative (branch instructions)
  *   Expressions: decimal  $hex  %binary  'char'  "char"  * (current PC)
- *                <lo-byte  >hi-byte  + - * /  ( )
+ *                <lo-byte  >hi-byte  + - * /  == !=  ( )
+ *                (== and != are for .IF conditions; lowest precedence)
  *   Comments   : ; to end of line
  *
  * Listing output:
@@ -645,6 +680,33 @@ static int find_binop(const char *s, int len, const char *ops) {
     return -1;
 }
 
+/*
+ * find_cmpop (v1.11)  --  like find_binop() but for the two-character
+ *   comparison operators "==" and "!=", used by .IF conditions.
+ *   In:  s, len -- expression text and its length
+ *   Out: return the index of the first character of the rightmost
+ *        top-level (paren-depth-0) "==" or "!=", or -1 if none found.
+ *        Scanning right-to-left with the rightmost match winning keeps
+ *        this left-associative, matching find_binop()'s convention
+ *        (not that repeated comparisons are common, but it's the
+ *        consistent choice).
+ *   Clobbers: none
+ *
+ *   No conflict with the existing single-char '<'/'>' low/high-byte
+ *   PREFIX operators (checked earlier in eval_expr(), only at position
+ *   0 of an expression): this only ever matches '=' or '!' followed by
+ *   '=', never a bare '<' or '>'.
+ */
+static int find_cmpop(const char *s, int len) {
+    int depth = 0;
+    for (int i = len-2; i >= 1; i--) {
+        if (s[i] == ')') depth++;
+        else if (s[i] == '(') depth--;
+        if (depth == 0 && s[i+1]=='=' && (s[i]=='=' || s[i]=='!')) return i;
+    }
+    return -1;
+}
+
 static int eval_expr(const char *raw, int pc, int pass2, int *err) {
     char s[LINE_LEN];
     strncpy(s, raw, LINE_LEN-1); s[LINE_LEN-1] = '\0';
@@ -708,6 +770,24 @@ static int eval_expr(const char *raw, int pc, int pass2, int *err) {
         if (matched) {
             s[len-1] = '\0';
             return eval_expr(s+1, pc, pass2, err);
+        }
+    }
+
+    /* comparison operators == and != (v1.11, for .IF conditions) --
+     * lowest precedence of all, so checked before + - * / below. */
+    {
+        int ci = find_cmpop(s, len);
+        if (ci >= 1) {
+            char left[LINE_LEN], right[LINE_LEN];
+            strncpy(left,  s,     ci); left[ci] = '\0'; str_trim(left);
+            strncpy(right, s+ci+2, LINE_LEN-1); str_trim(right);
+            int el=0, er=0;
+            int L = eval_expr(left,  pc, pass2, &el);
+            int R = eval_expr(right, pc, pass2, &er);
+            if (!el && !er) {
+                int eq = (L == R);
+                return (s[ci]=='=') ? eq : !eq;
+            }
         }
     }
 
@@ -1186,6 +1266,9 @@ typedef struct {
     char mnem[LINE_LEN];
     char operand[LINE_LEN];
     int  is_equate;
+    int  skip;          /* v1.11: 1 if inside a false .IF/.ELSE branch --
+                          * pass 1.5 and pass 2 both skip these lines
+                          * entirely (see if_active() header comment) */
 } LineInfo;
 
 static LineInfo pc_map[MAX_LINES];
@@ -1458,6 +1541,120 @@ static int expand_includes(char *text, const char *tag_prefix, int depth,
     return 1;
 }
 
+/*
+ * ── conditional assembly: .IF / .ELSE / .ENDIF (v1.11) ─────────────────────
+ *
+ * Design note (read this before touching any of this): this is a two-pass
+ * assembler. If a .IF condition were evaluated independently in pass 1 and
+ * pass 2, a forward-referenced or not-yet-finally-resolved symbol could
+ * make the two passes disagree about which lines even exist -- silently
+ * corrupting every address after that point in a way that's very hard to
+ * diagnose. So the decision is made exactly ONCE, here, during pass 1, and
+ * pass 1.5/pass 2 simply REPLAY the stored info->skip flag rather than
+ * re-evaluating anything. The consequence: .IF conditions may only
+ * reference symbols already fully and finally resolved earlier in the
+ * source (numeric literals, or equates/labels defined via a plain,
+ * non-forward-referencing definition) -- a forward reference in a .IF
+ * condition is a hard error rather than a silent miscompile.
+ *
+ * Known interaction, not fixed here: .INCLUDE is expanded by
+ * expand_includes() as a preprocessing step before pass 1 -- and therefore
+ * before any .IF state exists. An .INCLUDE inside a false .IF branch will
+ * still be opened and its contents spliced in (a missing file still
+ * errors, even though the code it contains would never actually be
+ * assembled). Fixing this would mean merging include-expansion and
+ * conditional-tracking into a single pass; out of scope here.
+ *
+ * .REF(label) (a Kowalski feature checking whether a label was ever
+ * referenced elsewhere) is NOT implemented -- it requires knowing the
+ * answer before the rest of the file has even been scanned, an even worse
+ * chicken-and-egg problem than the forward-reference restriction above.
+ */
+#define MAX_IF_DEPTH 16
+typedef struct {
+    int condition_true;     /* is THIS branch (before or after .ELSE) selected */
+    int had_else;            /* has .ELSE already been seen at this level */
+    int enclosing_active;    /* was the ENCLOSING context active when this .IF was reached */
+} IfFrame;
+static IfFrame if_stack[MAX_IF_DEPTH];
+static int     if_sp = 0;
+
+/*
+ * if_active (v1.11)
+ *   In:  none (reads if_stack/if_sp)
+ *   Out: return 1 if lines at the current point in pass 1 should be
+ *        processed normally (label registration, equates, instructions,
+ *        directives); return 0 if they should be skipped entirely --
+ *        inside a false .IF branch, or a branch nested inside one.
+ *        With no open .IF at all (if_sp==0), always active.
+ */
+static int if_active(void) {
+    if (if_sp == 0) return 1;
+    IfFrame *f = &if_stack[if_sp-1];
+    return f->enclosing_active && f->condition_true;
+}
+
+/*
+ * if_push (v1.11)  --  handle a .IF line.
+ *   In:  operand -- the .IF's condition expression text
+ *        pc, lineno -- for expression evaluation / error reporting
+ *   Out: none (pushes a new frame onto if_stack)
+ *   Clobbers: if_stack, if_sp; may call add_error() on stack overflow or
+ *             a condition that fails to evaluate (undefined symbol).
+ *
+ *   The condition is evaluated ONLY when the enclosing context is
+ *   currently active. Inside an already-skipped block, a nested .IF's
+ *   own condition is never evaluated at all (its symbols may not even
+ *   exist -- e.g. dead code behind a platform check) and the whole
+ *   nested block is simply skipped regardless.
+ */
+static void if_push(const char *operand, int pc, int lineno) {
+    int enclosing = if_active();
+    if (if_sp >= MAX_IF_DEPTH) {
+        add_error(lineno, ".IF nesting too deep (max 16)");
+        return;   /* don't push -- matching .ENDIF will underflow-guard too */
+    }
+    int cond = 0;
+    if (enclosing) {
+        int e = 0;
+        cond = (eval_expr(operand, pc, 1, &e) != 0);
+        if (e) {
+            add_error(lineno, ".IF: undefined symbol in condition "
+                               "(forward references are not supported in .IF)");
+            cond = 0;
+        }
+    }
+    if_stack[if_sp].condition_true   = cond;
+    if_stack[if_sp].had_else         = 0;
+    if_stack[if_sp].enclosing_active = enclosing;
+    if_sp++;
+}
+
+/*
+ * if_else (v1.11)  --  handle an .ELSE line.
+ *   In:  lineno -- for error reporting
+ *   Out: none (flips the top frame's condition_true)
+ *   Clobbers: if_stack top frame; add_error() on unmatched/duplicate .ELSE.
+ */
+static void if_else(int lineno) {
+    if (if_sp == 0) { add_error(lineno, ".ELSE without matching .IF"); return; }
+    IfFrame *f = &if_stack[if_sp-1];
+    if (f->had_else) { add_error(lineno, "duplicate .ELSE for the same .IF"); return; }
+    f->had_else = 1;
+    f->condition_true = !f->condition_true;
+}
+
+/*
+ * if_pop (v1.11)  --  handle an .ENDIF line.
+ *   In:  lineno -- for error reporting
+ *   Out: none (pops if_stack)
+ *   Clobbers: if_sp; add_error() on unmatched .ENDIF.
+ */
+static void if_pop(int lineno) {
+    if (if_sp == 0) { add_error(lineno, ".ENDIF without matching .IF"); return; }
+    if_sp--;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * ASSEMBLE  —  main two-pass entry point
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -1501,6 +1698,7 @@ static int assemble(const char *source) {
 
     /* ── PASS 1: collect labels, compute addresses ── */
     int pc = 0;
+    if_sp = 0;   /* v1.11: reset conditional-assembly stack for this assemble() call */
     for (int li = 0; li < nl; li++) {
         int lineno = li + 1;
         char label[LINE_LEN], mnem[LINE_LEN], operand[LINE_LEN];
@@ -1511,9 +1709,23 @@ static int assemble(const char *source) {
         info->lineno   = lineno;
         info->pc       = pc;
         info->is_equate = is_eq;
+        info->skip     = 0;
         strncpy(info->label,   label,   LINE_LEN-1);
         strncpy(info->mnem,    mnem,    LINE_LEN-1);
         strncpy(info->operand, operand, LINE_LEN-1);
+
+        /* v1.11: .IF/.ELSE/.ENDIF -- recognized before anything else on the
+         * line (label registration, equates, normal directive/instruction
+         * dispatch), since these are pure flow-control pseudo-ops with no
+         * label/value of their own. See the conditional-assembly block
+         * above assemble() for the full design and its restrictions. */
+        {
+            char mnl[LINE_LEN]; str_lower(mnl, mnem);
+            if (!strcmp(mnl, ".if"))   { if_push(operand, pc, lineno); info->skip = 1; continue; }
+            if (!strcmp(mnl, ".else")) { if_else(lineno);              info->skip = 1; continue; }
+            if (!strcmp(mnl, ".endif")){ if_pop(lineno);               info->skip = 1; continue; }
+        }
+        if (!if_active()) { info->skip = 1; continue; }
 
         /* equate */
         if (is_eq) {
@@ -1622,10 +1834,19 @@ static int assemble(const char *source) {
         strncpy(info->mnem, mn, LINE_LEN-1);
     }
 
+    /* v1.11: every .IF must be closed by a matching .ENDIF within the
+     * same file/assemble() call -- an if_sp left non-zero here means at
+     * least one is still open. Report against the last line, same
+     * convention as other end-of-file structural checks. */
+    if (if_sp != 0) {
+        add_error(nl, ".IF without matching .ENDIF (unclosed at end of file)");
+    }
+
     /* ── PASS 1.5: re-resolve equates now all labels known ── */
     g_scope[0] = '\0';
     for (int li = 0; li < nlines; li++) {
         LineInfo *info = &pc_map[li];
+        if (info->skip) continue;   /* v1.11: never re-resolve a skipped equate */
         if (!info->is_equate) {
             if (info->label[0] && info->label[0] != '@')
                 strncpy(g_scope, info->label, SYM_NAME_LEN-1);
@@ -1647,6 +1868,13 @@ static int assemble(const char *source) {
         int lineno = info->lineno;
         pc = info->pc;
         ListingRecord *lrec = listing_begin_line(lineno, pc, raw_lines[li]);
+
+        /* v1.11: replay pass 1's .IF/.ELSE decision -- never re-evaluate
+         * here (see conditional-assembly design note above assemble()).
+         * Lines inside a false branch still appear in the .LST (via
+         * listing_begin_line above) but emit nothing and are otherwise
+         * completely inert. */
+        if (info->skip) continue;
 
         if (!info->label[0] && !info->mnem[0]) continue;
 
