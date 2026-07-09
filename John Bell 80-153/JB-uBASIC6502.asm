@@ -30,6 +30,8 @@
 ; Numbers      : signed 16-bit  (-32768 .. 32767)
 ; String print : "literals", `;`, TAB(n) and CHR$(char); no string variables
 ;
+; Note: `:` multi-statement not supported. Inpout buffer is 31 chars long.  
+;
 ; Error codes (printed as "?N"):
 ;   ?0  syntax / bad expression
 ;   ?1  undefined line number
@@ -55,7 +57,7 @@
 ;   V1.2 (Jul 2026)   29 bytes free before vectors. Ported GOSUB/RETURN, RND 
 ;                     from uBASIC6502 1.9. Refactor PNUM/DELINE/INSLINE/EDITLN
 ;                     for size/correctness. GOTOL updates CURLN bugfix.Refactor
-;                     DO_NEW. Remove partial ':' multi-statement support. 
+;                     DO_NEW. Clean-up partial ':' multi-statement support. 
 ;   V1.1 (Jun 2026)   Refactored for size, added FREE and TAB.
 ;   v1.0 (Jun 2026)   Initial Port from uBASIC6502 1.4
 ;
@@ -108,8 +110,7 @@ GOSUB_SP:   .RES 1              ; 8-bit:  GOSUB/RETURN stack pointer (holds a ZP
 GOSUB_LO:   .RES 32             ; base of the 8-level GOSUB return-frame stack (32 bytes)
 VARS:       .RES 52             ; 52-byte variable store (A-Z, 2 bytes each)
 IBUF:       .RES (IBUF_MAX+1)   ; 32-byte input line buffer - coudl be bigger
-
-; ---- Misc constants -------------------------------------------------
+ZPEND:		; audit
 
 ; =============================================================================
 ; ROM START  ($F800)
