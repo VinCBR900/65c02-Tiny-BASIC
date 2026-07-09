@@ -1,5 +1,5 @@
 ; =============================================================================
-; JB-uBASIC6502 v1.2  --  2 KB Tiny BASIC (NMOS 6502) for John Bell 80-153 SBC
+; JB-uBASIC6502 v1.3  --  2 KB Tiny BASIC (NMOS 6502) for John Bell 80-153 SBC
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Note: Due to bitbang serial IO, this is not compatible with Kowalski simulator.
@@ -49,6 +49,9 @@
 ;
 ; ---- version lineage --------------------------------------------------------
 ; 6502 base:
+;   V1.3 (Jul 2026)   10 bytes free before vectors.  Multiple helpers to 
+;                     refactor for size.  Added optional LIST start,end.
+;                     FREE converted to function to save space.
 ;   V1.2 (Jul 2026)   29 bytes free before vectors. Ported GOSUB/RETURN, RND 
 ;                     from uBASIC6502 1.9. Refactor PNUM/DELINE/INSLINE/EDITLN
 ;                     for size/correctness. GOTOL updates CURLN bugfix.Refactor
@@ -132,7 +135,7 @@ T_K   = 203              ; $4B + $80  ('K' -- BREAK, PEEK)
 
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
-STR_BANNER: .DB "JB uBASIC v1.2"  ; startup banner, rolls into free
+STR_BANNER: .DB "JB uBASIC v1.3"  ; startup banner, rolls into free
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
 STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
