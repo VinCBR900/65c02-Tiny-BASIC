@@ -10,17 +10,19 @@ A minimal but complete integer BASIC. No tokeniser — program lines are stored 
 
 **Statements:** 
   * `END` `GOSUB`/`RETURN`  `GOTO`  `IF`/`THEN`  `INPUT`  `LET`  `POKE`  `PRINT [TAB(n)] [;] CHR$(n)`  `REM`  `RUN`  
-  * `LIST` `NEW` `FREE`
+  * `LIST` `NEW` 
 
 **Expressions:** 
   * `+` `-` `*` `/` `%`(mod) `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)`  variables `A`–`Z`
-  * Functions: `PEEK(addr)` `USR(addr)`  `RND`
+  * Functions: `ABS(val)`   `FREE`   `PEEK(addr)`  `RND`   `USR(addr)`  
 
 **Numbers:** signed 16-bit integers, −32768 to 32767
 
 **Notes**
-  * Uses 2 character matching (with 3rd char match for `GOSUB`/`GOTO` and `RETURN`/`REM`) so technically maches anything e.g. PROCEED matches PRINT.  This means spaces are important e.g. `PRINT TAB(5);"hello"` works, whereas `PRINTTAB(5);"HELLO"` does not.
-  * Multi-statement operator `:` is not supported and input buffer is 32 characters only.
+- Uses **2 character matching** - with 3rd char match for `GOSUB`/`GOTO` and `RETURN`/`REM`.  Matches anything after e.g. PROCEED matches PRINT.  Therefore  spaces are important e.g. `PRINT TAB(5);"hello"` works, whereas `PRINTTAB(5);"HELLO"` does not.
+- **`:` Not Supported** - Multi-statement operator `:` is not supported and input buffer is 32 characters only.
+- **`GOTO`/`GOSUB` accepts expressions** — `GOTO X`, `GOSUB BASE+N`, `GOTO 10*I` all work
+- **`RND`** — 16-bit Galois LFSR pseudo-random number, returns 1–32767; seeded at startup; useful as `RND MOD 6 + 1` for a die roll
 
 **Errors** (printed as `?N [IN line]`):
 
@@ -42,17 +44,17 @@ A significantly more capable integer BASIC. Keywords are tokenised on entry and 
   * `PRINT [TAB(n)] [;] CHR$(n)` `IF`/`THEN`/`ELSE` `GOTO` `GOSUB` `RETURN` `FOR`/`TO`/`STEP`/`NEXT` `LET` `INPUT` `REM` `END` `POKE` `DATA` `READ` `RESTORE` 
   * `RUN` `LIST` `NEW` `FREE` `HELP`
  
-**Functions:** `ABS(n)` `SGN(n)` `CHR$(n)` `ASC("c")` `PEEK(addr)` `USR(addr)` `RND` `SIN(deg)`  `COS(deg)`
+**Functions:** `ABS(n)` `SGN(n)` `ASC("c")` `PEEK(addr)` `USR(addr)` `RND` `SIN(deg)`  `COS(deg)`
 
 **Expressions:** `AND` `OR` `XOR` `NOT` `MOD` `+` `-` `*` `/` `%`(mod) `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)` variables `A`–`Z`
 
 **Numbers:** signed 16-bit integers, −32768 to 32767. Relational operators return −1 (true) or 0 (false). `AND`/`OR`/`XOR`/`NOT` are bitwise.
 
 **Notes**
-- **`GOTO`/`GOSUB` accept expressions** — `GOTO X`, `GOSUB BASE+N`, `GOTO 10*I` all work
+- **`GOTO`/`GOSUB` accepts expressions** — `GOTO X`, `GOSUB BASE+N`, `GOTO 10*I` all work
 - **`MOD` keyword** — `10 MOD 3` is now an alternative to `10 % 3` (both give `1`)
 - **`RND`** — 16-bit Galois LFSR pseudo-random number, returns 1–32767; seeded at startup; useful as `RND MOD 6 + 1` for a die roll
-- **`:` multi-statement** - don't have `FOR`/`NEXT`, `FOR`/`FOR`, `GOSUB`/`GOSUB` or `GOSUB`/`RETURN` on same line - its still a Tiny BASIC, after all.
+- **`:` multi-statement** Is Line based - don't have `FOR`/`NEXT`, `FOR`/`FOR`, `GOSUB`/`GOSUB` or `GOSUB`/`RETURN` on same line - its still a Tiny BASIC, after all.
 
 **Errors** (printed as `XX ERR [IN line]`):
 
