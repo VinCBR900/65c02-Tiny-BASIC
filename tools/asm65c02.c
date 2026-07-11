@@ -1,11 +1,21 @@
 /*
- * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.12, Jul 2026)
+ * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.13, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
  * Also used as an embedded assembler inside sim65c02.c (included directly).
  *
  * Changelog & Version History (Newest First)
+ *
+ * v1.13 (Jul 2026) — Forward-Referenced .ORG Correction
+ *   - FIXED: Stale address baking for code labels inside `.ORG <compound-equate>` 
+ *     blocks when the base equate expression contained a forward reference.
+ *   - ADDED: Pass 1.75 intermediate phase, executed between Pass 1.5 equate 
+ *     re-resolution and Pass 2 emission, to re-walk `pc_map[]` and re-evaluate 
+ *     `.ORG` operands with fully-resolved symbols.
+ *   - PC deltas are now dynamically propagated into subsequent `pc_map` entries 
+ *     and code-label symbol values, ensuring correct address resolution regardless 
+ *     of forward/backward reference order.
  *
  * v1.12 (Jul 2026) — Expression Parsing Correction
  *   - FIXED: Reordered `eval_expr()` parsing sequence to scan for binary and 
@@ -1742,6 +1752,65 @@ static int assemble(const char *source) {
         if (!e) sym_set(name, val);
     }
 
+    /* ── PASS 1.75: re-walk pc_map now equates are fully resolved ──────────
+     * Pass 1 evaluated .ORG expressions before all equates were known.  If an
+     * .ORG operand referenced an equate that was itself a forward reference
+     * (e.g. PROG = $0100+HWSTACK+1 where HWSTACK was defined later), pass 1
+     * used a stale value (forward refs return 0 in pass 1).  Pass 1.5 fixed
+     * the equate symbol values but left pc_map[].pc entries — and therefore
+     * all code-label sym values in those sections — stale.
+     *
+     * We now replay the pc_map in order: re-evaluate every .ORG operand with
+     * fully-resolved equates, propagate any delta to subsequent line PCs until
+     * the next .ORG, and re-set code labels whose stored address changed.
+     * This must complete before pass 2 emits any bytes so that operand
+     * eval_expr() calls (including forward references to labels in .ORG
+     * sections from code earlier in the file) see correct symbol values. */
+    {
+        g_scope[0] = '\0';
+        int running_pc = 0;
+        for (int li = 0; li < nlines; li++) {
+            LineInfo *info = &pc_map[li];
+            if (info->skip) continue;
+
+            /* maintain scope for local labels */
+            if (info->label[0] && info->label[0] != '@' && !info->is_equate)
+                strncpy(g_scope, info->label, SYM_NAME_LEN-1);
+
+            if (info->is_equate || !info->mnem[0]) continue;
+
+            if (!strcmp(info->mnem, ".org")) {
+                int e = 0;
+                int new_org = eval_expr(info->operand, info->pc, 1, &e) & 0xFFFF;
+                if (!e && new_org != info->pc) {
+                    int delta = new_org - info->pc;
+                    /* patch this .ORG line's own pc record */
+                    info->pc = new_org;
+                    /* propagate delta to lines in this section */
+                    for (int fi = li + 1; fi < nlines; fi++) {
+                        LineInfo *fi_info = &pc_map[fi];
+                        if (fi_info->skip) continue;
+                        if (fi_info->is_equate) continue;
+                        if (!strcmp(fi_info->mnem, ".org")) break; /* next .ORG owns its own re-eval */
+                        fi_info->pc += delta;
+                        /* re-set any code label on this line */
+                        if (fi_info->label[0]) {
+                            char full[SYM_NAME_LEN];
+                            strncpy(g_scope, fi_info->label[0]=='@' ? g_scope : fi_info->label,
+                                    SYM_NAME_LEN-1);
+                            scoped_name(full, fi_info->label);
+                            sym_set(full, fi_info->pc & 0xFFFF);
+                        }
+                    }
+                }
+                running_pc = new_org;
+            } else {
+                running_pc = info->pc;
+            }
+            (void)running_pc; /* suppress unused-variable warning */
+        }
+    }
+
     /* ── PASS 2: emit bytes ── */
     g_scope[0] = '\0';
     cpu_mode = 0;   /* v1.9 bug fix: don't inherit pass 1's trailing state */
@@ -2226,7 +2295,7 @@ static int parse_hex_range(const char *s, int *start, int *end) {
 
 static void asm_usage(FILE *out) {
     fprintf(out,
-        "asm65c02 v1.12 — Toy 65C02/6502 two-pass assembler\n"
+        "asm65c02 v1.13 — Toy 65C02/6502 two-pass assembler\n"
         "\n"
         "Copyright Vincent Crabtree 2026, MIT License, See LICENSE file\n"
         "\n"
@@ -2241,41 +2310,35 @@ static void asm_usage(FILE *out) {
         "  -o <file>    Write binary image to <file> (cleaner on Win32 than stdout).\n"
         "  -r <range>   Output only address range (requires --binary or -o).\n"
         "               e.g.  -r $F800-$FFFF   or   -r F000-FFFF\n"
-        "               uBASIC:    asm65c02 uBASIC6502.asm -o rom.bin -r $F800-$FFFF\n"
-        "               4K BASIC:  asm65c02 4kBASIC.asm -o rom.bin -r $F000-$FFFF\n"
-        "  -NoList      Suppress default sidecar .LST listing generation.\n"
-        "  -NoWarn65c02 Suppress the default warning issued whenever a 65C02-only\n"
-        "               instruction is assembled with no .opt proc6502/proc65c02\n"
-        "               directive in scope. Same effect as .opt proc65c02 (see\n"
-        "               below); conflicts (hard error) with a .opt proc6502 in the\n"
-        "               source, and cannot be combined with -Strict6502.\n"
-        "  -Strict6502  Treat every 65C02-only instruction as a hard error when no\n"
-        "               .opt proc6502/proc65c02 directive is in scope, without\n"
-        "               needing .opt proc6502 in the source. Same effect as .opt\n"
-        "               proc6502 (see below); conflicts (hard error) with a .opt\n"
+        "  -NoList      Suppress default .LST listing generation.\n"
+        "  -NoWarn65c02 Suppress default 65c02 instruction warning with no .opt \n"
+        "               proc6502/proc65c02 directive. Same as .opt proc65c02\n"
+        "               (see below); hard errors with .opt proc6502 in the source,\n"
+        "               and cannot be combined with -Strict6502.\n"
+        "  -Strict6502  Treat 65C02-only instructions as hard errors with no .opt\n"
+        "               proc6502/proc65c02 directive. without needing .opt proc6502\n"
+        "               Same as .opt proc6502 (see below); Hard errors with a .opt\n"
         "               proc65c02 in the source, and cannot be combined with\n"
         "               -NoWarn65c02.\n"
         "  --dump-all   Print all assembled symbols after the key-symbol table.\n"
         "  --help, -h   Print this help and exit.\n"
         "\n"
         "Listing files:\n"
-        "  A .LST file is generated by default,Use -NoList to suppress.\n"
+        "  .LST file is generated by default, use -NoList to suppress.\n"
         "\n"
         "CPU mode directives (in source):\n"
         "  .opt proc6502      Target NMOS 6502: flags 65C02-only instructions as\n"
-        "                     errors. Implies the same intent as -Strict6502; it is\n"
-        "                     a hard error to also pass -NoWarn65c02 on the command\n"
-        "                     line.\n"
+        "                     errors. Same intent as -Strict6502;  errors if\n"
+        "                     -NoWarn65c02 is on the command line.\n"
         "  .opt proc65c02     Target 65C02 (default): all instructions permitted,\n"
-        "                     with no portability warning. Implies the same intent\n"
-        "                     as -NoWarn65c02; it is a hard error to also pass\n"
-        "                     -Strict6502 on the command line.\n"
+        "                     with no portability warning. Same as -NoWarn65c02;\n"
+        "                     Hard errors if -Strict6502 is on the command line.\n"
         "  .setcpu \"6502\"     Equivalent to .opt proc6502.\n"
         "  .setcpu \"65C02\"    Equivalent to .opt proc65c02.\n"
         "  With no directive at all, 65C02-only instructions are allowed and warn\n"
         "  by default (see -NoWarn65c02/-Strict6502 above).\n"
-        "\n") ;
-     
+        "\n"
+    );
 }
 
 int main(int argc, char **argv) {
@@ -2389,7 +2452,7 @@ int main(int argc, char **argv) {
      * mem[]/syms[] may be incomplete or reflect a truncated pass 2, so
      * showing them was misleading. Suppress the whole block on failure. */
     if (ok) {
-        printf("\n------------------------------------------------------------\n");
+        printf("------------------------------------------------------------\n");
         int rv = mem[0xFFFC] | (mem[0xFFFD]<<8);
         printf("\n  Reset vector         = $%04X\n", (unsigned)rv);
 
