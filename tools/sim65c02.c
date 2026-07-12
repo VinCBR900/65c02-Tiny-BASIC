@@ -1,5 +1,5 @@
 /*
- * sim65c02.c  —  Toy 65C02 simulator  (v9, Jul 2026)
+ * sim65c02.c  —  Toy 65C02 simulator  (v10, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
@@ -132,46 +132,57 @@
  *
  * Reset vector at $FFFC/$FFFD is used to set the initial PC on startup.
  *
- * Version history:
- *   v1  Initial version for microbasic / uBASIC testing.
- *   v2  Added GOSUB/RETURN, FOR/NEXT, 4K BASIC support.
- *   v3  GETCH detection, --mandelbrot, --input, --maxcycles, --stats.
- *   v4  Archive cleanup.  Fixed --load-addr.  Auto-detect ROM base from file size.
- *   v5  Replaced Python assembler subprocess with direct C call.
- *       asm65c02.c is now #included; no Python runtime required.
- *   v6  Header updated: full option docs, --help flag, --plain documented,
- *       corrected project version references (uBASIC v13, 4K BASIC v11).
- *   v7  Added -w & -W  watches to stderr output
- *   v8  Added CMP abs,Y ($D9) and CMP (zp,X) ($C1) execution -- newly
- *       reachable once asm65c02.c v1.9 could emit them. Added execution
- *       for LSR/ROL/ROR/LDY abs,X ($5E/$3E/$7E/$BC), same reason.
- *       --maxcycles 0 now means unlimited (previously would run zero
- *       cycles, since the loop test was cycles<maxcycles with cycles
- *       starting at 0). GETCH/PUTCH replaced the old ROM byte-pattern
- *       scan (fragile: only matched one specific polling-loop shape,
- *       and never worked at all for raw .bin loads) with plain
- *       configurable addresses (--getch-addr/--putch-addr) intercepted
- *       directly in rd()/wr(); idle-exhaustion detection now keys off
- *       actual GETCH-read activity instead of PC-address matching, and
- *       is itself skipped when --maxcycles 0 is given. Added a SIGINT
- *       handler so Ctrl-C exits the run loop gracefully (prints
- *       --stats/-m output) instead of an abrupt kill. When --input
- *       supplies no input, GETCH now reads real stdin directly (blocking
- *       fgetc() per poll, LF->CR translation, EOF feeds the same idle-
- *       exhaustion path) instead of always requiring pre-queued --input;
- *       --input still takes precedence whenever given.
- *   v9  Removed --mandelbrot and --plain: both were demo/display
- *       conveniences from before real stdin support existed (--mandelbrot
- *       was just --input "RUN"; --plain suppressed ANSI cursor escapes
- *       for piped output). Now that any text file can be redirected in
- *       directly (`sim65c02 rom.asm < script.txt`, one BASIC line/command
- *       per line, exactly as you'd type it), both are redundant --
- *       terminal/cursor output always uses ANSI escapes unconditionally
- *       now (the behavior --plain used to opt OUT of). Documented the
- *       stdin-redirect-as-test-script workflow explicitly, including
- *       that a script ending in an infinite loop (e.g. GOTO) requires
- *       Ctrl-C regardless of --maxcycles, since the program is
- *       legitimately running, not idle-polling for input.
+ * Version History (Newest First)
+ *
+ * v10 — Opcode Completeness
+ *   - FIXED: Added missing execution mapping for CMP (zp) ($D2) zero-page 
+ *     indirect addressing mode to align with other core arithmetic opcodes.
+ *
+ * v9 — CLI Streamlining
+ *   - REMOVED: Redundant --mandelbrot and --plain flags now that full native 
+ *     stdin redirection (`sim65c02 rom.asm < script.txt`) is supported.
+ *   - ADDED: Explicit documentation for stdin test-script pipelining.
+ *
+ * v8 — Core I/O Overhaul & Execution Engine Updates
+ *   - ADDED: Opcode execution support for CMP abs,Y ($D9), CMP (zp,X) ($C1), 
+ *     and absolute indexed X variants for LSR, ROL, ROR, and LDY ($5E/$3E/$7E/$BC).
+ *   - CHANGED: Replaced fragile ROM signature polling loops with robust, 
+ *     address-configurable hooks via --getch-addr and --putch-addr inside rd()/wr().
+ *   - CHANGED: --maxcycles 0 now specifies unlimited execution.
+ *   - ADDED: Real-time, blocking stdin fallback (with LF->CR translation) when 
+ *     the --input buffer queue is exhausted or omitted.
+ *   - ADDED: SIGINT (Ctrl-C) trap handler for graceful exits and telemetry dumping.
+ *   - FIXED: Tied idle-exhaustion detection directly to explicit GETCH activity 
+ *     rather than static PC tracking.
+ *
+ * v7 — Diagnostic Monitoring
+ *   - ADDED: -w and -W watchpoint tracking switches routed directly to stderr.
+ *
+ * v6 — UX & Documentation Refreshes
+ *   - ADDED: Comprehensive inline option documentation and the --help CLI flag.
+ *   - FIXED: Re-synchronized software manifest targets to reference uBASIC v13 
+ *     and 4K BASIC v11 accurately.
+ *
+ * v5 — Toolchain Native Integration
+ *   - CHANGED: Migrated the external Python assembler compilation pipeline 
+ *     to a direct C `#include "asm65c02.c"` block, removing the Python runtime dependency.
+ *
+ * v4 — Loader Stability
+ *   - ADDED: Automated ROM base-address detection inferred from source file size.
+ *   - FIXED: Corrected target initialization bugs within the --load-addr driver.
+ *   - CLEANUP: General codebase maintenance and repository archive archiving.
+ *
+ * v3 — Instrumentation Interface
+ *   - ADDED: Preliminary diagnostics tracking flags: --mandelbrot, --input, 
+ *     --maxcycles, and --stats.
+ *   - ADDED: Experimental automated GETCH trapping hooks.
+ *
+ * v2 — Control Architecture Support
+ *   - ADDED: Support for GOSUB/RETURN and FOR/NEXT loops to enable 4K BASIC compatibility.
+ *
+ * v1 — Prototype Release
+ *   - Initial execution framework deployed for microbasic and uBASIC environments.
+ * =============================================================================
  */
 
 #include <stdio.h>
@@ -687,6 +698,7 @@ static int step(CPU *cpu) {
      * (v1.9) can emit them; previously unassemblable so unneeded here. */
     case 0xD9: do_cmp(cpu,cpu->A,RD(ABSY)); cpu->PC+=2; return 0;
     case 0xC1: do_cmp(cpu,cpu->A,RD(INDX)); cpu->PC+=1; return 0;
+    case 0xD2: do_cmp(cpu,cpu->A,RD(INDZP));cpu->PC+=1; return 0; /* 65C02: CMP (zp) */
 
     /* ── CPX ── */
     case 0xE0: do_cmp(cpu,cpu->X,IMM);    cpu->PC+=1; return 0;
@@ -902,7 +914,7 @@ static int assemble_and_load(const char *asm_path) {
 /* ── main ────────────────────────────────────────────────────────────────── */
 static void sim_usage(FILE *out) {
     fprintf(out,
-        "sim65c02 v9 — 65C02 simulator for uBASIC v13 and 4K BASIC v11\n"
+        "sim65c02 v10 — 65C02 simulator for uBASIC\n"
         "\n"
         "Usage:\n"
         "  sim65c02 <file.asm | file.bin> [options]\n"
