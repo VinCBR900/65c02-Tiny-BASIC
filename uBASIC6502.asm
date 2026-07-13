@@ -1,9 +1,11 @@
 ; =============================================================================
-; JB-uBASIC6502 v1.3  --  2 KB Tiny BASIC (NMOS 6502) for John Bell 80-153 SBC
+; JB-uBASIC6502 v1.4  --  2 KB Tiny BASIC (NMOS 6502) for John Bell 80-153 SBC
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
-; Note: Due to bitbang serial IO, this is not compatible with Kowalski simulator.
-;   Instead use the JB-Sim65c02 simulator.
+; Note: Due to bitbang serial IO, either use the JB-Sim65c02 simulator for 
+; bitbang ROM size testing, or set KOWALSKI for testing in Kowalski 6502 simulator. 
+;
+KOWALSKI   = 1
 ;
 ;   CPU    : NMOS 6502 @ 1 MHz
 ;   ROM    : 2716 EPROM  2 KB  $F800-$FFFF
@@ -50,9 +52,10 @@
 ;   No tokenisation; body bytes are stored exactly as typed.
 ;
 ; ---- version lineage --------------------------------------------------------
-;   V1.3 (Jul 2026)   22 bytes free before vectors.  Multiple refcators and 
-;					  helpers for size. Added optional LIST start,end and ABS(val)
-;                     FREE converted to function for space.
+;   V1.4 (Jul 2026)   Added showcase and Syntax edits for Kowalski Simulator.
+;   V1.3 (Jul 2026)   10 bytes free before vectors.  Multiple helpers to 
+;                     refactor for size. Added optional LIST start,end and ABS.
+;                     FREE converted to function to save space.
 ;   V1.2 (Jul 2026)   29 bytes free before vectors. Ported GOSUB/RETURN, RND 
 ;                     from uBASIC6502 1.9. Refactor PNUM/DELINE/INSLINE/EDITLN
 ;                     for size/correctness. GOTOL updates CURLN bugfix.Refactor
@@ -62,23 +65,30 @@
 ;
 ; ---- assembler mode ---------------------------------------------------------
          .opt proc6502
-
-; ---- hardware I/O (John Bell Engineering PN 80-153 -- 6522 VIA) -------------
+         
+; ---- Hardware I/O (John Bell Engineering PN 80-153 -- 6522 VIA) -------------
 VIA_DDRA = $1C03             ; 6522 Port A Data Direction Register
 VIA_ORA  = $1C0F             ; 6522 Port A Output/Input Register (no handshake)
 VIA_TX   = $01               ; PA0 = TX output bit mask
 VIA_RX   = $02               ; PA1 = RX input  bit mask
 
+; ---- Kowalski Emulated IO ---------------------------------------------------
+IO_OUT   = $E001             ; UART output: write character to terminal
+IO_IN    = $E004             ; UART input:  read character (0 = no char ready)
+
 ; ---- Constants -------------------------------------------------------------
-RAM_TOP  = $0400             ; first address above usable SRAM (1 KB: 2x 2114)
+	 .IF KOWALSKI
+RAM_TOP  = $800 	     ; Showcase a smidge under 2kbytes
+	 .ELSE
+RAM_TOP  = $0400             ; Bell board has 1k SRAM (1 KB: 2x 2114)
+	.ENDIF	 
+
 HWSTACK  = $7f               ; Give more space to PROG
-PROG     = $0180             ; = $101 + HWSTACK; hardcoded due to assembler barf 
+PROG     = $101 + HWSTACK    ; Prog Start above Stack 
 IBUF_MAX = 31                ; highest valid index into IBUF
 CR       = $0D               ; ASCII carriage return
 LF       = $0A               ; ASCII line feed
 BS       = $08               ; ASCII backspace
-GOSUB_FULL = (GOSUB_LO+3)    ; lowest X for which a full 4-byte push still fits 
-GOSUB_TOP  = (GOSUB_LO+31)   ; initial/empty GOSUB_SP value (topmost stack byte)
 
 ; ---- error codes -------------------------------------------------------------
 ERR_SN   = 0                 ; syntax / bad expression
@@ -90,31 +100,160 @@ ERR_RET  = 5                 ; RETURN without GOSUB
 
 ; ---- zero-page symbols -------------------------------------------------------
         .ORG 0
+        
+; =============================================================================
+; Program Start - 
+; Kowalski executes from first byte not Reset, so trampoline over to INIT.
+; Real hardware reaches INIT via Reset vector $FFFC instead.
+; Overwritten as soon as program starts in Simulator.        
+        .IF KOWALSKI
+        JMP INIT	; 3 bytes
+        NOP		; 1 byte
+T0	    = 0		; Manually overwrite trampoline
+T1          = 2
+	.ELSE        
+T0:         .RS 2              ; 16-bit: primary scratch word / expression result
+T1:         .RS 2              ; 16-bit: secondary scratch word
+        .ENDIF
+        
 ; Note IP and CURLN must be sequential for GOSUB/RETURN stack push
-T0:         .RES 2              ; 16-bit: primary scratch word / expression result
-T1:         .RES 2              ; 16-bit: secondary scratch word
-T2:         .RES 2              ; 16-bit: tertiary scratch word / STMT jump target
-T3:         .RES 2              ; 16-bit: PNUM x10-multiply scratch, RXCHAR/TXCHAR
-T4:         .RES 2              ; 16-bit: Used in DO_POKE, free for others
-IP:         .RES 2              ; 16-bit: interpreter pointer
-CURLN:      .RES 2              ; 16-bit: currently-executing line number
-PE:         .RES 2              ; 16-bit: program end (one past last byte)
-LP:         .RES 2              ; 16-bit: line pointer / multi-purpose scratch
-RND_SEED:   .RES 2              ; 16-bit: Galois LFSR state for RND (lo=$8A, hi=$8B)
-RUN:        .RES 1              ; 8-bit:  run flag ($00 = immediate, $FF = running)
-OP:         .RES 1              ; 8-bit:  saved operator for MUL/DIV/MOD ('*'/'/'/'%')
-GCHRX:      .RES 1              ; 8-bit:  GETLINE: buffer index X saved across JSR GETCH
-RUNSP:      .RES 1              ; 8-bit:  stack-pointer snapshot for GOTO/BREAK unwind
-GOSUB_SP:   .RES 1              ; 8-bit:  GOSUB/RETURN stack pointer (holds a ZP address directly)
-GOSUB_LO:   .RES 32             ; base of the 8-level GOSUB return-frame stack (32 bytes)
-VARS:       .RES 52             ; 52-byte variable store (A-Z, 2 bytes each)
-IBUF:       .RES (IBUF_MAX+1)   ; 32-byte input line buffer - coudl be bigger
+T2:         .RS 2              ; 16-bit: tertiary scratch word / STMT jump target
+T3:         .RS 2              ; 16-bit: PNUM x10-multiply scratch, RXCHAR/TXCHAR
+T4:         .RS 2              ; 16-bit: Used in DO_POKE, free for others
+IP:         .RS 2              ; 16-bit: interpreter pointer
+CURLN:      .RS 2              ; 16-bit: currently-executing line number
+PE:         .RS 2              ; 16-bit: program end (one past last byte)
+LP:         .RS 2              ; 16-bit: line pointer / multi-purpose scratch
+RND_SEED:   .RS 2              ; 16-bit: Galois LFSR state for RND (lo=$8A, hi=$8B)
+RUN:        .RS 1              ; 8-bit:  run flag ($00 = immediate, $FF = running)
+OP:         .RS 1              ; 8-bit:  saved operator for MUL/DIV/MOD ('*'/'/'/'%')
+GCHRX:      .RS 1              ; 8-bit:  GETLINE: buffer index X saved across JSR GETCH
+RUNSP:      .RS 1              ; 8-bit:  stack-pointer snapshot for GOTO/BREAK unwind
+GOSUB_SP:   .RS 1              ; 8-bit:  GOSUB/RETURN stack pointer (holds a ZP address directly)
+GOSUB_LO:   .RS 32             ; base of the 8-level GOSUB return-frame stack (32 bytes)
+VARS:       .RS 52             ; 52-byte variable store (A-Z, 2 bytes each)
+IBUF:       .RS IBUF_MAX+1   ; 32-byte input line buffer - coudl be bigger
 ZPEND:		; audit
+; Defined here so no forward reference
+GOSUB_FULL = GOSUB_LO+3    ; lowest X for which a full 4-byte push still fits 
+GOSUB_TOP  = GOSUB_LO+31   ; initial/empty GOSUB_SP value (topmost stack byte)
+
+        .IF KOWALSKI
+	.ORG PROG
+; =============================================================================
+; Pre-loaded showcase program
+;
+;   Stored as raw ASCII, mixed .DB format: <lineno_lo>,<lineno_hi>,"text",CR
+;   Runs of plain characters are quoted strings; a literal `"` or `;` in the
+;   BASIC text is emitted as a raw byte ($22 / $3B) instead of inside.
+;   One statement per line throughout
+;
+;   Lines  10-130: PRINT, CHR$, arithmetic, comparisons
+;   Lines 140-240: GOSUB/RETURN (incl. nested)
+;   Lines 250-430: GOTO loop, nested GOTO loop
+;   Lines 440-500: TAB, FREE, POKE/PEEK
+;   Lines 510-600: RND
+;   Lines 610-860: Mandelbrot set renderer
+;
+;   v1.9:  Added RND section 
+;   v1.8:  Added GOSUB/RETURN, TAB, FREE, and POKE/PEEK sections
+;   v1.1:  Mandelbrot column scan adjusted from -128..16 to -120..4
+; =============================================================================
+         .ORG PROG
+
+         .DB $0A,$00,"REM uBASIC v1.4 - SHOWCASE",CR        ; 10 REM uBASIC - SHOWCASE
+         .DB $14,$00,"PRINT ",$22,"-- uBASIC v1.4 SHOWCASE --",$22,CR ; 20 PRINT "-- uBASIC SHOWCASE --"
+         .DB $1E,$00,"PRINT ",$22,"--- PRINT / CHR$ ---",$22,CR ; 30 PRINT "--- PRINT / CHR$ ---"
+         .DB $28,$00,"PRINT CHR$(65)",$3B,"CHR$(66)",$3B,"CHR$(67)",CR ; 40 PRINT CHR$(65);CHR$(66);CHR$(67)
+         .DB $32,$00,"PRINT ",$22,"--- ARITHMETIC ---",$22,CR ; 50 PRINT "--- ARITHMETIC ---"
+         .DB $3C,$00,"PRINT ",$22,"3+4=",$22,$3B,"3+4",$3B,$22,"  10-3=",$22,$3B,"10-3",$3B,$22,"  6*7=",$22,$3B,"6*7",CR ; 60 PRINT "3+4=";3+4;"  10-3=";10-3;"  6*7=";6*7
+         .DB $46,$00,"PRINT ",$22,"20/4=",$22,$3B,"20/4",$3B,$22,"  17%5=",$22,$3B,"17%5",CR ; 70 PRINT "20/4=";20/4;"  17%5=";17%5
+         .DB $50,$00,"PRINT ",$22,"--- COMPARISONS ---",$22,CR ; 80 PRINT "--- COMPARISONS ---"
+         .DB $5A,$00,"IF 5>3 THEN PRINT ",$22,"5>3 ok",$22,CR ; 90 IF 5>3 THEN PRINT "5>3 ok"
+         .DB $64,$00,"IF 3<5 THEN PRINT ",$22,"3<5 ok",$22,CR ; 100 IF 3<5 THEN PRINT "3<5 ok"
+         .DB $6E,$00,"IF 3>=3 THEN PRINT ",$22,"3>=3 ok",$22,CR ; 110 IF 3>=3 THEN PRINT "3>=3 ok"
+         .DB $78,$00,"IF 4<>3 THEN PRINT ",$22,"4<>3 ok",$22,CR ; 120 IF 4<>3 THEN PRINT "4<>3 ok"
+         .DB $82,$00,"IF 3=3 THEN PRINT ",$22,"3=3 ok",$22,CR ; 130 IF 3=3 THEN PRINT "3=3 ok"
+         .DB $8C,$00,"PRINT ",$22,"--- GOSUB/RETURN ---",$22,CR ; 140 PRINT "--- GOSUB/RETURN ---"
+         .DB $96,$00,"GOSUB 200",CR                         ; 150 GOSUB 200
+         .DB $A0,$00,"PRINT ",$22,"back from depth 1, X=",$22,$3B,"X",CR ; 160 PRINT "back from depth 1, X=";X
+         .DB $AA,$00,"GOSUB 220",CR                         ; 170 GOSUB 220
+         .DB $B4,$00,"PRINT ",$22,"back from depth 2, X=",$22,$3B,"X",CR ; 180 PRINT "back from depth 2, X=";X
+         .DB $BE,$00,"GOTO 250",CR                          ; 190 GOTO 250
+         .DB $C8,$00,"X=1",CR                               ; 200 X=1
+         .DB $D2,$00,"RETURN",CR                            ; 210 RETURN
+         .DB $DC,$00,"GOSUB 200",CR                         ; 220 GOSUB 200
+         .DB $E6,$00,"X=X+1",CR                             ; 230 X=X+1
+         .DB $F0,$00,"RETURN",CR                            ; 240 RETURN
+         .DB $FA,$00,"PRINT ",$22,"--- LOOP via GOTO ---",$22,CR ; 250 PRINT "--- LOOP via GOTO ---"
+         .DB $04,$01,"I=1",CR                               ; 260 I=1
+         .DB $0E,$01,"IF I>5 THEN GOTO 310",CR              ; 270 IF I>5 THEN GOTO 310
+         .DB $18,$01,"PRINT I",$3B,CR                       ; 280 PRINT I;
+         .DB $22,$01,"I=I+1",CR                             ; 290 I=I+1
+         .DB $2C,$01,"GOTO 270",CR                          ; 300 GOTO 270
+         .DB $36,$01,"PRINT ",$22,$22,CR                    ; 310 PRINT ""
+         .DB $40,$01,"PRINT ",$22,"--- NESTED LOOP ---",$22,CR ; 320 PRINT "--- NESTED LOOP ---"
+         .DB $4A,$01,"I=1",CR                               ; 330 I=1
+         .DB $54,$01,"IF I>3 THEN GOTO 430",CR              ; 340 IF I>3 THEN GOTO 430
+         .DB $5E,$01,"J=1",CR                               ; 350 J=1
+         .DB $68,$01,"IF J>3 THEN GOTO 400",CR              ; 360 IF J>3 THEN GOTO 400
+         .DB $72,$01,"PRINT J",$3B,CR                       ; 370 PRINT J;
+         .DB $7C,$01,"J=J+1",CR                             ; 380 J=J+1
+         .DB $86,$01,"GOTO 360",CR                          ; 390 GOTO 360
+         .DB $90,$01,"PRINT ",$22,$22,CR                    ; 400 PRINT ""
+         .DB $9A,$01,"I=I+1",CR                             ; 410 I=I+1
+         .DB $A4,$01,"GOTO 340",CR                          ; 420 GOTO 340
+         .DB $AE,$01,"REM nested loop done",CR              ; 430 REM nested loop done
+         .DB $B8,$01,"PRINT ",$22,"--- TAB / FREE ---",$22,CR ; 440 PRINT "--- TAB / FREE ---"
+         .DB $C2,$01,"PRINT ",$22,"col1",$22,$3B,"TAB(3)",$3B,$22,"col2",$22,$3B,"TAB(3)",$3B,$22,"col3",$22,CR ; 450 PRINT "col1";TAB(3);"col2";TAB(3);"col3"
+         .DB $CC,$01,"PRINT ",$22,"bytes free:",$22,$3B,"FREE",CR      ; 460 PRINT "bytes free:"; FREE
+         .DB $E0,$01,"PRINT ",$22,"--- POKE / PEEK ---",$22,CR ; 480 PRINT "--- POKE / PEEK ---"
+         .DB $EA,$01,"POKE 900,42",CR                       ; 490 POKE 900,42
+         .DB $F4,$01,"PRINT ",$22,"poked 42, read back ",$22,$3B,"PEEK(900)",CR ; 500 PRINT "poked 42, read back ";PEEK(900)
+         .DB $FE,$01,"PRINT ",$22,"--- RND ---",$22,CR      ; 510 PRINT "--- RND ---"
+         .DB $08,$02,"PRINT RND",$3B,$22," ",$22,$3B,"RND",$3B,$22," ",$22,$3B,"RND",$3B,$22," ",$22,$3B,"RND",$3B,$22," ",$22,$3B,"RND",CR ; 520 PRINT RND;" ";RND;" ";RND;" ";RND;" ";RND
+         .DB $12,$02,"I=1",CR                               ; 530 I=1
+         .DB $1C,$02,"IF I>5 THEN GOTO 600",CR              ; 540 IF I>5 THEN GOTO 600
+         .DB $26,$02,"R=RND",CR                             ; 550 R=RND
+         .DB $30,$02,"R=R%10",CR                            ; 560 R=R%10
+         .DB $3A,$02,"PRINT ",$22,"d",$22,$3B,"R",$3B,$22," ",$22,$3B,CR ; 570 PRINT "d";R;" ";
+         .DB $44,$02,"I=I+1",CR                             ; 580 I=I+1
+         .DB $4E,$02,"GOTO 540",CR                          ; 590 GOTO 540
+         .DB $58,$02,"PRINT ",$22,$22,CR                    ; 600 PRINT ""
+         .DB $62,$02,"PRINT ",$22,"--- MANDELBROT ---",$22,CR ; 610 PRINT "--- MANDELBROT ---"
+         .DB $6C,$02,"I=-64",CR                             ; 620 I=-64
+         .DB $76,$02,"IF I>56 THEN GOTO 860",CR             ; 630 IF I>56 THEN GOTO 860
+         .DB $80,$02,"D=I",CR                               ; 640 D=I
+         .DB $8A,$02,"C=-120",CR                            ; 650 C=-120
+         .DB $94,$02,"IF C>4 THEN GOTO 830",CR              ; 660 IF C>4 THEN GOTO 830
+         .DB $9E,$02,"A=C",CR                               ; 670 A=C
+         .DB $A8,$02,"B=D",CR                               ; 680 B=D
+         .DB $B2,$02,"E=0",CR                               ; 690 E=0
+         .DB $BC,$02,"N=1",CR                               ; 700 N=1
+         .DB $C6,$02,"IF N>16 THEN GOTO 790",CR             ; 710 IF N>16 THEN GOTO 790
+         .DB $D0,$02,"IF E>0 THEN GOTO 770",CR              ; 720 IF E>0 THEN GOTO 770
+         .DB $DA,$02,"T=A*A/64-B*B/64+C",CR                 ; 730 T=A*A/64-B*B/64+C
+         .DB $E4,$02,"B=2*A*B/64+D",CR                      ; 740 B=2*A*B/64+D
+         .DB $EE,$02,"A=T",CR                               ; 750 A=T
+         .DB $F8,$02,"IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N",CR ; 760 IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N
+         .DB $02,$03,"N=N+1",CR                             ; 770 N=N+1
+         .DB $0C,$03,"IF N<=16 THEN GOTO 710",CR            ; 780 IF N<=16 THEN GOTO 710
+         .DB $16,$03,"IF E>0 THEN PRINT CHR$(E+32)",$3B,CR  ; 790 IF E>0 THEN PRINT CHR$(E+32);
+         .DB $20,$03,"IF E=0 THEN PRINT CHR$(32)",$3B,CR    ; 800 IF E=0 THEN PRINT CHR$(32);
+         .DB $2A,$03,"C=C+4",CR                             ; 810 C=C+4
+         .DB $34,$03,"GOTO 660",CR                          ; 820 GOTO 660
+         .DB $3E,$03,"PRINT ",$22,$22,CR                    ; 830 PRINT ""
+         .DB $48,$03,"I=I+6",CR                             ; 840 I=I+6
+         .DB $52,$03,"GOTO 630",CR                          ; 850 GOTO 630
+         .DB $5C,$03,"END",CR                               ; 860 END
+SHOWCASE_END:	.DB 0
+
+        .ENDIF
+
 
 ; =============================================================================
-; ROM START
+; ROM START  ($F800)
          .ORG $F800
-
 ; =============================================================================
 ; STRING / KEYWORD TABLE  (page $F8)
 ;
@@ -135,7 +274,7 @@ T_K   = 203              ; $4B + $80  ('K' -- BREAK, PEEK)
 
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
-STR_BANNER: .DB "JB uBASIC v1.3"  ; startup banner, rolls into free
+STR_BANNER: .DB "JB uBASIC v1.4"  ; startup banner, rolls into free
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
 STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
@@ -179,15 +318,22 @@ INIT:
          TXS                  ; set stack to top of page 1
          CLD                  ; ensure binary (not decimal) mode
 
+         CLI                  ; enable maskable IRQs (Break pushbutton on IRQ pin)
+         JSR DO_NEW           ; setup PE and PROG; also (re-)seeds RND_SEED
+
+        .IF KOWALSKI
+         ; --- Setup showcase  
+         LDA #<SHOWCASE_END   ; point PE at end of pre-loaded showcase program
+         STA PE               ; Replace with `JSR DO_NEW` for clean program (ROM)
+         LDA #>SHOWCASE_END
+         STA PE+1
+        .ELSE
          ; --- 6522 VIA setup: PA0 = TX output, PA1-PA7 = inputs ---
          LDA #VIA_TX          ; DDRA: bit 0 = output, bits 1-7 = input
          STA VIA_DDRA
          LDA #VIA_TX          ; TX line idles HIGH (mark = logic 1)
          STA VIA_ORA
-
-         CLI                  ; enable maskable IRQs (Break pushbutton on IRQ pin)
-         JSR DO_NEW           ; setup PE and PROG; also (re-)seeds RND_SEED
-
+        .ENDIF
         ;  STR_BANNER
          LDA #<STR_BANNER
          JSR PUTSTR           ; print banner + CR+LF
@@ -526,6 +672,7 @@ DP_STR:  JSR GETCI            ; read string body char by char
          BEQ DP_NL            ; unterminated string -- print CR/LF and stop
          JSR PUTCH
          BNE DP_STR           ; PUTCH always leaves A=VIA_TX=1 (Z=0): unconditional
+
 DP_CHR: LDA #<KW_CHRS
          JSR MTCHKW           ; matched "CHR$"?
          BCS DP_TAB
@@ -533,6 +680,7 @@ DP_CHR: LDA #<KW_CHRS
          LDA T0
          JSR PUTCH
          BNE DP_AFT            ; PUTCH always leaves A=VIA_TX=1 (Z=0): unconditional
+
 DP_TAB:  LDA #<KW_TAB
          JSR MTCHKW           ; matched "TAB"?
          BCS DP_NORM
@@ -767,7 +915,7 @@ LS_LN:   JSR PE_CMP
          LDA #' '
          JSR PUTCH
          JSR ADD2_LP            ; advance LP past the 2-byte header for the body walk
-LS_BODY: LDY #0                 l print body to CR
+LS_BODY: LDY #0
          LDA (LP),Y
          JSR BUMP_LP
          CMP #CR
@@ -1382,23 +1530,26 @@ E2_NOT_USR:
          JSR MTCHKW           ; matched "RND"?
          BCS E2_NOT_RND       ; nope
          ; Drop through
-; =============================================================================
-;   16-bit Galois LFSR in RND_SEED, tap $B4 (x^16+x^14+x^13+x^11+1),
-;   Shuffles on every call, better on a timer but we dont have one 
-         LSR RND_SEED+1       ; shift hi byte right, MSB = 0
-         ROR RND_SEED         ; shift lo byte right, MSB = old hi bit 0
-
          LDA RND_SEED         ; LDA/STA don't touch Carry -- safe before BCC
          STA T0
+         LDA RND_SEED+1         ; LDA/STA don't touch Carry -- safe before BCC
+         AND #$7F             ; force positive (clear bit 15) for T0
+         STA T0+1
+        ; drop through
+; =============================================================================
+;   16-bit Galois LFSR in RND_SEED, tap $B4 (x^16+x^14+x^13+x^11+1),
+;   Clobbers A, Shuffles on every call
 
+RND_SHUFFLE:
+         PHA
+         LSR RND_SEED+1       ; shift hi byte right, MSB = 0
+         ROR RND_SEED         ; shift lo byte right, MSB = old hi bit 0
          LDA RND_SEED+1       ; Carry from the LSR above is still intact
          BCC E2_RND_SK        ; no bit fell out: skip the feedback tap
-
          EOR #$B4             ; apply feedback tap
          STA RND_SEED+1       ; update the seed in memory
 E2_RND_SK:
-         AND #$7F             ; force positive (clear bit 15) for T0
-         STA T0+1
+         PLA
          RTS                   ; end of RND
 
 E2_NOT_RND:
@@ -1735,6 +1886,35 @@ PRT16PRNT:
          ; fall through into PUTCH
 
 ; =============================================================================
+; Kowalski and JB have different IO
+        .IF KOWALSKI
+; =============================================================================
+; PUTCH  --  write one character to the Kowalski terminal
+;
+;   In:  A = character to output
+;   Out: --
+;   Clobbers: --  (flags may change)
+; =============================================================================
+PUTCH:   STA IO_OUT
+         TAX    ; ensure zero flag not set
+         RTS
+
+; =============================================================================
+; GETCH  --  read one character from Kowalski terminal (blocking); echo it
+;
+;   In:  --
+;   Out: A = character read
+;   Clobbers: A
+; =============================================================================
+GETCH:   JSR RND_SHUFFLE
+         LDA IO_IN
+         BEQ GETCH          ; spin until a char is available
+         PHA                  ; save the actual typed character
+         JSR PUTCH            ; echo it (PUTCH's own return value is discarded)
+         PLA                  ; restore the typed character as GETCH's result
+         RTS
+	.ELSE
+; =============================================================================
 ; PUTCH  --  transmit one character via 6522 VIA PA0 (bitbang, 1200 baud)
 ;
 ;   In:  A = character to transmit
@@ -1800,15 +1980,13 @@ DL_LOOP: DEY
 ;
 ;   The received byte is assembled in TEMP[$30] via 8x ROR from the MSB.
 ;   It is saved on the hardware stack (PHA) before JSR PUTCH (which clobbers
-;   TEMP), then restored via PLA.  Caller's X is NOT preserved -- callers
-;   that need X intact (e.g. GETLINE) must save it themselves (see GCHRX).
+;   TEMP), then restored via PLA.  
 ; =============================================================================
-GETCH:
+GETCH:   JSR RND_SHUFFLE
          ; --- Wait for start bit: PA1 goes LOW ---
-         ; Caller is responsible for preserving X if needed (GETCH clobbers X).
-GC_WAIT: LDA VIA_ORA
+         LDA VIA_ORA
          AND #VIA_RX          ; isolate PA1
-         BNE GC_WAIT          ; non-zero = mark (idle high): keep waiting
+         BNE GETCH            ; non-zero = mark (idle high): keep waiting
 
          ; --- Delay to centre of start bit, then one full bit to bit 0 ---
          JSR DELAY_HALF       ; 0.5 bit: reach mid-point of start bit
@@ -1831,6 +2009,7 @@ GC_LOOP: LDA VIA_ORA         ; read port
          JSR PUTCH            ; echo
          LDA T3+1
          RTS
+	.ENDIF
 
 ; =============================================================================
 ; STMT DISPATCH TABLE
@@ -1841,17 +2020,28 @@ GC_LOOP: LDA VIA_ORA         ; read port
 ; =============================================================================
 ; NOTE: handler addresses stored as (handler-1) for the RTS-dispatch trick in STMT.
 ST_TAB:
-         .DB <KW_PRINT, <(DO_PRINT-1), >(DO_PRINT-1)
-         .DB <KW_IF,    <(DO_IF-1),    >(DO_IF-1)
-         .DB <KW_GOTO,  <(DO_GO-1),    >(DO_GO-1)
-         .DB <KW_LIST,  <(DO_LIST-1),  >(DO_LIST-1)
-         .DB <KW_RUN,   <(DO_RUN-1),   >(DO_RUN-1)
-         .DB <KW_NEW,   <(DO_NEW-1),   >(DO_NEW-1)
-         .DB <KW_INPUT, <(DO_INPUT-1), >(DO_INPUT-1)
-         .DB <KW_REM,   <(DO_REM_CHK-1),>(DO_REM_CHK-1)
-         .DB <KW_END,   <(DO_END-1),   >(DO_END-1)
-         .DB <KW_LET,   <(DO_LET-1),   >(DO_LET-1)
-         .DB <KW_POKE,  <(DO_POKE-1),  >(DO_POKE-1)
+         .DB <KW_PRINT
+           .DW DO_PRINT-1
+         .DB <KW_IF 
+           .DW DO_IF-1
+         .DB <KW_GOTO 
+           .DW DO_GO-1
+         .DB <KW_LIST 
+           .DW DO_LIST-1
+         .DB <KW_RUN 
+           .DW DO_RUN-1
+         .DB <KW_NEW 
+           .DW DO_NEW-1
+         .DB <KW_INPUT
+           .DW DO_INPUT-1
+         .DB <KW_REM 
+           .DW DO_REM_CHK-1
+         .DB <KW_END 
+           .DW DO_END-1
+         .DB <KW_LET 
+           .DW DO_LET-1
+         .DB <KW_POKE 
+           .DW DO_POKE-1
          .DB $FF  ; sentinel: fall through to implicit assign
 
 ROMEND: ; for auditing
