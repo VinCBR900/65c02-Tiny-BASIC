@@ -1,298 +1,125 @@
 ; =============================================================================
-; miniBASIC 65C02 v1.4
+; miniBASIC 65C02 v1.6
 ;
 ; 4KB Float BASIC (MBF4) for the 65C02.
-; Derived from uBASIC v18.1 (integer 65C02) + miniBASIC 8088 v2.0 (float).
 ;
 ; Statements accepted
-;   END  FOR..TO..STEP  FREE  GOSUB  GOTO  HELP  IF..THEN  INPUT  LET  LIST
-;   NEW  NEXT  POKE  PRINT  REM  RETURN  RUN
+;   END  FOR..TO..STEP  FREE  GOSUB  GOTO  IF..THEN  INPUT  LET  LIST  NEW
+;   NEXT  POKE  PRINT (incl. TAB(n))  REM  RETURN  RUN
 ; Expressions:
 ;   + - * / %   = < > <= >= <>   unary -
-;   CHR$(n)   PEEK(addr)   USR(addr)   SIN(deg)   COS(deg)   A-Z variables
+;   ABS(n)   CHR$(n)   PEEK(addr)   RND   SIN(deg)   COS(deg)   USR(addr)
+;   A-Z variables
 ;
 ; Numbers      : MBF4 float, ~6-7 significant decimal digits (see format below)
 ; String print : "literals", `;`, and CHR$() only; no string variables
+; 
+; OPEN ITEMS
+; SIN/COS uses Fixed Point CORDIC - approx 14bit accuracy, not 24 like MBF4
 ;
 ; Input buffer : GETLINE's IBUF is 32 bytes. A typed or INPUT'd line longer
 ;   than that is *silently truncated* -- no error is raised, and the
 ;   remainder is discarded character-by-character up to the terminating CR.
-;   Program lines stored via EDITLN are NOT limited to 32 bytes (they bypass
-;   IBUF entirely and are copied straight into program storage), so a LISTed
-;   line may be longer than 32 characters even though you could never have
-;   typed it directly at the prompt.
 ;
-; FOR/NEXT : the loop variable is a real float (usable normally in the loop
-;   body), but TO and STEP are evaluated as 16-bit signed integers -- this
-;   keeps the 4-level-deep frame stack small enough to fit free zero page.
-;   "FOR X = 1 TO 10 STEP 0.5" is therefore not supported; TO/STEP must be
-;   whole numbers (a non-integer START value, e.g. "FOR X = 1.5 TO 10", is
-;   fine). Max nesting depth is 4.
+; FOR/NEXT : loop variable, TO limit, and STEP are all real floats.
+;   "FOR X = 1 TO 10 STEP 0.5" and non-integer TO bounds (e.g. "TO 10.5")
+;   are both fully supported. Max nesting depth is 4.
 ;
-; ':' statement separator : NOT an officially supported feature -- it exists
-;   as an artifact of STMT_LINE's implementation (it loops for more
-;   statements after seeing ':') rather than a deliberate design, and has
-;   real edge cases. Simple "VAR=expr:VAR=expr[:GOTO n]" chains work
-;   correctly and are used within this file's own showcase program and
-;   error-recovery paths. However "PRINT expr;:<more>" on one line is
-;   broken: DO_PRINT sees the trailing ';' and unconditionally tries to
-;   parse one more print item, which fails on ':' and silently prints a
-;   spurious "0" before falling through to the next statement. Do not rely
-;   on ':' in new code; treat any working use of it as incidental, not
-;   guaranteed.
-;
-; Error codes (printed as "?N"):
-;   ?0  syntax / bad expression
-;   ?1  undefined line number
-;   ?2  division or modulo by zero
-;   ?3  out of memory (also: GOSUB stack full, 8 levels deep)
-;   ?4  bad variable name in LET
-;   ?5  RETURN without GOSUB
-;   ?6  illegal (zero) STEP
-;   ?7  too many nested FOR (max 4 deep)
-;   ?8  NEXT without FOR
-;
-; ---- program storage --------------------------------------------------------
-;   Base PROG ($0200); ceiling RAM_TOP ($1000 for 4 KB SRAM).
-;   Line format:  <lineno_lo> <lineno_hi> <raw ASCII body> <CR>
-;   No tokenisation; body bytes are stored exactly as typed.
-;
-; ORG $F000 (2732 EPROM).  RAM $0000-$0FFF.
 ; =============================================================================
 ; CHANGE HISTORY
 ;
-; v1.4: Large session covering FOR/NEXT, a float-library size pass, several
-;       real bugs (one pre-existing), and a uBASIC-helper porting pass.
-;       ROM usage: 3831 (v1.2 baseline) -> 4021 (right after FOR/NEXT, 98.2%
-;       full) -> 3879 (after this session's size work, 211 free).
+; v1.6 (Jul 2026) — Floating-Point FOR/NEXT
+;   - ROM usage: 3897 (v1.5) -> 3909 bytes (195 free after all additions).
+;   - CHANGED: FOR/NEXT TO limit and STEP are now full 4-byte floats so 
+;     fractional STEP (e.g. "STEP 0.5") and non-integer TO bounds are supported.
+;   - FOR_STK frame grew from 7 to 11 bytes/frame (var_slot + 4-byte limit +
+;     4-byte step + loop_line) to hold the full floats; FSTK_BASE's index
+;     multiplier changed from x7 to x11. 
+;   - DO_NEXT's exit test now calls FLT_CMP directly on the post-add loop
+;     variable vs. the float limit (var's sign vs. step's sign decides which
+;     comparison outcome means "keep looping").
 ;
-;   FOR/NEXT
-;       (1) Added FOR var=start[TO limit][STEP step] / NEXT [var]. 4-level
-;           frame stack at FOR_STK ($E2-$FD, zero page). New KW_FOR/KW_TO/
-;           KW_STEP keywords. NEW/NEXT share the "NE" prefix, disambiguated
-;           by 3rd-char peek (same trick as GOTO/GOSUB, REM/RETURN). New
-;           errors: ?6 illegal STEP, ?7 too many nested FOR, ?8 NEXT w/o FOR.
-;       (2) BUG (caught before release): the draft this was built from
-;           assumed uBASIC's integer VARS (2 bytes/var) -- directly adding
-;           an integer STEP onto our 4-byte float VARS bytes would have
-;           produced garbage. Loop variable is updated via a real
-;           FLT_ADD instead; only the limit/step comparison is integer.
+; v1.5 (Jul 2026) — CORDIC Refactor, Duplicate Elimination & Feature Expansion
+;   - ROM usage: 3879 (v1.4) -> 3897 bytes (193 free after all additions).
+;   - ADDED: ABS(n), TAB(n), and float-normalized RND (16-bit Galois LFSR with
+;     boot, NEW, and keyboard-wait jitter seeding).
+;   - CORDIC REFACTOR:
+;     * Optimized CORDIC_KERN by stashing MASKXZ in X; reordered updates.
+;     * Replaced 16-bit shift-multiply in DO_TRIG with 8-bit hardware multiply.
+;     * Redesigned quadrant folding to use repeated subtraction and Gray-code
+;       sign flags, replacing 4 range-check branches.
+;     * Unified sin/cos indexed selections and merged constant store tails.
+;   - DUPLICATE ELIMINATION (asmdup.py):
+;     * Created VARIDX subroutine to handle variable offset calculations;
+;       fixed case-insensitivity bug in DO_FOR.
+;     * Created EAT_PAREN subroutine to unify expression parsing and delimiter
+;       consumption across CHR$, USR, PEEK, SIN, and COS.
+;     * Consolidated PUSH_FLT_A and POP_FLT_A into a unified routine via a
+;       BIT-trick entry point; corrected STA instruction to use zero-page,X.
+;   - CLEANUP: Removed the statement-separator caveat and the HELP keyword.
 ;
-;   Float library size pass (asmdup.py-driven)
-;       (3) FLT_FROM_INT/FLT_FROM_INT_B unified into one X-offset-indexed
-;           routine (asmdup.py flagged them as near-duplicates).
-;       (4) NORM_PACK/FLT_ADD/FLT_MUL/FLT_DIV: adopted TSB hidden-bit
-;           restore, looped (not unrolled) swaps/workspace-copies, and a
-;           combined STZ+BCS shift-count check, per a supplied optimized
-;           draft, cross-checked instruction-by-instruction against the
-;           existing code before applying.
-;       (5) BUG (caught during testing, introduced by #4): FLT_PARSE's
-;           digit-accumulation loop kept a digit in X across `JSR
-;           MUL_BY_TEN` -- fine while FLT_MUL happened not to touch X, but
-;           its header already documented X as clobbered, and the new
-;           FLT_MUL legitimately does clobber it. "PRINT 10", "PRINT 100"
-;           etc. silently produced wrong values. Fixed by saving the digit
-;           to T0 before the call instead of X after.
-;       (6) 8 duplicated 12-byte inline FLT_A push/pop sequences replaced
-;           with PUSH_FLT_A/POP_FLT_A subroutines (asmdup.py find). NOTE:
-;           these cannot be plain JSR/RTS wrappers around PHA x4/PLA x4 --
-;           the pushed frame must survive underneath the JSR's own return
-;           address across arbitrary intervening code, so each one pops
-;           its own return address out of the way first, does the real
-;           work, then pushes it back before RTS. A naive first attempt
-;           without this trampoline crashed immediately (RTS consumed the
-;           last 2 bytes of parked float data as a return address).
+; v1.4 — FOR/NEXT, Floating-Point Sizing & Core Bug Fixes
+;   - ROM usage: 3831 (v1.2) -> 3879 bytes (211 free).
+;   - ADDED: FOR/NEXT loop control with a 4-level nested stack on Zero Page.
+;     Uses FLT_ADD for loop variable updates.
+;   - FLOAT SIZE OPTIMIZATION:
+;     * Unified FLT_FROM_INT and FLT_FROM_INT_B into one indexed routine.
+;     * Refactored NORM_PACK, FLT_ADD, FLT_MUL, and FLT_DIV (looped workspace
+;       copies, TSB hidden-bit restoration, and combined STZ+BCS bounds checking).
+;     * Replaced 8 inline float push/pop sequences with PUSH_FLT_A/POP_FLT_A
+;       trampoline subroutines to preserve caller return addresses.
+;   - FIXED: FLT_PRINT off-by-one bug that truncated single-digit fractional
+;     floats (e.g., "1.5" printing as "1") via corrected CPY check.
+;   - FIXED: FLT_PARSE digit accumulation bug where FLT_MUL clobbered the X
+;     register; digit state is now stored in T0.
+;   - uBASIC PORTS & CONSOLIDATIONS:
+;     * Unified program pointer setups into PROG2X and comparison checks into PE_CMP_X.
+;     * Shared LP increments via ADD2_LP/BUMP_LP and line-skips via LSKIP.
+;     * Replaced INSLINE with a simpler backward-shift-copy algorithm.
+;     * Consolidated variable writing across engine routines into STORE_VAR.
+;   - 65C02 ADVANCEMENTS:
+;     * Converted eligible static (zp),Y operations to (zp) no-index indirect mode.
+;     * Replaced target PLA;TAX pairs with PLX in DO_LET and DO_INPUT.
+;     * Optimized FLT_PRINT via INC A flag wrapping, stack-based digit caching
+;       (PHA/PHX), and fractional loop reuse.
 ;
-;   Bug fix (pre-existing, not from this session)
-;       (7) FLT_PRINT's fraction-printing guard did `CPY FP_LASTNZ; BCS
-;           FPEND` ("skip if already past the last significant digit"),
-;           but BCS fires on Y>=FP_LASTNZ, not Y>FP_LASTNZ. A fraction with
-;           exactly one significant digit (e.g. 1.5) has Y land exactly on
-;           FP_LASTNZ, so the off-by-one skipped it -- "PRINT 1.5" printed
-;           "1". Confirmed present in the very first uploaded v1.2; never
-;           triggered until FOR/NEXT's float-start-value test hit it.
+; v1.3 — GOSUB/RETURN & Keyword Engine Optimization
+;   - ADDED: GOSUB and RETURN control flow with an 8-level Zero Page stack.
+;     Uses a 3rd-character lookahead to multiplex GOTO/GOSUB and REM/RETURN.
+;   - CHANGED: Replaced full-string keyword lookup with a space-saving 2-character
+;     prefix matching scheme, enabling lenient matching (e.g., PRX for PRINT).
 ;
-;   uBASIC helper porting pass (reviewed for applicability, not all of
-;   uBASIC's line-editing helpers translate -- see below)
-;       (8) PROG2X: one indexed routine sets IP/PE/LP to PROG (were 5
-;           separate 4-instruction inline sequences); works here because
-;           IP/PE/LP happen to sit at the same +0/+4/+6 ZP offsets uBASIC
-;           assumes.
-;       (9) PE_CMP_X: one indexed routine compares IP or LP against PE
-;           (were 3 separate inline compares in EDITLN/DO_LIST/GOTOL).
-;      (10) ADD2_LP/BUMP_LP: shared LP+=2 / LP+=1 (uBASIC's JSR-then-fall-
-;           through trick), replacing 3 inline increments in DO_LIST.
-;      (11) INSLINE replaced with uBASIC's design: a T0_CMP_LP-driven
-;           backward shift-copy instead of our own T2DEC-counter-driven
-;           one, and a simpler PE+size-vs-RAM_TOP overflow check. ~43
-;           bytes saved; extensively tested (append, insert-before,
-;           replace same/longer/shorter body, delete).
-;      (12) LSKIP added (shared "advance LP past the current line",
-;           uBASIC's design) and GOTOL restructured to search via LP
-;           instead of IP -- converting to IP only once a match is found
-;           -- so it can share LSKIP with EDITLN instead of each keeping
-;           its own 21-byte inline copy. Highest-risk change this session
-;           (GOTOL underlies GOTO/GOSUB/RUN/NEXT); tested against all four.
-;      (13) T0_CMP_LP checked against our INSLINE and NOT applicable on
-;           its own -- our original INSLINE used a different algorithm
-;           shape (copy-based, no "found it" check). Became applicable
-;           once INSLINE itself was replaced per (11).
-;      (14) uBASIC's DO_LIST checked and found to be LARGER, not smaller
-;           -- it implements LIST start,end range filtering, which ours
-;           doesn't have (out of scope). Not ported.
-;      (15) STORE_VAR: "copy FLT_A into VARS[X..X+3]" was duplicated
-;           identically in DO_LET, DO_INPUT, DO_FOR, DO_NEXT (asmdup.py
-;           find); now one shared routine.
+; v1.2 — Zero Page Contiguity & Documentation Pass
+;   - CHANGED: Reorganized Zero Page into a fully contiguous $00-$B9 block.
+;   - ADDED: Standardized headers (In/Out/Clobbers) across all subroutines.
+;   - ADDED: Completely rewritten showcase program testing CORDIC sine and Mandelbrot.
 ;
-;   65C02 opcode pass
-;      (16) Several `LDY #0` + `(zp),Y` sites where Y never changes across
-;           the access converted to plain `(zp)` (65C02 zero-page-indirect,
-;           no index): PUTSTR's print loop, LSKIP, DO_POKE, EXPR2's PEEK.
-;           CAUGHT: an attempted `CMP (zp)` in MTCHKW assembles fine but
-;           the simulator only implements the 65C02 no-index-indirect mode
-;           for LDA/STA ($B2/$92), not CMP/ADC/SBC/etc ($D2 unknown-opcode
-;           halt) -- reverted that one site back to LDY #0 + `(zp),Y`.
-;      (17) Two `PLA;TAX` pairs (DO_LET, DO_INPUT, both feeding STORE_VAR)
-;           replaced with `PLX`.
-;      (18) FLT_PRINT: `INC A` replaces `CMP #$FF` after FLT_CMP (A=$FF
-;           wraps to $00, same Z result, verified against FLT_CMP's actual
-;           0/1/$FF contract); the digit-loop's saved digit/index moved
-;           from dedicated ZP bytes (FP_IX/FP_XSV, now free) to PHA/PHX
-;           (safe here since it's a plain in-frame push/pop, not a
-;           subroutine call -- unlike PUSH_FLT_A/POP_FLT_A, no trampoline
-;           needed); `ORA #'0'` replaces `CLC/ADC #'0'` (digit is 0-9, no
-;           overlapping bits, OR and ADD agree); the separate integer-
-;           digit and zero-padding loops merged into one; the <1.0 case's
-;           fraction-printing loop now reuses the >=1.0 case's loop via a
-;           branch instead of duplicating it. REJECTED from the supplied
-;           draft: `JMP POP_FLT_A` as a tail call at the end -- POP_FLT_A's
-;           trampoline (see #6) requires being entered via JSR so it has
-;           its own return address to manage; tail-calling it means it
-;           consumes the caller's return address instead, corrupting the
-;           stack. Kept as `JSR POP_FLT_A` / `RTS`.
-;
-; v1.3: (1) Ported GOSUB/RETURN from uBASIC v1.3: 8-level zero-page return
-;           stack at GOSUB_LO ($BB-$DA). GOTO/GOSUB share one ST_TAB entry
-;           and one keyword prefix ("GO"); the handler peeks the 3rd raw
-;           input character to tell them apart (uBASIC's trick). Same for
-;           REM/RETURN ("RE" + 3rd char). New ?5 error: RETURN w/o GOSUB.
-;       (2) MTCHKW/KW_TAB replaced with uBASIC's 2-char-prefix scheme (was
-;           full-string, high-bit-terminated, variable length). Saves table
-;           bytes now and scales better as keywords are added later (FOR/
-;           NEXT etc). BEHAVIOR CHANGE: keyword matching is now lenient
-;           like uBASIC -- e.g. "PRX" matches PRINT, since only the first
-;           2 letters are checked and any run of trailing letters is
-;           swallowed. Was previously exact-spelling only.
-;
-; v1.2: (1) Zero page reorganized to be fully contiguous $00-$B9 (was two small
-;           gaps at $0F and $A8-$AB), every byte now individually commented.
-;       (2) Every subroutine given a header comment (purpose/In/Out/Clobbers),
-;           matching the uBASIC documentation convention.
-;       (3) Showcase program rewritten to exercise every statement and
-;           function, including a CORDIC sine wave and a floating-point
-;           Mandelbrot finale.
-;
-; v1.1: (1) DELINE no longer corrupts LP when editing/deleting a program
-;           line with >=256 bytes of trailing program text (the copy loop's
-;           page-boundary bookkeeping was bumping the caller's insertion
-;           pointer along with its own source pointer).
-;       (2) Immediate-mode GOTO no longer crashes when issued before the
-;           first RUN (DO_GOTO now only collapses the stack via RUNSP while
-;           a program is actually RUNning).
-;       (3) Dead FLT_A_TO_C/FLT_C_TO_A removed, FLT_C zero-page freed.
-;       (4) FLT_A_TO_B/FLT_B_TO_A, variable fetch/store, and FLT_ZERO
-;           rerolled into loops; float-alignment byte fast-path removed;
-;           PUTSTRZP tail-calls PUTCH.  68 bytes smaller overall.
+; v1.1 — Memory Copy & Stack Protection Fixes
+;   - FIXED: DELINE pointer corruption on edits/deletions with >=256 bytes
+;     of trailing program text.
+;   - FIXED: Immediate-mode GOTO crash by checking RUNSP state before
+;     collapsing the runtime stack.
+;   - CLEANUP: Removed dead float routines, reclaimed FLT_C ZP space, rerolled
+;     utility routines into loops, and saved 68 bytes overall.
 ;
 ; MBF4: Byte0=biased_exp($00=zero), Byte1=sign|mant[22:16], Byte2-3=mant[15:0]
 ;       value=(-1)^sign * 2^(exp-$80) * 0.1mmm...
 ;       1.0=[$81,$00,$00,$00]  -1.0=[$81,$80,$00,$00]  10.0=[$84,$20,$00,$00]
 ;
-; ZP:  $00/$01=IP  $02/$03=CURLN  $04/$05=PE  $06/$07=LP
-;      $08/$09=T0  $0A/$0B=T1  $0C/$0D=T2
-;      $0E=RUN  $0F free  $10-$2F=IBUF(32)
-;      $30-$33=FLT_A  $34-$37=FLT_B  $38-$3B=CX/CY (CORDIC)
-;      $3C=FLT_SA  $3D=FLT_SB  $3E=FLT_ER  $3F=FLT_DE  $40=FLT_DB
-;      $41 free  $42=RUNSP  $43-$AA=VARS(A-Z,4 bytes each)
-;      $AB=FP_LASTNZ  $AC-$B1=FLT mul/div scratch
-;      $B2-$B9=CORDIC (CZ,TMPX,TMPY,MASKXZ,MASKY)
-;      $BA=GOSUB_SP  $BB-$DA=GOSUB_LO (8-level return stack)  $DB-$FF free
-; Zero page is fully contiguous $00-$DA -- see equates below for a comment
-; on every byte.
-;
 ; TRUE=-1.0  FALSE=0.0
-; Errors: ?0=syntax ?1=undef_line ?2=div0 ?3=out_of_mem ?4=bad_var
 
          .opt proc65c02
 
+; IO comms and constants
 IO_OUT   = $E001            ; UART output: write character to terminal
 IO_IN    = $E004            ; UART input: read character (0 = no char ready)
 RAM_TOP  = $1000            ; first address above usable SRAM (4 KB)
-
-; ---- zero page (fully contiguous, $00-$DA; $DB-$FF free) --------------------
-; NOTE: IP and CURLN must stay sequential (IP,IP+1,CURLN,CURLN+1) -- the
-; GOSUB/RETURN 4-byte frame push/pop loop in DO_GOTO/DO_REM_CHK depends on
-; it, same as it does in uBASIC.
-IP       = $00              ; 16-bit: interpreter/parse pointer
-CURLN    = $02              ; 16-bit: currently-executing line number
-PE       = $04              ; 16-bit: program end (one past last byte)
-LP       = $06              ; 16-bit: line pointer / MTCHKW's IP-backup scratch
-T0       = $08              ; 16-bit: primary scratch word / expression result
-T1       = $0A              ; 16-bit: secondary scratch word / MTCHKW keyword ptr
-T2       = $0C              ; 16-bit: tertiary scratch word / STMT jump target
-RUN      = $0E              ; 8-bit:  run flag ($00 = immediate, $FF = running)
-; $0F free (was FP_IX -- FLT_PRINT's digit loop now uses PHA/PLA instead)
-IBUF     = $10              ; 32-byte input line buffer ($10-$2F)
-FLT_A    = $30              ; 4-byte float accumulator (exp,sign|mant_hi,mant,mant)
-FLT_B    = $34              ; 4-byte float operand B
-CX       = $38              ; 16-bit: CORDIC X accumulator (CX/CY must stay
-CY       = $3A              ; 16-bit: CORDIC Y accumulator  contiguous as one block)
-FLT_SA   = $3C              ; 8-bit:  sign of FLT_A during add/sub/mul/div
-FLT_SB   = $3D              ; 8-bit:  sign of FLT_B during add/sub/mul/div
-FLT_ER   = $3E              ; 8-bit:  running exponent during add/mul/div
-FLT_DE   = $3F              ; 8-bit:  decimal exponent scratch (FLT_PRINT/PARSE)
-FLT_DB   = $40              ; 8-bit:  extra mantissa bit scratch (align/round)
-; $41 free (was FP_XSV -- FLT_PRINT's digit loop now uses PHX/PLX instead)
-RUNSP    = $42              ; 8-bit:  stack-pointer snapshot for GOTO/RUN unwind
-VARS     = $43              ; A-Z variable store (4 bytes each), 104 bytes
-VARS_MAX = $67              ; 103; STZ VARS,X for X=103..0 clears VARS (104 bytes)
-FP_LASTNZ = $AB             ; 8-bit:  FLT_PRINT index of last non-zero digit
-FLT_MA   = $AC              ; 8-bit:  MUL multiplicand scratch (hi)
-FLT_MB   = $AD              ; 8-bit:  MUL multiplicand scratch (mid)
-FLT_MC   = $AE              ; 8-bit:  MUL multiplicand scratch (lo)
-FLT_DVH  = $AF              ; 8-bit:  DIV divisor scratch (hi)
-FLT_DVM  = $B0              ; 8-bit:  DIV divisor scratch (mid)
-FLT_DVL  = $B1              ; 8-bit:  DIV divisor scratch (lo)
-CZ       = $B2              ; 16-bit: CORDIC Z (angle accumulator)
-TMPX     = $B4              ; 16-bit: CORDIC per-iteration tmpX (TMPX/TMPY must
-TMPY     = $B6              ; 16-bit: CORDIC per-iteration tmpY  stay contiguous)
-MASKXZ   = $B8              ; 8-bit:  CORDIC branchless sign mask for X/Z update
-MASKY    = $B9              ; 8-bit:  CORDIC branchless sign mask for Y update
-GOSUB_SP = $BA               ; 8-bit:  GOSUB/RETURN stack pointer (holds a ZP
-                              ;  address directly, not an index -- see DO_GOTO)
-GOSUB_LO = $BB                ; base of the 8-level GOSUB return-frame stack
-                               ; (32 bytes: 8 frames x 4 bytes: IP,IP+1,CURLN,CURLN+1)
-GOSUB_TOP  = GOSUB_LO+31    ; empty-stack value for GOSUB_SP (topmost byte)
-GOSUB_FULL = GOSUB_LO+3     ; lowest GOSUB_SP for which a full push still fits
-PFA_RL   = $DB               ; 8-bit: PUSH_FLT_A/POP_FLT_A return-addr trampoline lo
-PFA_RH   = $DC               ; 8-bit: PUSH_FLT_A/POP_FLT_A return-addr trampoline hi
-; ---- FOR/NEXT (loop VARIABLE is a real float in VARS; LIMIT and STEP are
-; 16-bit signed integers, to keep the 4-level frame stack small enough to
-; fit free zero page -- "FOR X = 1 TO 10 STEP 0.5" is therefore not
-; supported, TO/STEP must be whole numbers) ----
-FVAR     = $DD               ; 8-bit:  staged byte offset into VARS (var*4)
-FLIM     = $DE               ; 16-bit: staged limit (contiguous with FVAR/FSTEP
-                              ;  for FSTK_PUSH's indexed copy loop)
-FSTEP    = $E0               ; 16-bit: staged step
-FOR_STK  = $E2               ; 4 frames x 7 bytes: [var_slot,lim_lo,lim_hi,
-                              ;  step_lo,step_hi,loop_line_lo,loop_line_hi]
-FSTK     = $FE                ; 8-bit: count of active FOR loops (0-4)
-; $FF free
-PROG     = $0200
 IBUF_MAX = 31
 CR       = $0D
 LF       = $0A
 BS       = $08
+
+; Error codes
 ERR_SN   = 0
 ERR_UL   = 1
 ERR_OV   = 2
@@ -303,12 +130,211 @@ ERR_ST   = 6                 ; illegal (zero) STEP
 ERR_FOR  = 7                 ; too many nested FOR (max 4 deep)
 ERR_NF   = 8                 ; NEXT without FOR
 
-         .ORG $F000
-ROMSTART: BRA INIT   ; Kowalski trampoline
+; ---- zero page  --------------------
+; NOTE: IP and CURLN must stay sequential (IP,IP+1,CURLN,CURLN+1) -- the
+; GOSUB/RETURN 4-byte frame push/pop loop in DO_GOTO/DO_REM_CHK depends on
+; it, same as it does in uBASIC.
+        .ORG 0
+        ; We need a hack for Kowalski as it executes from zero
+        JMP INIT
+        NOP
+;T0:       .RS 2              ; 16-bit: primary scratch word / expression result
+;T1:       .RS 2              ; 16-bit: secondary scratch word / MTCHKW keyword ptr
+T0        = 0                 ; Kludge to overwite Kowalski trampoline   
+T1        = 2
+T2:       .RS 2              ; 16-bit: tertiary scratch word / STMT jump target
+IP:       .RS 2              ; 16-bit: interpreter/parse pointer
+CURLN:    .RS 2              ; 16-bit: currently-executing line number
+PE:       .RS 2              ; 16-bit: program end (one past last byte)
+LP:       .RS 2              ; 16-bit: line pointer / MTCHKW's IP-backup scratch
+RUN:      .RS 1              ; 8-bit:  run flag ($00 = immediate, $FF = running)
+IBUF:     .RS 32             ; 32-byte input line buffer ($10-$2F)
+FLT_A:    .RS 4              ; 4-byte float accumulator (exp,sign|mant_hi,mant,mant)
+FLT_B:    .RS 4              ; 4-byte float operand B
+CX:       .RS 2              ; 16-bit: CORDIC X accumulator (CX/CY must stay
+CY:       .RS 2              ; 16-bit: CORDIC Y accumulator  contiguous as one block)
+FLT_SA:   .RS 1              ; 8-bit:  sign of FLT_A during add/sub/mul/div
+FLT_SB:   .RS 1              ; 8-bit:  sign of FLT_B during add/sub/mul/div
+FLT_ER:   .RS 1              ; 8-bit:  running exponent during add/mul/div
+FLT_DE:   .RS 1              ; 8-bit:  decimal exponent scratch (FLT_PRINT/PARSE)
+FLT_DB:   .RS 1              ; 8-bit:  extra mantissa bit scratch (align/round)
+RUNSP:    .RS 1              ; 8-bit:  stack-pointer snapshot for GOTO/RUN unwind
+VARS:     .RS 104            ; A-Z variable store (4 bytes each), 104 bytes
+VARS_MAX = $67               ; 103; STZ VARS,X for X=103..0 clears VARS (104 bytes)
+FP_LASTNZ: .RS 1             ; 8-bit:  FLT_PRINT index of last non-zero digit
+FLT_MA:   .RS 1              ; 8-bit:  MUL multiplicand scratch (hi)
+FLT_MB:   .RS 1              ; 8-bit:  MUL multiplicand scratch (mid)
+FLT_MC:   .RS 1              ; 8-bit:  MUL multiplicand scratch (lo)
+FLT_DVH:  .RS 1              ; 8-bit:  DIV divisor scratch (hi)
+FLT_DVM:  .RS 1              ; 8-bit:  DIV divisor scratch (mid)
+FLT_DVL:  .RS 1              ; 8-bit:  DIV divisor scratch (lo)
+CZ:       .RS 2              ; 16-bit: CORDIC Z (angle accumulator)
+TMPX:     .RS 2              ; 16-bit: CORDIC per-iteration tmpX (TMPX/TMPY must
+TMPY:     .RS 2              ; 16-bit: CORDIC per-iteration tmpY  stay contiguous)
+MASKXZ:   .RS 1              ; 8-bit:  CORDIC branchless sign mask for X/Z update
+MASKY:    .RS 1              ; 8-bit:  CORDIC branchless sign mask for Y update
+GOSUB_SP: .RS 1              ; 8-bit:  GOSUB/RETURN stack pointer (holds a ZP
+                             ;  address directly, not an index -- see DO_GOTO)
+GOSUB_LO: .RS 32             ; base of the 8-level GOSUB return-frame stack
+                             ; (32 bytes: 8 frames x 4 bytes: IP,IP+1,CURLN,CURLN+1)
+PFA_RL:   .RS 1              ; 8-bit: PUSH_FLT_A/POP_FLT_A return-addr trampoline lo
+PFA_RH:   .RS 1              ; 8-bit: PUSH_FLT_A/POP_FLT_A return-addr trampoline hi
+RND_SEED: .RS 2              ; 16-bit: Galois LFSR state for RND
+FVAR:     .RS 1              ; 8-bit:  staged byte offset into VARS (var*4)
+FLIM:     .RS 4              ; 4-byte: staged limit float (contiguous with
+                             ;  FVAR/FSTEP for FSTK_PUSH's indexed copy loop)
+FSTEP:    .RS 4              ; 4-byte: staged step float
+FSTK:     .RS 1              ; 8-bit: count of active FOR loops (0-4)
+
+; More Constants here to avoid forward reference issues
+GOSUB_TOP  = GOSUB_LO+31    ; empty-stack value for GOSUB_SP (topmost byte)
+GOSUB_FULL = GOSUB_LO+3     ; lowest GOSUB_SP for which a full push still fits
+ZPEND:  ; audit
+
+        .ORG $200
+; ---- FOR/NEXT (loop VARIABLE, LIMIT and STEP are all real floats; "FOR X =
+; 1 TO 10 STEP 0.5" is fully supported. Max nesting depth is 4.)
+FOR_STK:  .RS 44             ; 4 frames x 11 bytes: [var_slot,
+                             ;  limit(4-byte float), step(4-byte float),
+                             ;  loop_line_lo,loop_line_hi]
+
+; ===========================================================================
+; SHOWCASE (RAM, pre-loaded for simulator; starts at PROG, right after the
+; FOR/NEXT RAM block )
+; Line format: lo_lineno, hi_lineno, ASCII body, CR
+; Exercises every statement (PRINT, LET, IF..THEN, GOTO, FOR..TO..STEP..NEXT,
+; POKE, FREE, END) and every function (CHR$, PEEK, SIN, COS), plus a CORDIC
+; sine-wave plot and a floating-point Mandelbrot finale -- the pixel-plane
+; scan itself is driven by fractional FOR/NEXT bounds (e.g.
+; "FOR Y=-1 TO 0.95 STEP 0.0833"), with X/Y as the loop variables directly.
+; `:` not supported#
+
+PROG:
+; line 10
+         .DB $0A,$00,"PRINT ",$22,"miniBASIC 65C02 V1.6 Float BASIC - showcase",$22,$0D
+; line 20
+         .DB $14,$00,"PRINT ",$22,"=== LET and arithmetic ===",$22,$0D
+; line 30
+         .DB $1E,$00,"LET A=7",$0D
+; line 40
+         .DB $28,$00,"B=3",$0D
+; line 50
+         .DB $32,$00,"PRINT ",$22,"A=",$22,";A;",$22," B=",$22,";B",$0D
+; line 60
+         .DB $3C,$00,"PRINT ",$22,"A+B=",$22,";A+B;",$22," A-B=",$22,";A-B",$0D
+; line 70
+         .DB $46,$00,"PRINT ",$22,"A*B=",$22,";A*B;",$22," A/B=",$22,";A/B",$0D
+; line 80
+         .DB $50,$00,"PRINT ",$22,"A MOD B=",$22,";A%B",$0D
+; line 90
+         .DB $5A,$00,"PRINT ",$22,"=== relational ops ===",$22,$0D
+; line 100
+         .DB $64,$00,"PRINT ",$22,"A>B ",$22,";A>B;",$22," A<B ",$22,";A<B",$0D
+; line 110
+         .DB $6E,$00,"PRINT ",$22,"A=A ",$22,";A=A;",$22," A<>B ",$22,";A<>B",$0D
+; line 120
+         .DB $78,$00,"PRINT ",$22,"=== IF/THEN/GOTO ===",$22,$0D
+; line 130
+         .DB $82,$00,"IF A>B THEN PRINT ",$22,"A is bigger than B",$22,$0D
+; line 140
+         .DB $8C,$00,"PRINT ",$22,"=== POKE/PEEK ===",$22,$0D
+; line 150
+         .DB $96,$00,"POKE 4000,65",$0D
+; line 160
+         .DB $A0,$00,"PRINT ",$22,"PEEK(4000)=",$22,";PEEK(4000)",$0D
+; line 170
+         .DB $AA,$00,"PRINT ",$22,"=== CHR$ ===",$22,$0D
+; line 180
+         .DB $B4,$00,"PRINT CHR$(72);CHR$(73);CHR$(33)",$0D
+; line 190
+         .DB $BE,$00,"PRINT ",$22,"=== FREE ===",$22,$0D
+; line 200
+         .DB $C8,$00,"FREE",$0D
+; line 210
+         .DB $D2,$00,"PRINT ",$22,"=== 355/113 ~ pi ===",$22,$0D
+; line 220
+         .DB $DC,$00,"PRINT 355/113",$0D
+; line 230
+         .DB $E6,$00,"PRINT ",$22,"=== SIN/COS identity ===",$22,$0D
+; line 240
+         .DB $F0,$00,"PRINT SIN(30)*SIN(30)+COS(30)*COS(30)",$0D
+; line 250
+         .DB $FA,$00,"PRINT ",$22,"=== CORDIC sine wave ===",$22,$0D
+; line 260
+         .DB $04,$01,"I=0",$0D
+; line 270
+         .DB $0E,$01,"Y=SIN(I)",$0D
+; line 280
+         .DB $18,$01,"C=20+Y*18",$0D
+; line 290
+         .DB $22,$01,"J=0",$0D
+; line 300
+         .DB $2C,$01,"IF J>=C THEN GOTO 340",$0D
+; line 310
+         .DB $36,$01,"PRINT ",$22," ",$22,";",$0D
+; line 320
+         .DB $40,$01,"J=J+1",$0D
+; line 330
+         .DB $4A,$01,"GOTO 300",$0D
+; line 340
+         .DB $54,$01,"PRINT ",$22,"*",$22,$0D
+; line 350
+         .DB $5E,$01,"I=I+15",$0D
+; line 360
+         .DB $68,$01,"IF I<=360 THEN GOTO 270",$0D
+; line 370
+         .DB $72,$01,"PRINT ",$22,"=== Mandelbrot finale ===",$22,$0D
+; line 380
+         .DB $7C,$01,"FOR Y=-1 TO 0.95 STEP 0.0833",$0D
+; line 390
+         .DB $86,$01,"FOR X=-2 TO 0.48 STEP 0.0417",$0D
+; line 420
+         .DB $A4,$01,"U=0",$0D
+; line 430
+         .DB $AE,$01,"V=0",$0D
+; line 440
+         .DB $B8,$01,"N=0",$0D
+; line 450
+         .DB $C2,$01,"P=U*U",$0D
+; line 460
+         .DB $CC,$01,"Q=V*V",$0D
+; line 470
+         .DB $D6,$01,"IF P+Q>4 THEN GOTO 540",$0D
+; line 480
+         .DB $E0,$01,"IF N>=15 THEN GOTO 540",$0D
+; line 490
+         .DB $EA,$01,"W=P-Q+X",$0D
+; line 500
+         .DB $F4,$01,"V=2*U*V+Y",$0D
+; line 510
+         .DB $FE,$01,"U=W",$0D
+; line 520
+         .DB $08,$02,"N=N+1",$0D
+; line 530
+         .DB $12,$02,"GOTO 450",$0D
+; line 540
+         .DB $1C,$02,"K=48+N",$0D
+; line 550
+         .DB $26,$02,"IF N<15 THEN GOTO 570",$0D
+; line 560
+         .DB $30,$02,"K=64",$0D
+; line 570
+         .DB $3A,$02,"PRINT CHR$(K);",$0D
+; line 580
+         .DB $44,$02,"NEXT X",$0D
+; line 600
+         .DB $58,$02,"PRINT",$0D
+; line 610
+         .DB $62,$02,"NEXT Y",$0D
+; line 650
+         .DB $8A,$02,"END",$0D
+SHOWCASE_END: ; audit
 
 ; ---- STRING/KEYWORD TABLE (page $F0) ----------------------------------------
+
+         .ORG $F000
 STR_PAGE = >STR_BANNER
-STR_BANNER: .DB "miniBASIC 65C02"
+STR_BANNER: .DB "miniBASIC 65C02 V1.6"
 STR_CRLF:   .DB $0D,$8A
 STR_FREE:   .DB "FRE",$C5     ; " FREE" tail for DO_FREE; KW_FREE (2-byte
                                 ; prefix, no terminator) can no longer double
@@ -320,7 +346,6 @@ STR_BREAK:  .DB $0D,$0A,"BREA",$CB
 ; the full BASIC keyword is consumed (uBASIC's scheme). GOTO/GOSUB share
 ; the "GO" entry and REM/RETURN share "RE" -- their handlers peek the 3rd
 ; raw input character to disambiguate (see DO_GOTO / DO_REM_CHK).
-KW_TAB:
 KW_PRINT:  .DB "PR"
 KW_IF:     .DB "IF"
 KW_GOTO:   .DB "GO"
@@ -342,6 +367,9 @@ KW_COS:    .DB "CO"
 KW_FOR:    .DB "FO"
 KW_TO:     .DB "TO"
 KW_STEP:   .DB "ST"
+KW_ABS:    .DB "AB"
+KW_RND:    .DB "RN"
+KW_TAB:    .DB "TA"
 
 ; =============================================================================
 ; INIT  --  cold start
@@ -359,6 +387,10 @@ INIZ:    STZ 0,X
          BPL INIZ
          LDA #GOSUB_TOP        ; INIZ zeroed GOSUB_SP too; 0 is not the empty
          STA GOSUB_SP          ; sentinel -- set it properly
+         LDA #$AC              ; INIZ zeroed RND_SEED too, and 0 is a fixed
+         STA RND_SEED           ; point for a Galois LFSR (stays 0 forever) --
+         LDA #$E1                ; seed it with a non-zero value
+         STA RND_SEED+1
          LDA #<SHOWCASE_END
          STA PE
          LDA #>SHOWCASE_END
@@ -814,6 +846,40 @@ SV_LP:   LDA FLT_A,Y
          BNE SV_LP
          RTS
 
+; VARIDX -- consume a variable letter (already validated as A-Z by the
+;   caller) and compute its VARS byte offset (index*4)
+;   In: IP -> the letter (peeked+validated, not yet consumed)
+;   Out: A = byte offset into VARS; IP advanced past the letter
+;   Clobbers: A
+VARIDX:  JSR GETCI
+         JSR UC
+         SEC
+         SBC #'A'
+         ASL
+         ASL
+         RTS
+
+; EAT_PAREN -- consume a delimiter+expr (EAT_EXPR), then consume one more
+;   delimiter (the closing ')'). Shared by CHR$/PEEK/USR/SIN/COS parsing.
+;   Clobbers: same as EAT_EXPR, plus WEAT's (none extra)
+EAT_PAREN: JSR EAT_EXPR
+           JMP WEAT
+
+; RND_SHUFFLE -- advance the 16-bit Galois LFSR one step (tap $B4:
+;   x^16+x^14+x^13+x^11+1). Called both from GETCH's keyboard-wait loop
+;   (accumulating entropy from real timing jitter while idle) and from
+;   RND() itself. Shuffles on every call; better with a hardware timer,
+;   but this board doesn't have one.
+;   Out: RND_SEED advanced  Clobbers: A
+RND_SHUFFLE:
+         LSR RND_SEED+1
+         ROR RND_SEED
+         BCC RS_SK
+         LDA RND_SEED+1
+         EOR #$B4
+         STA RND_SEED+1
+RS_SK:   RTS
+
 DO_FREE: SEC
          LDA #<RAM_TOP
          SBC PE
@@ -853,12 +919,24 @@ DPS:     JSR GETCI
          BRA DPS
 DPX:     LDA #<KW_CHRS
          JSR MTCHKW
-         BCS DPNC
-         JSR EAT_EXPR
-         JSR WEAT
+         BCS DPTB
+         JSR EAT_PAREN
          JSR FLT_TO_INT
          LDA T0
          JSR PUTCH
+         BRA DPA
+DPTB:    LDA #<KW_TAB
+         JSR MTCHKW
+         BCS DPNC
+         JSR EAT_PAREN
+         JSR FLT_TO_INT
+         LDA T0
+         BEQ DPA               ; TAB(0) or negative: nothing to print
+         TAX
+DPTL:    LDA #' '
+         JSR PUTCH
+         DEX
+         BNE DPTL
          BRA DPA
 DPNC:    JSR EXPR
          JSR FLT_PRINT
@@ -1022,7 +1100,11 @@ DNL:     STZ VARS,X
          LDA #GOSUB_TOP
          STA GOSUB_SP          ; empty call stack (immediate-mode GOSUB unwind)
          STZ FSTK               ; empty the FOR/NEXT loop stack too
-         RTS
+         LDA #$AC
+         STA RND_SEED           ; reseed RND too (0 is a fixed point for a
+         LDA #$E1                 ; Galois LFSR, never reached again once
+         STA RND_SEED+1              ; seeded non-zero, but NEW resets to a
+         RTS                            ; known sequence, same as uBASIC)
 
 DO_NEXT_J:
          JMP DO_NEXT
@@ -1065,12 +1147,7 @@ DO_INPUT:
          BCC DIDN
          CMP #'Z'+1
          BCS DIDN
-         JSR GETCI
-         JSR UC
-         SEC
-         SBC #'A'
-         ASL
-         ASL
+         JSR VARIDX
          PHA
          LDA IP+1
          PHA
@@ -1318,13 +1395,11 @@ E2NNG:   CMP #'+'
          LDA #<KW_CHRS
          JSR MTCHKW
          BCS E2NC
-         JSR EAT_EXPR
-         JMP WEAT
+         JMP EAT_PAREN
 E2NC:    LDA #<KW_PEEK
          JSR MTCHKW
          BCS E2NP
-         JSR EAT_EXPR
-         JSR WEAT
+         JSR EAT_PAREN
          JSR FLT_TO_INT
          LDA (T0)
          STA T0
@@ -1333,8 +1408,7 @@ E2NC:    LDA #<KW_PEEK
 E2NP:    LDA #<KW_USR
          JSR MTCHKW
          BCS E2NSIN
-         JSR EAT_EXPR
-         JSR WEAT
+         JSR EAT_PAREN
          JSR FLT_TO_INT
          LDA T0
          STA T2
@@ -1344,18 +1418,33 @@ E2NP:    LDA #<KW_USR
 E2NSIN:  LDA #<KW_SIN
          JSR MTCHKW
          BCS E2NCOS
-         JSR EAT_EXPR
-         JSR WEAT
+         JSR EAT_PAREN
          LDA #1
          BRA E2TRIG
 E2NCOS:  LDA #<KW_COS
          JSR MTCHKW
          BCS E2NU
-         JSR EAT_EXPR
-         JSR WEAT
+         JSR EAT_PAREN
          LDA #0
 E2TRIG:  JMP DO_TRIG
-E2NU:    LDA (IP)
+E2NU:    LDA #<KW_ABS
+         JSR MTCHKW
+         BCS E2NRND
+         JSR EAT_PAREN
+         JMP FLT_ABS
+E2NRND:  LDA #<KW_RND
+         JSR MTCHKW
+         BCS E2ND
+         JSR RND_SHUFFLE
+         LDA RND_SEED
+         STA T0
+         LDA RND_SEED+1
+         AND #$7F              ; force positive (0-32767 range)
+         STA T0+1
+         JSR FLT_FROM_INT
+         JSR FLT_32768_B
+         JMP FLT_DIV           ; RND() = LFSR value / 32768, so 0 <= x < 1
+E2ND:    LDA (IP)
          CMP #'0'
          BCC E2VR
          CMP #'9'+1
@@ -1367,12 +1456,7 @@ E2VR:    JSR UC
          BCC E2BD
          CMP #'Z'+1
          BCS E2BD
-         JSR GETCI
-         JSR UC
-         SEC
-         SBC #'A'
-         ASL
-         ASL
+         JSR VARIDX
          TAX
          LDY #0
 EVRL:    LDA VARS,X
@@ -1458,8 +1542,9 @@ PUTCH:   STA IO_OUT
          RTS
 
 GETCH:   LDA IO_IN
-         BEQ GETCH
-         BRA PUTCH
+         BNE PUTCH
+         JSR RND_SHUFFLE
+         BRA GETCH
 
 NEG_T1:  LDX #2
          .DB $2C
@@ -1542,12 +1627,7 @@ DO_LET:  JSR WPEEK_UC
          BCC DLD
          CMP #'Z'+1
          BCS DLD
-         JSR GETCI
-         JSR UC
-         SEC
-         SBC #'A'
-         ASL
-         ASL
+         JSR VARIDX
          PHA
          JSR WPEEK
          CMP #'='
@@ -1563,7 +1643,7 @@ DLPOP:   PLA
 DLD:     RTS
 
 ; =============================================================================
-; FSTK_BASE  --  LP = FOR_STK + A*7
+; FSTK_BASE  --  LP = FOR_STK + A*11
 ;   In:  A = frame index (0-3)
 ;   Out: LP = address of that frame within FOR_STK
 ;   Clobbers: A, T2
@@ -1571,11 +1651,12 @@ DLD:     RTS
 FSTK_BASE:
          STA T2
          ASL 
-         CLC
-         ADC T2
          ASL 
          CLC
-         ADC T2                ; A = index*7
+         ADC T2                ; A = index*5
+         ASL                    ; A = index*10
+         CLC
+         ADC T2                ; A = index*11
          CLC
          ADC #<FOR_STK
          STA LP
@@ -1589,15 +1670,11 @@ FSTK_BASE:
 ;
 ;   In:  IP -> variable letter
 ;   Out: loop frame pushed onto FOR_STK; VARS[var] = float(start)
-;   Clobbers: A, X, Y, T0, T2, LP, FLT_A, FLT_B
+;   Clobbers: A, X, Y, T0, T2, LP, FLT_A, FLT_B, FLT_ER, FLT_SA
 ;
-;   The loop VARIABLE is a real float in VARS, updated via FLT_ADD each
-;   NEXT, so it behaves normally in float expressions inside the loop
-;   body. LIMIT and STEP are 16-bit signed integers, not floats -- this
-;   keeps a 4-level-deep frame stack small enough to fit free zero page.
-;   Consequently "FOR X = 1 TO 10 STEP 0.5" is not supported: TO/STEP
-;   must be whole numbers (a non-integer start value like "FOR X = 1.5
-;   TO 10" IS fine -- only the bound and step are integer-only).
+;   The loop VARIABLE, LIMIT, and STEP are all real floats now -- LIMIT
+;   and STEP are staged whole (no int16 truncation), so "FOR X = 1 TO 10
+;   STEP 0.5" and non-integer TO bounds ("FOR X = 1 TO 10.5") both work.
 ; =============================================================================
 DO_FOR:
          JSR WPEEK_UC
@@ -1605,11 +1682,7 @@ DO_FOR:
          BCC DFBADJ
          CMP #'Z'+1
          BCS DFBADJ
-         JSR GETCI
-         SEC
-         SBC #'A'
-         ASL 
-         ASL                  ; var_index*4 = byte offset into VARS
+         JSR VARIDX            ; var_index*4 = byte offset into VARS
          STA FVAR
          JSR WPEEK
          CMP #'='
@@ -1624,27 +1697,28 @@ DFCONT:  LDX FVAR
          JSR MTCHKW
          BCS DFBAD             ; TO is mandatory
          JSR EXPR              ; evaluate limit -> FLT_A
-         JSR FLT_TO_INT        ; T0 = 16-bit limit
-         LDA T0
-         STA FLIM
-         LDA T0+1
-         STA FLIM+1
+         LDX #3                 ; stage limit float FLT_A -> FLIM (4 bytes)
+DFLCP:   LDA FLT_A,X
+         STA FLIM,X
+         DEX
+         BPL DFLCP
          LDA #<KW_STEP
          JSR MTCHKW
          BCS DFNOSTEP
          JSR EXPR              ; evaluate step -> FLT_A
-         JSR FLT_TO_INT
-         LDA T0
-         LDX T0+1
-         BRA DFHVSTEP
+         BRA DFSCP
 DFNOSTEP:
-         LDA #1                ; default step = 1
-         LDX #0
-DFHVSTEP:
-         STA FSTEP
-         STX FSTEP+1
-         ORA FSTEP+1           ; step of zero is illegal
-         BNE DFSZOK
+         LDA #1                ; default step = 1.0
+         STA T0
+         STZ T0+1
+         JSR FLT_FROM_INT      ; FLT_A = 1.0
+DFSCP:   LDX #3                 ; stage step float FLT_A -> FSTEP (4 bytes)
+DFSCPL:  LDA FLT_A,X
+         STA FSTEP,X
+         DEX
+         BPL DFSCPL
+         LDA FSTEP              ; step of zero is illegal (exponent byte
+         BNE DFSZOK              ;  0 == float value 0, per FLT_* convention)
          LDA #ERR_ST
          JMP DO_ERROR
 DFSZOK:  LDA FSTK
@@ -1652,13 +1726,13 @@ DFSZOK:  LDA FSTK
          BCC DFPUSH
          LDA #ERR_FOR
          JMP DO_ERROR
-DFPUSH:  JSR FSTK_BASE          ; LP = FOR_STK + FSTK*7 (A already = FSTK)
-         LDY #4                 ; copy FVAR,FLIM,FLIM+1,FSTEP,FSTEP+1 (they're
+DFPUSH:  JSR FSTK_BASE          ; LP = FOR_STK + FSTK*11 (A already = FSTK)
+         LDY #8                 ; copy FVAR,FLIM(4),FSTEP(4) (they're
 DFCP:    LDA FVAR,Y              ; contiguous in ZP) into the frame in one pass
          STA (LP),Y
          DEY
          BPL DFCP
-         LDY #5
+         LDY #9
          LDA CURLN               ; loop_line = this FOR statement's own line;
          STA (LP),Y                ; NEXT skips past it via SKL, landing on
          INY                         ; the first body line (same trick RETURN
@@ -1677,14 +1751,15 @@ DFBAD:   LDA #ERR_SN
 ;   Out: loop variable advanced; branches back to the line after the FOR
 ;        that opened this loop, or falls through to the statement after
 ;        NEXT once the limit is crossed
-;   Clobbers: A, X, Y, T0, T2, LP, FLT_A, FLT_B
+;   Clobbers: A, X, Y, T0, T1, T2, LP, FLT_A, FLT_B, FLT_SA, FLT_SB, FLT_ER, FLT_DB
 ;
-;   Comparison converts the (post-add) float loop variable to a 16-bit int
-;   and does a single unified signed test: diff = var - limit. If diff==0
-;   the limit is met exactly (inclusive: always loop once more). Otherwise
-;   XOR diff's sign with the step's sign -- differing signs means the
-;   limit has not yet been reached (keep looping); matching signs means
-;   it has been crossed (stop).
+;   Both bound and step are now full floats. After VAR += STEP, FLT_CMP
+;   compares VAR to LIMIT (-1/0/+1). Which outcomes mean "keep looping"
+;   depends on STEP's sign, stashed on the hardware stack before FLT_ADD/
+;   FLT_CMP get a chance to clobber FLT_B: for a positive STEP, loop unless
+;   VAR>LIMIT; for a negative STEP, loop unless VAR<LIMIT. Landing exactly
+;   on LIMIT (CMP==0) always loops once more (inclusive bound), same as
+;   the old integer version.
 ; =============================================================================
 DO_NEXT:
          JSR WPEEK_UC          ; consume optional variable name (ignored)
@@ -1708,40 +1783,45 @@ DNLD:    LDA VARS,X             ; load current loop variable into FLT_A
          INY
          CPY #4
          BNE DNLD
-         LDY #3
-         LDA (LP),Y             ; [3] step_lo
-         STA T0
-         INY
-         LDA (LP),Y             ; [4] step_hi
-         STA T0+1
-         JSR FLT_FROM_INT_B     ; FLT_B = float(step)
+         LDY #8                 ; copy step float, frame[5..8] -> FLT_B[0..3]
+         LDX #3
+DNCPB:   LDA (LP),Y
+         STA FLT_B,X
+         DEY
+         DEX
+         BPL DNCPB
+         LDY #6                 ; frame[6] = step's sign|mant_hi byte;
+         LDA (LP),Y              ; stash its sign bit now, before FLT_ADD/
+         AND #$80                ; FLT_CMP get a chance to clobber FLT_B
+         PHA
          JSR FLT_ADD            ; FLT_A = var + step
          LDA (LP)               ; var_slot again
          TAX
          JSR STORE_VAR           ; store updated loop variable back to VARS
-         JSR FLT_TO_INT         ; T0 = int(current loop var), for the compare
-         LDY #1
-         LDA T0
-         SEC
-         SBC (LP),Y             ; [1] limit_lo
-         STA T2
-         INY
-         LDA T0+1
-         SBC (LP),Y             ; [2] limit_hi
-         TAX                    ; X = diff hi byte
-         ORA T2                 ; Z reflects 16-bit "diff == 0"
-         BEQ DN_loop            ; var == limit: always loop once more
-         TXA                    ; restore diff hi byte (restores N flag)
-         LDY #4
-         EOR (LP),Y             ; XOR with [4] step_hi
-         BMI DN_loop            ; differing signs: limit not yet crossed
-         DEC FSTK                ; matching signs: limit crossed, done
-         RTS
-DN_loop: LDY #5
-         LDA (LP),Y             ; [5] loop_line_lo
+         LDY #4                 ; copy limit float, frame[1..4] -> FLT_B[0..3]
+         LDX #3
+DNCPL:   LDA (LP),Y
+         STA FLT_B,X
+         DEY
+         DEX
+         BPL DNCPL
+         JSR FLT_CMP             ; A = -1/0/+1 (var vs limit); FLT_A preserved
+         STA T2                  ; stash compare result
+         PLA                     ; recover step's sign bit
+         BMI DN_negstep
+         LDA T2                  ; positive step: loop unless var>limit
+         CMP #1
+         BEQ DN_done
+         BRA DN_loop
+DN_negstep:
+         LDA T2                  ; negative step: loop unless var<limit
+         CMP #$FF
+         BEQ DN_done
+DN_loop: LDY #9
+         LDA (LP),Y             ; [9] loop_line_lo
          STA T0
          INY
-         LDA (LP),Y             ; [6] loop_line_hi
+         LDA (LP),Y             ; [10] loop_line_hi
          STA T0+1
          JSR GOTOL
          BCS DN_ul
@@ -1749,6 +1829,8 @@ DN_loop: LDY #5
          TXS                    ; unwind hardware stack (same as GOTO/RETURN)
          JMP SKL                ; skip past the FOR line itself, land on body
 DN_ul:   JMP ERR_UL_J
+DN_done: DEC FSTK                ; limit crossed: pop the frame, fall through
+         RTS
 
 ; ---- ST_TAB: statement-keyword dispatch table (3 bytes/entry, $FF-terminated)
 ST_TAB:
@@ -1908,38 +1990,61 @@ FBAL:    LDA FLT_B,X
 ;               Clobbers: A, Y, PFA_RL/PFA_RH
 ;   POP_FLT_A   In: -- (matching PUSH_FLT_A frame beneath the return addr)
 ;               Out: FLT_A restored  Clobbers: A, Y, PFA_RL/PFA_RH
+; PUSH_FLT_A / POP_FLT_A -- save/restore the 4-byte float FLT_A on the
+; hardware stack, straddling arbitrary caller code (relational ops parking
+; the left operand across a recursive EXPR_ADD call, FLT_PRINT parking the
+; original value across its digit-scaling loop, etc).
+;
+; Merged into one routine: PUSH_FLT_A's entry stub sets X=3 then a BIT-
+; trick (.DB $2C) swallows POP_FLT_A's own "LDX #-4" (2 bytes) so it falls
+; straight into the shared return-address trampoline with X untouched.
+; TXA re-tests X's sign to pick the push or pop path -- this can't be
+; skipped even though LDX already set N/Z on entry, because the PLA pair
+; just above it clobbers those flags first.
+;
+; Must be entered via JSR, not tail-called: each pops its own return
+; address out of the way first, does the real push/pop, then pushes the
+; address back before RTS. A plain JSR/RTS wrapper around PHA x4/PLA x4
+; would break -- the parked frame must survive underneath the JSR's own
+; return address across arbitrary intervening code, so its own RTS would
+; otherwise consume the last 2 bytes of parked float data as a return
+; address (confirmed by an earlier crash before this trampoline was added).
+;
+; The X=-4-counting-up-to-0 POP loop needs zero-page,X addressing to wrap
+; correctly (STA FLT_A+4,X with X=$FC computes ($34+$FC) mod 256 = $30 =
+; FLT_A, verified against the assembler's actual output) -- Y doesn't work
+; here since STA has no zero-page,Y mode, only absolute,Y, which does a
+; full 16-bit add instead of wrapping and would corrupt the stack page.
+;
+;   PUSH_FLT_A  In: FLT_A  Out: FLT_A pushed beneath caller's return addr
+;               Clobbers: A, X, PFA_RL/PFA_RH
+;   POP_FLT_A   In: -- (matching PUSH_FLT_A frame beneath the return addr)
+;               Out: FLT_A restored  Clobbers: A, X, PFA_RL/PFA_RH
 PUSH_FLT_A:
-         PLA
-         STA PFA_RL
-         PLA
-         STA PFA_RH
-         LDY #3
-PSHL:    LDA FLT_A,Y
-         PHA
-         DEY
-         BPL PSHL
-         LDA PFA_RH
-         PHA
-         LDA PFA_RL
-         PHA
-         RTS
-
+         LDX #3
+         .DB $2C               ; BIT-trick: swallows POP_FLT_A's "LDX #-4"
 POP_FLT_A:
+         LDX #<-4
          PLA
          STA PFA_RL
          PLA
          STA PFA_RH
-         LDY #0
-POPL:    PLA
-         STA FLT_A,Y
-         INY
-         CPY #4
-         BNE POPL
-         LDA PFA_RH
+         TXA
+         BMI POPL
+PSHL:    LDA FLT_A,X
+         PHA
+         DEX
+         BPL PSHL
+PRET:    LDA PFA_RH
          PHA
          LDA PFA_RL
          PHA
          RTS
+POPL:    PLA
+         STA FLT_A+4,X
+         INX
+         BNE POPL
+         BEQ PRET              ; unconditional: X==0 here (BNE just fell through)
 
 ; =============================================================================
 ; FLT_FROM_INT / FLT_FROM_INT_B  --  convert a signed 16-bit integer to float
@@ -2733,20 +2838,10 @@ CK_NOSH:
         LDA #0
         SBC #0
         STA MASKXZ
+        TAX                  ; stash MASKXZ in X (avoids reloading from ZP)
         EOR #$FF
         STA MASKY
-        LDA MASKXZ
-        ASL 
-        LDA TMPY
-        EOR MASKXZ
-        ADC CX
-        STA CX
-        LDA TMPY+1
-        EOR MASKXZ
-        ADC CX+1
-        STA CX+1
-        LDA MASKY
-        ASL 
+        ASL                 ; MASKY's bit 7 into carry
         LDA TMPX
         EOR MASKY
         ADC CY
@@ -2755,7 +2850,17 @@ CK_NOSH:
         EOR MASKY
         ADC CY+1
         STA CY+1
-        LDA MASKXZ
+        TXA                  ; restore MASKXZ
+        ASL                 ; MASKXZ's bit 7 into carry
+        LDA TMPY
+        EOR MASKXZ
+        ADC CX
+        STA CX
+        LDA TMPY+1
+        EOR MASKXZ
+        ADC CX+1
+        STA CX+1
+        TXA                  ; restore MASKXZ again
         ASL 
         LDA CK_ATL,y
         EOR MASKXZ
@@ -2773,24 +2878,26 @@ CK_NOSH:
 CK_ATL: .DB <8192,<4836,<2555,<1297,<651,<326,<163,<81,<41,<20,<10,<5,<3,<1,<1,<0
 CK_ATH: .DB >8192,>4836,>2555,>1297,>651,>326,>163,>81,>41,>20,>10,>5,>3,>1,>1,>0
 
-; FLT_360_B -- FLT_B = 360.0.  Clobbers: A.
-FLT_360_B:
-        LDA #$89
-        STA FLT_B
-        LDA #$34
-        STA FLT_B+1
-        STZ FLT_B+2
-        STZ FLT_B+3
-        RTS
-
-; FLT_10000_B -- FLT_B = 10000.0.  Clobbers: A.
+; FLT_10000_B/FLT_360_B/FLT_32768_B -- FLT_B = 10000.0, 360.0, or 32768.0.
+; Clobbers: A, X, Y.
 FLT_10000_B:
         LDA #$8E
+        LDX #$1C
+        LDY #$40
+        BRA FLT_LOAD_B
+FLT_360_B:
+        LDA #$89
+        LDX #$34
+        LDY #$00
+        BRA FLT_LOAD_B
+FLT_32768_B:
+        LDA #$90
+        LDX #$00
+        LDY #$00
+FLT_LOAD_B:
         STA FLT_B
-        LDA #$1C
-        STA FLT_B+1
-        LDA #$40
-        STA FLT_B+2
+        STX FLT_B+1
+        STY FLT_B+2
         STZ FLT_B+3
         RTS
 
@@ -2815,67 +2922,47 @@ DO_TRIG:
         JSR FLT_ADD             ; negative: wrap into [0,360)
 DT_NONNEG:
         JSR FLT_TO_INT          ; T0 = 0..359
-        ; ---- quadrant fold: T0 -> 0..90, T1 = flags (bit0=negate CX, bit1=negate CY)
-        LDA T0+1
-        BNE DTF_HI
-        LDA T0
-        CMP #91
-        BCC DTF_Q1
-        CMP #181
-        BCC DTF_Q2
-        BRA DTF_Q3               ; hi=0 means T0<=255, and 255<271, so must be Q3
-DTF_HI:
-        LDA T0
-        CMP #15                 ; 256+15=271: Q3/Q4 split
-        BCC DTF_Q3
-DTF_Q4: LDA #<360
+        ; ---- quadrant fold via repeated subtraction: T1 = quadrant count
+        ; (0-3), then T0 -> 0..90. Gray-code transform of T1 below turns
+        ; the raw count into the sign flags DT_NCX/DT_NCY expect (bit0=
+        ; negate CX, bit1=negate CY): 0,1,2,3 -> 0,1,3,2.
+        STZ T1
+DTF_DIV: LDA T0
         SEC
-        SBC T0
-        STA T0
-        LDA #>360
-        SBC T0+1
-        STA T0+1
-        LDA #2
-        BRA DTF_FLAGS
-DTF_Q3: LDA T0
-        SEC
-        SBC #180
-        STA T0
+        SBC #90
+        TAX
         LDA T0+1
         SBC #0
+        BCC DTF_DONE            ; borrow: T0 already < 90
+        STX T0
         STA T0+1
-        LDA #3
-        BRA DTF_FLAGS
-DTF_Q2: LDA #180
+        INC T1
+        BRA DTF_DIV
+DTF_DONE:
+        LDA T1
+        LSR                    ; odd quadrant -> mirror (90 - T0)
+        BCC DTF_EVEN
+        LDA #90
         SEC
         SBC T0
         STA T0
-        STZ T0+1
-        LDA #1
-        BRA DTF_FLAGS
-DTF_Q1: STZ T0+1
-        LDA #0
-DTF_FLAGS:
+DTF_EVEN:
+        LDA T1
+        LSR 
+        EOR T1
         STA T1
-        ; ---- T0(0-90) * 182/256 -> CZ (angle -> Z units) ----
-        LDA #182
-        STA T2
-        STZ CZ
-        STZ CZ+1
+        ; ---- T0(0-90) * 182, 8-bit multiplicand -> CZ (angle -> Z units) ----
+        LDA #0
         LDX #8
-DTF_ML: LSR T2
+DTF_ML: LSR T0
         BCC DTF_MN
-        LDA CZ
         CLC
-        ADC T0
-        STA CZ
-        LDA CZ+1
-        ADC T0+1
-        STA CZ+1
-DTF_MN: ASL T0
-        ROL T0+1
+        ADC #182
+DTF_MN: ROR 
+        ROR CZ
         DEX
         BNE DTF_ML
+        STA CZ+1
         ; ---- init + run CORDIC ----
         LDA #<6073
         STA CX
@@ -2885,8 +2972,7 @@ DTF_MN: ASL T0
         STZ CY+1
         JSR CORDIC_KERN
         ; ---- apply quadrant sign flags ----
-        LDA T1
-        LSR
+        LSR T1
         BCC DT_NCX
         LDA #0
         SEC
@@ -2895,9 +2981,7 @@ DTF_MN: ASL T0
         LDA #0
         SBC CX+1
         STA CX+1
-DT_NCX: LDA T1
-        LSR
-        LSR
+DT_NCX: LSR T1
         BCC DT_NCY
         LDA #0
         SEC
@@ -2907,162 +2991,22 @@ DT_NCX: LDA T1
         SBC CY+1
         STA CY+1
 DT_NCY:
-        ; ---- select CX(cos)/CY(sin), convert to float, /10000 ----
-        PLA
-        BEQ DT_COS
-        LDA CY
+        ; ---- select CX(cos)/CY(sin) via index (CX/CY confirmed contiguous
+        ; in ZP -- see their equates), convert to float, /10000 ----
+        PLA                     ; 0 for COS, 1 for SIN
+        ASL                    ; 0 -> CX, 2 -> CY
+        TAX
+        LDA CX,X
         STA T0
-        LDA CY+1
-        STA T0+1
-        BRA DT_SCALE
-DT_COS: LDA CX
-        STA T0
-        LDA CX+1
+        LDA CX+1,X
         STA T0+1
 DT_SCALE:
         JSR FLT_FROM_INT
         JSR FLT_10000_B
         JMP FLT_DIV
+ROMEND: ; audit
 
-; ===========================================================================
-; SHOWCASE (RAM $0200, pre-loaded for simulator)
-; Line format: lo_lineno, hi_lineno, ASCII body, CR
-; Exercises every statement (PRINT, LET, IF..THEN, GOTO, POKE, FREE, HELP,
-; END) and every function (CHR$, PEEK, SIN, COS), plus a CORDIC sine-wave
-; plot and a floating-point Mandelbrot finale. Deliberately colon-free (see
-; the ':' note in the file header).
-; ===========================================================================
-         .ORG $0200
-; line 10
-         .DB $0A,$00,"REM miniBASIC 65C02 Float BASIC - showcase",$0D
-; line 20
-         .DB $14,$00,"PRINT ",$22,"=== LET and arithmetic ===",$22,$0D
-; line 30
-         .DB $1E,$00,"LET A=7",$0D
-; line 40
-         .DB $28,$00,"B=3",$0D
-; line 50
-         .DB $32,$00,"PRINT ",$22,"A=",$22,";A;",$22," B=",$22,";B",$0D
-; line 60
-         .DB $3C,$00,"PRINT ",$22,"A+B=",$22,";A+B;",$22," A-B=",$22,";A-B",$0D
-; line 70
-         .DB $46,$00,"PRINT ",$22,"A*B=",$22,";A*B;",$22," A/B=",$22,";A/B",$0D
-; line 80
-         .DB $50,$00,"PRINT ",$22,"A MOD B=",$22,";A%B",$0D
-; line 90
-         .DB $5A,$00,"PRINT ",$22,"=== relational ops ===",$22,$0D
-; line 100
-         .DB $64,$00,"PRINT ",$22,"A>B ",$22,";A>B;",$22," A<B ",$22,";A<B",$0D
-; line 110
-         .DB $6E,$00,"PRINT ",$22,"A=A ",$22,";A=A;",$22," A<>B ",$22,";A<>B",$0D
-; line 120
-         .DB $78,$00,"PRINT ",$22,"=== IF/THEN/GOTO ===",$22,$0D
-; line 130
-         .DB $82,$00,"IF A>B THEN PRINT ",$22,"A is bigger than B",$22,$0D
-; line 140
-         .DB $8C,$00,"PRINT ",$22,"=== POKE/PEEK ===",$22,$0D
-; line 150
-         .DB $96,$00,"POKE 4000,65",$0D
-; line 160
-         .DB $A0,$00,"PRINT ",$22,"PEEK(4000)=",$22,";PEEK(4000)",$0D
-; line 170
-         .DB $AA,$00,"PRINT ",$22,"=== CHR$ ===",$22,$0D
-; line 180
-         .DB $B4,$00,"PRINT CHR$(72);CHR$(73);CHR$(33)",$0D
-; line 190
-         .DB $BE,$00,"PRINT ",$22,"=== FREE ===",$22,$0D
-; line 200
-         .DB $C8,$00,"FREE",$0D
-; line 210
-         .DB $D2,$00,"PRINT ",$22,"=== 355/113 ~ pi ===",$22,$0D
-; line 220
-         .DB $DC,$00,"PRINT 355/113",$0D
-; line 230
-         .DB $E6,$00,"PRINT ",$22,"=== SIN/COS identity ===",$22,$0D
-; line 240
-         .DB $F0,$00,"PRINT SIN(30)*SIN(30)+COS(30)*COS(30)",$0D
-; line 250
-         .DB $FA,$00,"PRINT ",$22,"=== CORDIC sine wave ===",$22,$0D
-; line 260
-         .DB $04,$01,"I=0",$0D
-; line 270
-         .DB $0E,$01,"Y=SIN(I)",$0D
-; line 280
-         .DB $18,$01,"C=20+Y*18",$0D
-; line 290
-         .DB $22,$01,"J=0",$0D
-; line 300
-         .DB $2C,$01,"IF J>=C THEN GOTO 340",$0D
-; line 310
-         .DB $36,$01,"PRINT ",$22," ",$22,";",$0D
-; line 320
-         .DB $40,$01,"J=J+1",$0D
-; line 330
-         .DB $4A,$01,"GOTO 300",$0D
-; line 340
-         .DB $54,$01,"PRINT ",$22,"*",$22,$0D
-; line 350
-         .DB $5E,$01,"I=I+15",$0D
-; line 360
-         .DB $68,$01,"IF I<=360 THEN GOTO 270",$0D
-; line 370
-         .DB $72,$01,"PRINT ",$22,"=== Mandelbrot finale ===",$22,$0D
-; line 380
-         .DB $7C,$01,"R=0",$0D
-; line 390
-         .DB $86,$01,"C=0",$0D
-; line 400
-         .DB $90,$01,"X=-2+C*0.0417",$0D
-; line 410
-         .DB $9A,$01,"Y=-1+R*0.0833",$0D
-; line 420
-         .DB $A4,$01,"U=0",$0D
-; line 430
-         .DB $AE,$01,"V=0",$0D
-; line 440
-         .DB $B8,$01,"N=0",$0D
-; line 450
-         .DB $C2,$01,"P=U*U",$0D
-; line 460
-         .DB $CC,$01,"Q=V*V",$0D
-; line 470
-         .DB $D6,$01,"IF P+Q>4 THEN GOTO 540",$0D
-; line 480
-         .DB $E0,$01,"IF N>=15 THEN GOTO 540",$0D
-; line 490
-         .DB $EA,$01,"W=P-Q+X",$0D
-; line 500
-         .DB $F4,$01,"V=2*U*V+Y",$0D
-; line 510
-         .DB $FE,$01,"U=W",$0D
-; line 520
-         .DB $08,$02,"N=N+1",$0D
-; line 530
-         .DB $12,$02,"GOTO 450",$0D
-; line 540
-         .DB $1C,$02,"K=48+N",$0D
-; line 550
-         .DB $26,$02,"IF N<15 THEN GOTO 570",$0D
-; line 560
-         .DB $30,$02,"K=64",$0D
-; line 570
-         .DB $3A,$02,"PRINT CHR$(K);",$0D
-; line 580
-         .DB $44,$02,"C=C+1",$0D
-; line 590
-         .DB $4E,$02,"IF C<60 THEN GOTO 400",$0D
-; line 600
-         .DB $58,$02,"PRINT",$0D
-; line 610
-         .DB $62,$02,"R=R+1",$0D
-; line 620
-         .DB $6C,$02,"IF R<24 THEN GOTO 390",$0D
-; line 630
-         .DB $76,$02,"PRINT ",$22,"=== HELP ===",$22,$0D
-; line 650
-         .DB $8A,$02,"END",$0D
-SHOWCASE_END:
-
+        ; vectors
          .ORG $FFFC
-         .DW ROMSTART
+         .DW INIT
          .DW IRQ_HANDLER
