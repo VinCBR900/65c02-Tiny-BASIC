@@ -1,12 +1,12 @@
 # 6502 Tiny BASICs
 
-### uBASIC — fits in a 2716 EPROM (<2 KByte)
+### uBASIC6502 — fits in a 2716 EPROM (<2 KByte)
 
 **<2048 bytes assembled. ROM at $F800–$FFFF**
 
 A minimal but complete integer BASIC. No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution. This costs RAM and speed but keeps the interpreter very small. Courtesy of [Sehugg and Mango 1](https://github.com/sehugg/mango_one), You can open this project in [8 Bit Workshop](http://8bitworkshop.com/v3.12.1/?redir.html?platform=verilog&githubURL=https%3A%2F%2Fgithub.com%2FVinCBR900%2Fmango_one&file=mango1.v) and try it Out! Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing `ESC` aborts running program. 
 
-#### uBASIC `uBASIC6502.asm`
+This interpreter has also been ported to the John Bell 80-153 single board computer.  A modified sim65c02 simulator (JB-sim65c02) is provided for this version.
 
 **Statements:** 
   * `END` `GOSUB`/`RETURN`  `GOTO`  `IF`/`THEN`  `INPUT`  `LET`  `POKE`  `PRINT [TAB(n)] [;] CHR$(n)`  `REM`  `RUN`  
@@ -20,9 +20,9 @@ A minimal but complete integer BASIC. No tokeniser — program lines are stored 
 
 **Notes**
 - Uses **2 character matching** - with 3rd char match for `GOSUB`/`GOTO` and `RETURN`/`REM`.  Matches anything after e.g. PROCEED matches PRINT.  Therefore  spaces are important e.g. `PRINT TAB(5);"hello"` works, whereas `PRINTTAB(5);"HELLO"` does not.
-- **`:` Not Supported** - Multi-statement operator `:` is not supported and input buffer is 32 characters only.
 - **`GOTO`/`GOSUB` accepts expressions** — `GOTO X`, `GOSUB BASE+N`, `GOTO 10*I` all work
 - **`RND`** — 16-bit Galois LFSR pseudo-random number, returns 1–32767; seeded at startup; useful as `RND MOD 6 + 1` for a die roll
+- **`:` Not Supported** - Multi-statement operator `:` is not supported and input buffer is 32 characters only.
 
 **Errors** (printed as `?N [IN line]`):
 
@@ -78,7 +78,8 @@ A significantly more capable integer BASIC. Keywords are tokenised on entry and 
 | `uBASIC6502.asm` | NMOS-6502 uBASIC  with 2-byte keyword-prefix matcher |
 | `4kBASIC.asm` | 4K BASIC source (~3100 lines, heavily commented) |
 | `asm65c02.c` | In tools folder, Two-pass 6502/65C02 assembler — builds standalone |
-| `sim65c02.c` | In tools folder, 65C02/6502 simulator — includes asm65c02.c directly |
+| `sim65c02.c` | In tools folder, 65C02/6502 simulator with Kowalski I/O — includes asm65c02.c directly |
+| `JB-sim65c02.c` | In tools folder, 65C02/6502 simulator with John Bell 80-153 Bitbang emulation — includes asm65c02.c directly |
 
 ---
 
@@ -89,6 +90,7 @@ A significantly more capable integer BASIC. Keywords are tokenised on entry and 
 Both ROMs work in the [Kowalski 65C02 Simulator](https://github.com/Kelmar/kowalski). Set:
 - CPU mode: Set **65C02** if using 4k versions
 - Terminal emulation addresses: **E000–E006**
+- Ensure `uBASIC6502.asm` has the `KOWaLSKI=1` defined at teh top of the file 
 
 Load the assembled binary or paste the `.asm` source click Assemble (F7), Debug (F6) and either RUN (F5) or Animate (Ctrl-F5) if you want to watch it step through - don't forget to click and type into the yellow Terminal window. The INIT trampoline at the start of uBASIC ROM means Kowalski's nominal execute-from-first-byte behaviour works correctly, as does real hardware's reset-vector startup.
 
@@ -97,13 +99,14 @@ Building and Running
 
 `sim65c02.c` may be used for batch testing by piping file in from STDIN, or may be started with max-cycles set to 0 and will take inpuit form STDIN, with output going to STDOUT and errors to STDERR.  
 
-**Build on Windows with TCC:**
+**Build**
 ```
-Tcc -O2 -o sim65c02.exe sim65c02.c
+REM for Windows
+Tcc -O2 -o sim65c02.exe sim65c02.c 
 ```
 
-**Cross-compile on Linux:**
 ```bash
+# for LInux
 gcc -O2 -o sim65c02 sim65c02.c
 ```
 **Run:**
@@ -183,18 +186,18 @@ Both interpreters support `%` as integer modulo: `10 % 3` gives `1`. 4K BASIC v1
 
 #### The pre-loaded showcase program
 
-All ROMs include a feature showcase program pre-loaded at $0200. Type `RUN` to execute it, `NEW` to clear it, or `LIST` to read the source. The showcase is designed to exercise as much of each interpreter's instruction set as possible in a single self-contained program.
+All ROMs include a pre-loaded feature showcase program for Kowalski simulator. Type `RUN` to execute it, `NEW` to clear it, or `LIST` to read the source. The showcase is designed to exercise as much of each interpreter's instruction set as possible in a single self-contained program.
 
 ### Notes
-  * Originally I started with a 65c02 2kbyte tiny BASIC, whichafter got working ported to NMOS 6502.  The 65c02 version had more features due to better code density, but eventually I Realized I should just refactor NMOS 6502 and get as many features in that, rather than working on two 2kbyte versions.  So the original 65c02 version `uBASIC.asm` is in the `Archive` folder.
+  * Originally I started with a 65c02 2kbyte tiny BASIC, which after got working ported to NMOS 6502.  The 65c02 version had more features due to better code density, but eventually I Realized I should just refactor NMOS 6502 and get as many features in that, rather than working on two 2kbyte versions.  So the original 65c02 version `uBASIC.asm` is in the `Archive` folder.
   * Originally I had two different simulator versions - a batch version and an interactive.  Eventually I realized maintaining both was a pain, and one could do both jobs.  So the old _interactive_ versions are in the `Archive` folder. 
 
 ---
 
 ## Credits & Similar Projects
 
-- **Oscar Toledo** for [x86 BootBASIC](https://github.com/nanochess/bootBASIC) — my original inspiration for a non-IL Tiny BASIC approach.
-- **Will Stevens'** [1kbyte 8080 Tiny BASIC](https://github.com/WillStevens/basic1K) was also a more recent inspiration and taught me a few old skool tricks on code density. 
+- **Oscar Toledo** for [x86 BootBASIC](https://github.com/nanochess/bootBASIC) — original inspiration for a non-IL Tiny BASIC approach.
+- **Will Stevens'** [1kbyte 8080 Tiny BASIC](https://github.com/WillStevens/basic1K) - a more recent inspiration and taught me a few old skool tricks on code density. 
 - **Hans Otten** for a thorough [6502 Tiny BASIC site](http://retro.hansotten.nl/6502-sbc/kim-1-manuals-and-software/kim-1-software/tiny-basic).
 - **[Claude AI](https://claude.ai)** for making it possible for a non-expert to ship something that had been on the back burner since 1989.
 
