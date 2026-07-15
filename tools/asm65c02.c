@@ -1,11 +1,27 @@
 /*
- * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.13, Jul 2026)
+ * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.14, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
  * Also used as an embedded assembler inside sim65c02.c (included directly).
  *
  * Changelog & Version History (Newest First)
+ *
+ * v1.14 (Jul 2026) — Undefined Symbol Detection in Instruction Operands
+ *   - FIXED: A Pass 2 reference to an undefined symbol in an instruction
+ *     operand (e.g. `JSR MISTYPED_LABEL`) was silently evaluated as 0
+ *     instead of raising an assembly error, so the instruction assembled
+ *     against address $0000 with no diagnostic at all. Root cause: eval_expr()
+ *     correctly set its *err flag on an undefined Pass 2 symbol, but the
+ *     `ev()` convenience wrapper used by parse_operand() — the path behind
+ *     every plain instruction operand (LDA/JSR/STA/JMP/branches/indexed/
+ *     indirect forms) — discarded that flag instead of reporting it.
+ *   - `ev()` and `parse_operand()` now take a `lineno` parameter so `ev()`
+ *     can call add_error() itself when a Pass 2 symbol lookup fails, the
+ *     same way `.word`/`.byte`/BBR/BBS operand evaluation already did.
+ *   - Legitimate forward references (a label defined later in the same
+ *     file) are unaffected: `eval_expr()` only raises *err when pass2==1,
+ *     exactly as before.
  *
  * v1.13 (Jul 2026) — Forward-Referenced .ORG Correction
  *   - FIXED: Stale address baking for code labels inside `.ORG <compound-equate>` 
@@ -741,10 +757,25 @@ static int eval_expr(const char *raw, int pc, int pass2, int *err) {
     return 0;
 }
 
-/* convenience wrapper: eval, return 0 on error */
-static int ev(const char *expr, int pc, int pass2) {
+/* convenience wrapper: eval, return 0 on error.
+ * v1.14 FIX: previously this silently discarded eval_expr()'s *err flag,
+ * so a pass-2 reference to an undefined symbol (e.g. a mistyped or
+ * removed label used as an instruction operand, "JSR SOME_LABEL") quietly
+ * evaluated to 0 instead of raising an assembly error -- the instruction
+ * then assembled against address $0000 with no diagnostic at all. Every
+ * other eval_expr() call site in this file already checks its own local
+ * err flag and calls add_error(); this is the one path (used by every
+ * plain instruction operand via parse_operand()) that did not. lineno is
+ * needed here purely to report against; pass 1 calls (pass2==0) never
+ * trigger this, since eval_expr() only raises *err for pass2. */
+static int ev(const char *expr, int pc, int pass2, int lineno) {
     int e = 0;
     int v = eval_expr(expr, pc, pass2, &e);
+    if (pass2 && e) {
+        char msg[ERR_LEN];
+        snprintf(msg, ERR_LEN, "Undefined symbol in operand: '%s'", expr);
+        add_error(lineno, msg);
+    }
     return v;
 }
 
@@ -845,7 +876,7 @@ static int literal_forces_abs(const char *expr) {
     return n >= 3;
 }
 
-static Operand parse_operand(const char *raw_op, const char *mn, int pc, int pass2) {
+static Operand parse_operand(const char *raw_op, const char *mn, int pc, int pass2, int lineno) {
     char o[LINE_LEN];
     strncpy(o, raw_op, LINE_LEN-1); o[LINE_LEN-1] = '\0';
     str_trim(o);
@@ -874,7 +905,7 @@ static Operand parse_operand(const char *raw_op, const char *mn, int pc, int pas
     /* immediate: #expr */
     if (o[0] == '#') {
         res.mode  = M_IMM;
-        res.value = ev(o+1, pc, pass2) & 0xFF;
+        res.value = ev(o+1, pc, pass2, lineno) & 0xFF;
         return res;
     }
 
@@ -902,7 +933,7 @@ static Operand parse_operand(const char *raw_op, const char *mn, int pc, int pas
                 if (inner_len < 0) inner_len = 0;
                 strncpy(inner, o+1, inner_len); inner[inner_len] = '\0';
                 str_trim(inner);
-                int val = ev(inner, pc, pass2) & 0xFFFF;
+                int val = ev(inner, pc, pass2, lineno) & 0xFFFF;
                 if (!strcmp(mn, "jmp")) {
                     res.mode = M_IND_ABSX; res.value = val; return res;
                 }
@@ -915,14 +946,14 @@ static Operand parse_operand(const char *raw_op, const char *mn, int pc, int pas
                 char inner[LINE_LEN];
                 strncpy(inner, o+1, close-1); inner[close-1] = '\0';
                 res.mode  = M_IND_Y;
-                res.value = ev(inner, pc, pass2) & 0xFF;
+                res.value = ev(inner, pc, pass2, lineno) & 0xFF;
                 return res;
             }
             if (*after == '\0') {
                 /* (expr) — JMP uses abs-indirect; LDA/STA use ind_zp */
                 char inner[LINE_LEN];
                 strncpy(inner, o+1, close-1); inner[close-1] = '\0';
-                int val = ev(inner, pc, pass2) & 0xFFFF;
+                int val = ev(inner, pc, pass2, lineno) & 0xFFFF;
                 if (!pass2 && has_undef(inner)) {
                     /* forward ref: assume abs indirect */
                     res.mode = M_IND; res.value = val; return res;
@@ -950,7 +981,7 @@ static Operand parse_operand(const char *raw_op, const char *mn, int pc, int pas
             if (reg=='X' || reg=='Y') {
                 char base[LINE_LEN];
                 strncpy(base, o, comma); base[comma] = '\0'; str_trim(base);
-                int val = ev(base, pc, pass2) & 0xFFFF;
+                int val = ev(base, pc, pass2, lineno) & 0xFFFF;
                 Mode m;
                 if (!pass2 && has_undef(base)) {
                     m = (reg=='X') ? M_ABSX : M_ABSY;  /* forward ref: always use ABS size */
@@ -967,13 +998,13 @@ static Operand parse_operand(const char *raw_op, const char *mn, int pc, int pas
     /* branch */
     if (is_branch(mn)) {
         res.mode  = M_REL;
-        res.value = ev(o, pc, pass2) & 0xFFFF;
+        res.value = ev(o, pc, pass2, lineno) & 0xFFFF;
         return res;
     }
 
     /* plain value: zp or abs */
     {
-        int val = ev(o, pc, pass2) & 0xFFFF;
+        int val = ev(o, pc, pass2, lineno) & 0xFFFF;
         if (!pass2 && has_undef(o)) {
             res.mode = M_ABS; res.value = val; return res;  /* forward ref: always ABS size */
         }
@@ -1714,7 +1745,7 @@ static int assemble(const char *source) {
 
         /* instruction */
         if (mnem_known(mn)) {
-            Operand op = parse_operand(operand, mn, pc, 0);
+            Operand op = parse_operand(operand, mn, pc, 0, lineno);
             pc += instr_size(mn, op.mode);
         } else {
             char msg[ERR_LEN];
@@ -2058,7 +2089,7 @@ static int assemble(const char *source) {
 
         if (!mnem_known(mn)) continue;
 
-        Operand oper = parse_operand(op, mn, pc, 1);
+        Operand oper = parse_operand(op, mn, pc, 1, lineno);
         Mode m = promote(mn, oper.mode);
 
         /* v1.5: 6502 mode -- flag any 65C02-only instruction as an error */
@@ -2295,7 +2326,7 @@ static int parse_hex_range(const char *s, int *start, int *end) {
 
 static void asm_usage(FILE *out) {
     fprintf(out,
-        "asm65c02 v1.13 — Toy 65C02/6502 two-pass assembler\n"
+        "asm65c02 v1.14 — Toy 65C02/6502 two-pass assembler\n"
         "\n"
         "Copyright Vincent Crabtree 2026, MIT License, See LICENSE file\n"
         "\n"
