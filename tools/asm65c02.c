@@ -1,11 +1,70 @@
 /*
- * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.14, Jul 2026)
+ * asm65c02.c - Two-pass Toy 65C02 assembler  (v1.16, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
  * Also used as an embedded assembler inside sim65c02.c (included directly).
  *
  * Changelog & Version History (Newest First)
+ *
+ * v1.16 (Jul 2026) — General (6502+65C02) Redundant-Comparison Advisories
+ *   - ADDED: Two more advisory-only Pass 2 warnings, unlike v1.15's these
+ *     are NOT gated by cpu_mode -- they apply equally to a 6502 or 65C02
+ *     target, since none of them use a 65C02-only opcode:
+ *       - CMP #0 / CPX #0 / CPY #0 immediately after an instruction that
+ *         already leaves N/Z reflecting A/X/Y (lda/adc/sbc/and/ora/eor/
+ *         txa/tya/pla for A; ldx/tax/inx/dex/plx for X; ldy/tay/iny/dey/
+ *         ply for Y) is redundant and can be deleted outright (saves 2
+ *         bytes, not just shortened). Same strict-adjacency and label
+ *         rules as v1.15's two-instruction checks: deliberately
+ *         conservative, so ANY intervening instruction -- even a
+ *         flag-preserving one like STA -- resets the tracked state,
+ *         trading a few missed opportunities for not needing a second
+ *         "does this opcode touch N/Z" table alongside reg_reflected_by().
+ *       - AND #$FF, ORA #$00, EOR #$00 are unconditional no-ops (true
+ *         identity operations for any value of A) regardless of context,
+ *         so no adjacency tracking is needed for these -- checked
+ *         directly off oper.value once parse_operand() has resolved it.
+ *   - Deliberately NOT added: CMP #$80 before BPL/BMI. Unlike CMP #0,
+ *     this is not a redundant flag test -- N after CMP #imm reflects
+ *     bit 7 of (A - imm), so CMP #$80 tests "is A < $80" (unsigned), a
+ *     real and intentional pattern, not a leftover comparison that can
+ *     be deleted. Also not added: the .byte $2C (BIT abs) branch-skip
+ *     trick for eliminating a merge-back branch/jump between two 2-byte
+ *     paths. Real technique, but out of scope here: detection needs a
+ *     3-4 line structural match (not a simple adjacency check), it
+ *     restructures control flow rather than substituting an equivalent
+ *     instruction, and BIT abs performs a genuine memory read that can
+ *     have side effects on memory-mapped hardware the assembler has no
+ *     way to know about (e.g. a status-register read-to-clear on some
+ *     targets) -- a materially different risk than every other
+ *     suggestion here, all of which are true instruction-for-
+ *     instruction equivalences with no such caveat.
+ *   - Still governed by the same -NoWarnOptSize flag as v1.15.
+ *
+ * v1.15 (Jul 2026) — 65C02 Size-Optimization Advisories
+ *   - ADDED: Advisory-only Pass 2 warnings (add_warning(), never affect
+ *     emitted bytes) for a few common instruction sequences that have a
+ *     shorter 65C02-only equivalent:
+ *       - Unconditional absolute JMP whose target is within a signed
+ *         byte of the next instruction -> BRA saves 1 byte. Reuses the
+ *         same offset math as the existing M_REL branch-range check.
+ *       - TXA+PHA -> PHX, TYA+PHA -> PHY, PLA+TAX -> PLX, PLA+TAY -> PLY
+ *         (each saves 1 byte).
+ *       - LDA #0 + STA <addr> -> STZ <addr> (saves up to 2 bytes);
+ *         skipped when the STA operand is indirect or Y-indexed, since
+ *         STZ doesn't support those addressing modes.
+ *   - The two-instruction checks require the pair to be strictly
+ *     adjacent with nothing between them: a label on the SECOND
+ *     instruction, or any bare label-only/directive line in between,
+ *     suppresses the suggestion, since something may jump directly into
+ *     the second instruction and skip the first. A label on the FIRST
+ *     instruction of a pair does not suppress it.
+ *   - Gated off entirely for a strict 6502 target (cpu_mode==1), since
+ *     none of these opcodes exist there. New -NoWarnOptSize CLI flag
+ *     suppresses just these advisories, independent of -NoWarn65c02 and
+ *     -Strict6502 (which control source portability, a different
+ *     concern from code size on a fixed 65C02 target).
  *
  * v1.14 (Jul 2026) — Undefined Symbol Detection in Instruction Operands
  *   - FIXED: A Pass 2 reference to an undefined symbol in an instruction
@@ -454,6 +513,20 @@ static int g_nowarn65c02 = 0;
 static int g_strict6502  = 0;
 
 /*
+ * g_nowarn_optsize (v1.15):
+ *   Controls the size-optimization advisories added in v1.15 (JMP-could-
+ *   be-BRA, and the TXA+PHA/TYA+PHA/PLA+TAX/PLA+TAY/LDA #0+STA peephole
+ *   suggestions below). These are purely informational -- never emitted
+ *   bytes are affected -- so they get their own flag rather than reusing
+ *   g_nowarn65c02, which governs a semantically different thing (source
+ *   portability to NMOS 6502, not code size on a fixed 65C02 target).
+ *   Same lifetime rules as g_nowarn65c02/g_strict6502 above: CLI-only,
+ *   set once in main(), never touched by sim65c02.c's assemble(source)
+ *   call site, so the simulator always assembles with these warnings on.
+ */
+static int g_nowarn_optsize = 0;
+
+/*
  * is_65c02only  --  return 1 if the (mnemonic, mode) combination requires
  *                  a 65C02 and is therefore illegal in cpu_mode==1 (6502).
  *
@@ -551,6 +624,29 @@ static int scoped_get(const char *name, int *out) {
  * Returns the integer value; sets *err=1 on error.
  */
 static int eval_expr(const char *raw, int pc, int pass2, int *err);
+
+/* v1.16: reg_reflected_by -- returns 'A', 'X', 'Y', or 0, indicating
+ * which register (if any) the given mnemonic leaves N/Z exactly
+ * reflecting, for the CMP/CPX/CPY #0 redundancy peephole check. Plain
+ * memory INC/DEC deliberately excluded (they reflect the memory
+ * location's new value, not any register); INX/DEX/INY/DEY are the
+ * register-specific forms and are included. PLX/PLY are 65C02-only but
+ * safe to include unconditionally here -- if cpu_mode==1 forbids them,
+ * that's flagged as a hard error at their own emission site regardless
+ * of this advisory-only classification. */
+static char reg_reflected_by(const char *mn) {
+    if (!strcmp(mn,"lda") || !strcmp(mn,"adc") || !strcmp(mn,"sbc") ||
+        !strcmp(mn,"and") || !strcmp(mn,"ora") || !strcmp(mn,"eor") ||
+        !strcmp(mn,"txa") || !strcmp(mn,"tya") || !strcmp(mn,"pla"))
+        return 'A';
+    if (!strcmp(mn,"ldx") || !strcmp(mn,"tax") || !strcmp(mn,"inx") ||
+        !strcmp(mn,"dex") || !strcmp(mn,"plx"))
+        return 'X';
+    if (!strcmp(mn,"ldy") || !strcmp(mn,"tay") || !strcmp(mn,"iny") ||
+        !strcmp(mn,"dey") || !strcmp(mn,"ply"))
+        return 'Y';
+    return 0;
+}
 
 /* helper: find rightmost binary operator outside parentheses at given level */
 static int find_binop(const char *s, int len, const char *ops) {
@@ -1845,6 +1941,30 @@ static int assemble(const char *source) {
     /* ── PASS 2: emit bytes ── */
     g_scope[0] = '\0';
     cpu_mode = 0;   /* v1.9 bug fix: don't inherit pass 1's trailing state */
+
+    /* v1.15: size-optimization peephole state -- the lowercase mnemonic
+     * of the most recently emitted "simple" instruction (txa/tya/pla,
+     * or the marker "zld" for "lda #0"), used to flag a couple of common
+     * two-instruction sequences that have a shorter 65C02 equivalent
+     * (TXA+PHA -> PHX, TYA+PHA -> PHY, PLA+TAX -> PLX, PLA+TAY -> PLY,
+     * LDA #0+STA addr -> STZ addr). Reset to "" by ANY intervening line
+     * (label-only, directive, or non-matching instruction) so the check
+     * only fires on strictly adjacent instructions with nothing between
+     * them -- in particular, a label on the second instruction means
+     * something may jump directly into it, skipping the first, which
+     * would make the substitution wrong; see the reset logic below.
+     *
+     * v1.16: prev_opt_reg tracks which of A/X/Y ('A'/'X'/'Y', or 0 for
+     * none) the most recent instruction left N/Z reflecting, for the
+     * general (not 65C02-specific) CMP/CPX/CPY #0 redundancy check
+     * below. Updated alongside prev_opt_mn, on the same lines, under the
+     * same adjacency/label reset rules -- deliberately conservative: ANY
+     * intervening instruction resets it to 0, even flag-preserving ones
+     * like STA, trading a few missed suggestions for not needing a
+     * separate "does this opcode touch N/Z" table. */
+    char prev_opt_mn[8] = "";
+    char prev_opt_reg = 0;
+
     for (int li = 0; li < nlines; li++) {
         LineInfo *info = &pc_map[li];
         int lineno = info->lineno;
@@ -1859,6 +1979,92 @@ static int assemble(const char *source) {
         if (info->skip) continue;
 
         if (!info->label[0] && !info->mnem[0]) continue;
+
+        /* v1.15: size-optimization peephole check, using the state left
+         * by the PREVIOUS line (prev_opt_mn), before anything below
+         * updates it for this line. A label on THIS line means some
+         * other code may jump directly here, skipping whatever
+         * instruction prev_opt_mn refers to -- so the check is
+         * conditioned on info->label[0] being empty. Placed ahead of
+         * every directive/equate `continue` below so it runs exactly
+         * once per non-blank line, uniformly. */
+        if (!g_nowarn_optsize && !info->label[0] && info->mnem[0]) {
+            const char *cm = info->mnem;
+            const char *hint = NULL;
+            char cmp0_msg[ERR_LEN];
+            if (cpu_mode != 1) {
+                if      (!strcmp(prev_opt_mn,"txa") && !strcmp(cm,"pha")) hint = "TXA+PHA can be PHX on 65C02 (saves 1 byte)";
+                else if (!strcmp(prev_opt_mn,"tya") && !strcmp(cm,"pha")) hint = "TYA+PHA can be PHY on 65C02 (saves 1 byte)";
+                else if (!strcmp(prev_opt_mn,"pla") && !strcmp(cm,"tax")) hint = "PLA+TAX can be PLX on 65C02 (saves 1 byte)";
+                else if (!strcmp(prev_opt_mn,"pla") && !strcmp(cm,"tay")) hint = "PLA+TAY can be PLY on 65C02 (saves 1 byte)";
+                else if (!strcmp(prev_opt_mn,"zld") && !strcmp(cm,"sta")
+                         && !strchr(info->operand,'(')
+                         && !strstr(info->operand,",y") && !strstr(info->operand,",Y"))
+                    hint = "LDA #0+STA <addr> can be STZ <addr> on 65C02 (saves up to 2 bytes)";
+            }
+            /* v1.16: CMP/CPX/CPY #0 redundancy -- general 6502/65C02,
+             * not gated by cpu_mode. Only fires when prev_opt_reg
+             * matches the register the comparison targets AND the
+             * operand is a literal immediate 0 (checked via a
+             * throwaway eval_expr probe -- see the *err discard
+             * rationale in the update block below). */
+            if (!hint) {
+                int is_cmp0 = (!strcmp(cm,"cmp") && prev_opt_reg=='A')
+                           || (!strcmp(cm,"cpx") && prev_opt_reg=='X')
+                           || (!strcmp(cm,"cpy") && prev_opt_reg=='Y');
+                if (is_cmp0 && info->operand[0]) {
+                    const char *p = skip_ws(info->operand);
+                    if (*p == '#') {
+                        int e = 0;
+                        int v = eval_expr(p+1, info->pc, 1, &e);
+                        if (!e && v == 0) {
+                            snprintf(cmp0_msg, ERR_LEN,
+                                "%s #0 is redundant -- previous instruction already sets N/Z from %c (delete this line, saves 2 bytes)",
+                                cm, prev_opt_reg);
+                            hint = cmp0_msg;
+                        }
+                    }
+                }
+            }
+            if (hint) add_warning(info->lineno, hint);
+        }
+        /* ...then update prev_opt_mn for the NEXT line, based on THIS
+         * one. A label attached to a txa/tya/pla line is fine -- someone
+         * jumping to that label still flows through the rest of the pair
+         * normally, so it's only a BARE label-only line (no mnemonic at
+         * all) that breaks the chain, since nothing then stands between
+         * a jump landing there and whatever instruction comes after (see
+         * that branch below). Otherwise "prev"-side mnemonics
+         * (txa/tya/pla) or "lda #<literal 0>" become the new state,
+         * anything else resets it. eval_expr's *err is deliberately
+         * discarded here -- the normal instruction path re-evaluates
+         * this same operand later on this same line and reports any
+         * real error there; this is a throwaway advisory-only probe. */
+        if (!info->mnem[0]) {
+            /* bare label-only line: breaks the chain, since a label
+             * materializing here means something could jump straight to
+             * whatever comes next, bypassing prev_opt_mn's instruction. */
+            prev_opt_mn[0] = '\0';
+        } else if (!strcmp(info->mnem,"txa") || !strcmp(info->mnem,"tya") || !strcmp(info->mnem,"pla")) {
+            strncpy(prev_opt_mn, info->mnem, sizeof(prev_opt_mn)-1);
+        } else if (!strcmp(info->mnem,"lda") && info->operand[0]) {
+            const char *p = skip_ws(info->operand);
+            if (*p == '#') {
+                int e = 0;
+                int v = eval_expr(p+1, info->pc, 1, &e);
+                strcpy(prev_opt_mn, (!e && v == 0) ? "zld" : "");
+            } else {
+                prev_opt_mn[0] = '\0';
+            }
+        } else {
+            prev_opt_mn[0] = '\0';
+        }
+        /* v1.16: prev_opt_reg follows the same reset rule as prev_opt_mn
+         * above (a bare label-only line, i.e. no mnemonic, resets it;
+         * anything else is reclassified fresh from THIS line's own
+         * mnemonic via reg_reflected_by(), independent of prev_opt_mn's
+         * own value). */
+        prev_opt_reg = info->mnem[0] ? reg_reflected_by(info->mnem) : 0;
 
         /* update scope */
         if (info->label[0] && info->label[0]!='@' && !info->is_equate)
@@ -2134,6 +2340,21 @@ static int assemble(const char *source) {
         }
         int val = oper.value;
         int sz  = mode_size[m];
+
+        /* v1.16: no-op immediate advisory -- general 6502/65C02, not
+         * gated by cpu_mode. AND #$FF, ORA #$00, and EOR #$00 are true
+         * identity operations regardless of surrounding code (unlike
+         * the CMP #0 check above, no adjacency/flow context needed:
+         * these masks are no-ops for any value of A). oper.value is
+         * already fully resolved and error-checked by parse_operand()
+         * above, so no extra evaluation is needed here. */
+        if (!g_nowarn_optsize && m == M_IMM) {
+            const char *noop_msg = NULL;
+            if      (!strcmp(mn,"and") && (val & 0xFF) == 0xFF) noop_msg = "AND #$FF is a no-op (leaves A unchanged); consider removing";
+            else if (!strcmp(mn,"ora") && (val & 0xFF) == 0x00) noop_msg = "ORA #$00 is a no-op (leaves A unchanged); consider removing";
+            else if (!strcmp(mn,"eor") && (val & 0xFF) == 0x00) noop_msg = "EOR #$00 is a no-op (leaves A unchanged); consider removing";
+            if (noop_msg) add_warning(lineno, noop_msg);
+        }
         /* v1.8: pc is the TRUE running address here, not yet masked.
            mem[pc], mem[pc+1], mem[pc+2] below previously indexed with
            this unmasked value directly -- once pc exceeded 65536
@@ -2173,6 +2394,28 @@ static int assemble(const char *source) {
             } else {
                 mem[(pc+1) & 0xFFFF] = (uint8_t)(val & 0xFF);
                 if (sz == 3) mem[(pc+2) & 0xFFFF] = (uint8_t)((val >> 8) & 0xFF);
+            }
+        }
+
+        /* v1.15: size-optimization advisory -- an unconditional absolute
+         * JMP (M_ABS; deliberately excludes JMP (addr) / M_IND and
+         * JMP (addr,X) / M_IND_ABSX, which BRA cannot express) that
+         * lands within a signed byte of the next instruction could be a
+         * 1-byte-shorter BRA on 65C02. Reuses the exact offset math from
+         * the M_REL case above. Gated off for a strict 6502 target
+         * (BRA doesn't exist there) and behind -NoWarnOptSize; advisory
+         * only, never changes what was just emitted above. */
+        if (!g_nowarn_optsize && cpu_mode != 1 && m == M_ABS && !strcmp(mn, "jmp")) {
+            int next_pc = (pc + 2) & 0xFFFF;   /* BRA is 2 bytes, not 3 */
+            int offset  = val - next_pc;
+            if (offset > 32767)  offset -= 65536;
+            if (offset < -32768) offset += 65536;
+            if (offset >= -128 && offset <= 127) {
+                char msg[ERR_LEN];
+                snprintf(msg, ERR_LEN,
+                    "JMP $%04X is within BRA range (offset %d) -- BRA saves 1 byte on 65C02",
+                    val, offset);
+                add_warning(lineno, msg);
             }
         }
         listing_capture_bytes(lrec, pc, sz);
@@ -2326,7 +2569,7 @@ static int parse_hex_range(const char *s, int *start, int *end) {
 
 static void asm_usage(FILE *out) {
     fprintf(out,
-        "asm65c02 v1.14 — Toy 65C02/6502 two-pass assembler\n"
+        "asm65c02 v1.16 — Toy 65C02/6502 two-pass assembler\n"
         "\n"
         "Copyright Vincent Crabtree 2026, MIT License, See LICENSE file\n"
         "\n"
@@ -2351,6 +2594,10 @@ static void asm_usage(FILE *out) {
         "               Same as .opt proc6502 (see below); Hard errors with a .opt\n"
         "               proc65c02 in the source, and cannot be combined with\n"
         "               -NoWarn65c02.\n"
+        "  -NoWarnOptSize Suppress size-optimization advisories (65C02 JMP-could-\n"
+        "               be-BRA, PHX/PHY/PLX/PLY/STZ peephole suggestions, plus the\n"
+        "               general CMP/CPX/CPY #0 redundancy and no-op-immediate\n"
+        "               checks). These never change emitted bytes -- info only.\n"
         "  --dump-all   Print all assembled symbols after the key-symbol table.\n"
         "  --help, -h   Print this help and exit.\n"
         "\n"
@@ -2401,6 +2648,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-NoList"))    list_on     = 0;
         else if (!strcmp(argv[i], "-NoWarn65c02")) g_nowarn65c02 = 1;
         else if (!strcmp(argv[i], "-Strict6502"))  g_strict6502  = 1;
+        else if (!strcmp(argv[i], "-NoWarnOptSize")) g_nowarn_optsize = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             asm_usage(stdout); return 0;
         }
