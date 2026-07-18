@@ -1,5 +1,5 @@
 /*
- * asm65c02.c  -  Two-pass Toy 65C02 assembler  (v1.16, Jul 2026)
+ * asm65c02.c  -  Two-pass Toy 65C02 assembler  (v1.17, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
@@ -35,6 +35,11 @@
  *                   be-BRA, PHX/PHY/PLX/PLY/STZ peephole suggestions, plus the
  *                   general CMP/CPX/CPY #0 redundancy and no-op-immediate
  *                   checks). These never change emitted bytes -- info only.
+ *   -D NAME         Predefine NAME as 1 for use with .IF NAME, as if
+ *                   "NAME = 1" appeared before the source file. Repeatable.
+ *   -D NAME=EXPR    Predefine NAME as EXPR (decimal, $hex, %binary, etc).
+ *                   Earlier -D flags on the same command line are visible
+ *                   to later ones, e.g. -D A=1 -D B=A+1.
  *   --dump-all      Print every assembled symbol sorted by address.  
  *   --help, -h      Print this help and exit.
  *
@@ -70,6 +75,10 @@
 
  /*
  *  VERSION HISTORY
+ *
+ * v1.17 (2026-07)
+ *   - Added -D NAME / -D NAME=EXPR command-line predefines, for use with
+ *     .IF NAME. Predefines are injected directly into the symbol table before Pass 1.
  *
  * v1.16 (2026-07)
  *   - Added target-agnostic size-optimization advisories for redundant zero-comparisons and unconditional no-ops.
@@ -568,6 +577,83 @@ static char reg_reflected_by(const char *mn) {
         !strcmp(mn,"dey") || !strcmp(mn,"ply"))
         return 'Y';
     return 0;
+}
+
+/* ── v1.17: -D command-line predefines ──────────────────────────────────── */
+/*
+ * cli_predefines[] / n_cli_predefines:
+ *   Populated by -D NAME[=EXPR] command-line arguments, in BOTH this
+ *   file's own main() (ASM65C02_MAIN) and sim65c02.c's main() (same
+ *   translation unit via #include "asm65c02.c" -- see the file header).
+ *   CLI-set-once, same lifetime as g_nowarn65c02/g_strict6502/
+ *   g_nowarn_optsize: never touched again after argument parsing.
+ *
+ *   Existence, not just injection order, is why this needs its own
+ *   array rather than just calling sym_set() once at CLI-parse time and
+ *   leaving it at that: assemble() resets syms[]/nsyms to empty on
+ *   EVERY call (see "nsyms = 0; ..." below), so anything placed in
+ *   syms[] before that point would be wiped out immediately. This list
+ *   is what survives; assemble() re-applies it right after its own
+ *   reset, before pass 1 begins.
+ *
+ *   Why THIS point, specifically, and not e.g. as a synthetic
+ *   "NAME = value" line prepended to the source text: .IF's design
+ *   (see the .IF header comment) evaluates its condition with
+ *   eval_expr(..., pass2=1, ...) during pass 1, which hard-errors on
+ *   any symbol not yet "fully and finally resolved" -- so a -D symbol
+ *   needs to already be sitting in syms[] before pass 1 starts scanning
+ *   the file, exactly like a plain equate written before the .IF. That
+ *   is exactly what happens here. Prepending source text would also
+ *   have worked semantically, but would have shifted every line number
+ *   in every error/warning message by however many -D flags were
+ *   given; injecting directly into syms[] adds no lines at all.
+ */
+#define MAX_PREDEFINES 64
+typedef struct { char name[SYM_NAME_LEN]; int value; } PreDefine;
+static PreDefine cli_predefines[MAX_PREDEFINES];
+static int       n_cli_predefines = 0;
+
+/*
+ * asm_predefine (v1.17)
+ *   In:  arg -- text after "-D", either "NAME" or "NAME=EXPR"
+ *   Out: 1 on success, 0 if NAME is not a valid identifier, the table
+ *        is full, or EXPR fails to evaluate. Callers should treat 0 as
+ *        a fatal CLI-argument error, matching how other malformed
+ *        arguments are already handled in both main()s.
+ *
+ *   With no "=EXPR", NAME defaults to 1 (truthy) -- the usual C
+ *   -DFLAG convention, matching .IF's plain `!= 0` truthiness check.
+ *   EXPR is evaluated immediately, against syms[] as it stands right
+ *   now (empty, unless earlier -D flags on the same command line
+ *   already populated it) -- so "-D A=1 -D B=A+1" resolves left to
+ *   right, but EXPR can never reference anything defined in the source
+ *   file itself, since that hasn't been read yet.
+ */
+static int asm_predefine(const char *arg) {
+    const char *eq = strchr(arg, '=');
+    int namelen = eq ? (int)(eq - arg) : (int)strlen(arg);
+    if (namelen <= 0 || namelen >= SYM_NAME_LEN) return 0;
+    char name[SYM_NAME_LEN];
+    memcpy(name, arg, (size_t)namelen);
+    name[namelen] = '\0';
+    if (!is_ident_start(name[0])) return 0;
+    for (int i = 1; i < namelen; i++)
+        if (!is_ident(name[i])) return 0;
+
+    int value = 1;
+    if (eq) {
+        int e = 0;
+        value = eval_expr(eq + 1, 0, 1, &e);
+        if (e) return 0;
+    }
+    if (n_cli_predefines >= MAX_PREDEFINES) return 0;
+    strncpy(cli_predefines[n_cli_predefines].name, name, SYM_NAME_LEN-1);
+    cli_predefines[n_cli_predefines].name[SYM_NAME_LEN-1] = '\0';
+    cli_predefines[n_cli_predefines].value = value;
+    n_cli_predefines++;
+    sym_set(name, value);   /* visible to any later -D on this same
+                              * command line right away */
+    return 1;
 }
 
 /* helper: find rightmost binary operator outside parentheses at given level */
@@ -1611,6 +1697,14 @@ static int assemble(const char *source) {
     memset(mem, 0, sizeof(mem));
     memset(mem_written, 0, sizeof(mem_written));
     nsyms = 0; nerrors = 0; nwarnings = 0; nlines = 0; nlisting = 0;
+
+    /* v1.17: re-apply -D command-line predefines -- syms[] was just
+     * wiped above by nsyms=0, so this has to happen every assemble()
+     * call, not just once at CLI-parse time. See cli_predefines[]'s
+     * header comment for why this happens here (before pass 1) rather
+     * than as prepended source text. */
+    for (int i = 0; i < n_cli_predefines; i++)
+        sym_set(cli_predefines[i].name, cli_predefines[i].value);
     g_scope[0] = '\0';
     cpu_mode = 0;   /* default: 65C02 mode */
     asm_stats.first_opcode_pc = -1;
@@ -2491,7 +2585,7 @@ static int parse_hex_range(const char *s, int *start, int *end) {
 
 static void asm_usage(FILE *out) {
     fprintf(out,
-        "asm65c02 v1.16 - Toy 65C02/6502 two-pass assembler\n"
+        "asm65c02 v1.17 - Toy 65C02/6502 two-pass assembler\n"
         "\n"
         "Copyright Vincent Crabtree 2026, MIT License, See LICENSE file\n"
         "\n"
@@ -2520,6 +2614,14 @@ static void asm_usage(FILE *out) {
         "               be-BRA, PHX/PHY/PLX/PLY/STZ peephole suggestions, plus the\n"
         "               general CMP/CPX/CPY #0 redundancy and no-op-immediate\n"
         "               checks). These never change emitted bytes -- info only.\n"
+        "  -D NAME      Predefine NAME as 1, as if 'NAME = 1' appeared before the\n"
+        "               start of the source file -- for use with .IF NAME. May be\n"
+        "               repeated.\n"
+        "  -D NAME=EXPR Predefine NAME as EXPR (any expression this assembler\n"
+        "               already understands: decimal, $hex, %%binary, +-*/ etc).\n"
+        "               Earlier -D flags on the same command line are visible to\n"
+        "               later ones, e.g. -D A=1 -D B=A+1. EXPR can never reference\n"
+        "               anything defined in the source file itself.\n"
         "  --dump-all   Print all assembled symbols after the key-symbol table.\n"
         "  --help, -h   Print this help and exit.\n"
         "\n"
@@ -2571,6 +2673,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-NoWarn65c02")) g_nowarn65c02 = 1;
         else if (!strcmp(argv[i], "-Strict6502"))  g_strict6502  = 1;
         else if (!strcmp(argv[i], "-NoWarnOptSize")) g_nowarn_optsize = 1;
+        else if (!strcmp(argv[i], "-D")) {
+            if (i+1 >= argc) { fprintf(stderr, "-D requires an argument (NAME or NAME=EXPR)\n"); return 1; }
+            if (!asm_predefine(argv[++i])) {
+                fprintf(stderr, "Invalid -D argument: '%s' (expected NAME or NAME=EXPR)\n", argv[i]);
+                return 1;
+            }
+        }
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             asm_usage(stdout); return 0;
         }
