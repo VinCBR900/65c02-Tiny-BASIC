@@ -1,162 +1,9 @@
 /*
- * asm65c02.c - Two-pass Toy 65C02 assembler  (v1.16, Jul 2026)
+ * asm65c02.c  -  Two-pass Toy 65C02 assembler  (v1.16, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
  * Also used as an embedded assembler inside sim65c02.c (included directly).
- *
- * Changelog & Version History (Newest First)
- *
- * v1.16 (Jul 2026) — General (6502+65C02) Redundant-Comparison Advisories
- *   - ADDED: Two more advisory-only Pass 2 warnings, unlike v1.15's these
- *     are NOT gated by cpu_mode -- they apply equally to a 6502 or 65C02
- *     target, since none of them use a 65C02-only opcode:
- *       - CMP #0 / CPX #0 / CPY #0 immediately after an instruction that
- *         already leaves N/Z reflecting A/X/Y (lda/adc/sbc/and/ora/eor/
- *         txa/tya/pla for A; ldx/tax/inx/dex/plx for X; ldy/tay/iny/dey/
- *         ply for Y) is redundant and can be deleted outright (saves 2
- *         bytes, not just shortened). Same strict-adjacency and label
- *         rules as v1.15's two-instruction checks: deliberately
- *         conservative, so ANY intervening instruction -- even a
- *         flag-preserving one like STA -- resets the tracked state,
- *         trading a few missed opportunities for not needing a second
- *         "does this opcode touch N/Z" table alongside reg_reflected_by().
- *       - AND #$FF, ORA #$00, EOR #$00 are unconditional no-ops (true
- *         identity operations for any value of A) regardless of context,
- *         so no adjacency tracking is needed for these -- checked
- *         directly off oper.value once parse_operand() has resolved it.
- *   - Deliberately NOT added: CMP #$80 before BPL/BMI. Unlike CMP #0,
- *     this is not a redundant flag test -- N after CMP #imm reflects
- *     bit 7 of (A - imm), so CMP #$80 tests "is A < $80" (unsigned), a
- *     real and intentional pattern, not a leftover comparison that can
- *     be deleted. Also not added: the .byte $2C (BIT abs) branch-skip
- *     trick for eliminating a merge-back branch/jump between two 2-byte
- *     paths. Real technique, but out of scope here: detection needs a
- *     3-4 line structural match (not a simple adjacency check), it
- *     restructures control flow rather than substituting an equivalent
- *     instruction, and BIT abs performs a genuine memory read that can
- *     have side effects on memory-mapped hardware the assembler has no
- *     way to know about (e.g. a status-register read-to-clear on some
- *     targets) -- a materially different risk than every other
- *     suggestion here, all of which are true instruction-for-
- *     instruction equivalences with no such caveat.
- *   - Still governed by the same -NoWarnOptSize flag as v1.15.
- *
- * v1.15 (Jul 2026) — 65C02 Size-Optimization Advisories
- *   - ADDED: Advisory-only Pass 2 warnings (add_warning(), never affect
- *     emitted bytes) for a few common instruction sequences that have a
- *     shorter 65C02-only equivalent:
- *       - Unconditional absolute JMP whose target is within a signed
- *         byte of the next instruction -> BRA saves 1 byte. Reuses the
- *         same offset math as the existing M_REL branch-range check.
- *       - TXA+PHA -> PHX, TYA+PHA -> PHY, PLA+TAX -> PLX, PLA+TAY -> PLY
- *         (each saves 1 byte).
- *       - LDA #0 + STA <addr> -> STZ <addr> (saves up to 2 bytes);
- *         skipped when the STA operand is indirect or Y-indexed, since
- *         STZ doesn't support those addressing modes.
- *   - The two-instruction checks require the pair to be strictly
- *     adjacent with nothing between them: a label on the SECOND
- *     instruction, or any bare label-only/directive line in between,
- *     suppresses the suggestion, since something may jump directly into
- *     the second instruction and skip the first. A label on the FIRST
- *     instruction of a pair does not suppress it.
- *   - Gated off entirely for a strict 6502 target (cpu_mode==1), since
- *     none of these opcodes exist there. New -NoWarnOptSize CLI flag
- *     suppresses just these advisories, independent of -NoWarn65c02 and
- *     -Strict6502 (which control source portability, a different
- *     concern from code size on a fixed 65C02 target).
- *
- * v1.14 (Jul 2026) — Undefined Symbol Detection in Instruction Operands
- *   - FIXED: A Pass 2 reference to an undefined symbol in an instruction
- *     operand (e.g. `JSR MISTYPED_LABEL`) was silently evaluated as 0
- *     instead of raising an assembly error, so the instruction assembled
- *     against address $0000 with no diagnostic at all. Root cause: eval_expr()
- *     correctly set its *err flag on an undefined Pass 2 symbol, but the
- *     `ev()` convenience wrapper used by parse_operand() — the path behind
- *     every plain instruction operand (LDA/JSR/STA/JMP/branches/indexed/
- *     indirect forms) — discarded that flag instead of reporting it.
- *   - `ev()` and `parse_operand()` now take a `lineno` parameter so `ev()`
- *     can call add_error() itself when a Pass 2 symbol lookup fails, the
- *     same way `.word`/`.byte`/BBR/BBS operand evaluation already did.
- *   - Legitimate forward references (a label defined later in the same
- *     file) are unaffected: `eval_expr()` only raises *err when pass2==1,
- *     exactly as before.
- *
- * v1.13 (Jul 2026) — Forward-Referenced .ORG Correction
- *   - FIXED: Stale address baking for code labels inside `.ORG <compound-equate>` 
- *     blocks when the base equate expression contained a forward reference.
- *   - ADDED: Pass 1.75 intermediate phase, executed between Pass 1.5 equate 
- *     re-resolution and Pass 2 emission, to re-walk `pc_map[]` and re-evaluate 
- *     `.ORG` operands with fully-resolved symbols.
- *   - PC deltas are now dynamically propagated into subsequent `pc_map` entries 
- *     and code-label symbol values, ensuring correct address resolution regardless 
- *     of forward/backward reference order.
- *
- * v1.12 (Jul 2026) — Expression Parsing Correction
- *   - FIXED: Reordered `eval_expr()` parsing sequence to scan for binary and 
- *     comparison operators before checking atoms, resolving expression truncation 
- *     bugs on literal-first inputs (e.g., "$10+$20" truncating to $10).
- *   - Relocated the unary minus evaluator directly into the atom processing block.
- *
- * v1.11 (Jul 2026) — Conditional Assembly
- *   - ADDED: Support for conditional assembly directives (.IF expr, .ELSE, .ENDIF) 
- *     following Kowalski conventions, supporting up to 16 nesting levels.
- *   - ADDED: Equality (==) and inequality (!=) comparison operators to `eval_expr()`.
- *   - Conditions are evaluated exactly once during Pass 1; forward-referenced 
- *     symbols within a conditional block trigger a hard error by design.
- *   * Note: Include file expansion (.INCLUDE) runs prior to conditional checking; 
- *     files within unexecuted conditional blocks are still processed.
- *
- * v1.10 (Jul 2026) — Directive Aliasing
- *   - ADDED: Support for the .RS storage reservation directive as a recognized alias 
- *     for .RES, fully integrated across pass sizing, emission, and listing pipelines.
- *
- * v1.9 (Jul 2026) — Audit Pass & Syntax Regression Fixes
- *   - ADDED: M_IND_X (zp,X) and M_IND_ABSX JMP (abs,X) addressing modes.
- *   - ADDED: Missing absolute indexed opcode mappings across ADC, CMP, SBC, AND, 
- *     EOR, ORA, ASL, LSR, ROL, ROR, DEC, INC, and LDY instruction groups.
- *   - Integrated TSB, TRB, and STZ abs,X ($9E) into the master OPTAB.
- *   - ADDED: Rockwell/WDC bit extensions: BBR0-7/BBS0-7 (zp,target) and RMB0-7/SMB0-7 (zp).
- *   - ADDED: Core file directives: .INCLUDE (depth-capped) and .INCBIN.
- *   - Assembling 65C02 opcodes outside of explicit target scopes now throws a warning.
- *   - ADDED: CLI flags: -NoWarn65c02 (suppress warnings) and -Strict6502 (warnings become errors).
- *   - Updated cpu_mode to tri-state; Pass 2 now explicitly resets target mode context.
- *   - FIXED: Explicit widths (e.g., $0000) now correctly force absolute addressing modes.
- *   - FIXED: LDX zp,Y entry corrected from mis-mapped M_ZPX ($96) to M_ZPY ($B6).
- *   - FIXED: Post-error diagnostic listings are now gated on successful assembly (ok==1).
- *   * Note: STP ($DB) and WAI ($CB) remain explicitly out of scope.
- *
- * v1.8 — Correctness & Compatibility Pass
- *   - FIXED: Explicit "A" operands (e.g., INC A) are now properly parsed as M_ACC.
- *   - FIXED: has_undef() now skips literal prefixes ($, %%, decimal), preventing hex digits 
- *     A-F in literals from being falsely evaluated as undefined forward symbols.
- *   - FIXED: Enforced consistent PC masking across all emissions and labels; integrated 
- *     check_pc_overflow() to convert image-wrapping faults into hard assembly errors.
- *   - FIXED: Resolved potential C undefined behavior by adding explicit NULL checks in derive_lst_path().
- *
- * v1.7 — Listing Output
- *   - Enabled sidecar .LST listing file generation by default.
- *   - Added -NoList CLI switch to suppress listing generation.
- *
- * v1.6 — CPU Target Switching
- *   - Added target control directives: .opt proc6502 / .opt proc65c02 and .setcpu.
- *   - In strict 6502 mode, the assembler flags all 65C02-specific opcodes, accumulator 
- *     syntax variations, immediate BIT modes, and no-index indirect zero-page modes as errors.
- *
- * v1.5 — CLI Refresh
- *   - Added -o <file> for custom output names and -r $HHHH-$HHHH for binary range extraction.
- *   - Enforced strict command-line parsing to explicitly reject unknown arguments.
- *   - Implemented the AsmStats tracking structure for transparent size reporting.
- *
- * v1.4 — Opcode Correction
- *   - Added the missing SED opcode ($F8, Set Decimal Mode) to the master instruction table.
- *
- * v1.3 — Forward-Reference Sizing
- *   - Any Pass 1 expression containing an undefined or forward symbol now automatically 
- *     forces absolute addressing modes (ABS/ABSX/ABSY) to safely guarantee size constraints.
- *
- * v1.2 — Stack Protection
- *   - Converted source_copy[] allocation to static, preventing a 1MB stack overflow crash on Windows.
  *
  * Build (standalone):
  *   gcc -O2 -DASM65C02_MAIN -o asm65c02 asm65c02.c
@@ -175,17 +22,20 @@
  *                   Errors go to stderr.  Used internally by sim65c02.
  *   -o <file>       Write binary image to <file> (avoids stdout/binary issues on Win32).
  *   -r $HHHH-$HHHH  Limit binary output to address range (requires --binary or -o).
- *   -NoList        Suppress default sidecar .LST listing generation.
  *                   Preferred ROM extraction examples:
  *                     uBASIC (2 KB at $F800):   -r $F800-$FFFF
  *                     4K BASIC (4 KB at $F000): -r $F000-$FFFF
+ *   -NoList         Suppress default sidecar .LST listing generation.
  *   -NoWarn65c02    Suppress the default warning issued whenever a 65C02-only
  *                   instruction is assembled in default (65C02) CPU mode.
  *   -Strict6502     Treat every 65C02-only instruction as a hard error even in
  *                   default (65C02) CPU mode, without needing .opt proc6502 in
  *                   the source. Overrides -NoWarn65c02 if both are given.
- *   --dump-all      After the key-symbol table, print every assembled symbol
- *                   sorted by address.  Useful for detailed size analysis.
+ *   -NoWarnOptSize  Suppress size-optimization advisories (65C02 JMP-could-
+ *                   be-BRA, PHX/PHY/PLX/PLY/STZ peephole suggestions, plus the
+ *                   general CMP/CPX/CPY #0 redundancy and no-op-immediate
+ *                   checks). These never change emitted bytes -- info only.
+ *   --dump-all      Print every assembled symbol sorted by address.  
  *   --help, -h      Print this help and exit.
  *
  * Supported syntax (Kowalski-compatible subset):
@@ -213,7 +63,79 @@
  *                <lo-byte  >hi-byte  + - * /  == !=  ( )
  *                (== and != are for .IF conditions; lowest precedence)
  *   Comments   : ; to end of line
+ *   Files      : .INCLUDE "file", .INCBIN "file" - splice in text/binary file at location.
+ *                NOTE: File expansion (.INCLUDE) runs prior to conditional checking; 
+ *                files within unexecuted conditional blocks are still processed.
+ */
+
+ /*
+ *  VERSION HISTORY
  *
+ * v1.16 (2026-07)
+ *   - Added target-agnostic size-optimization advisories for redundant zero-comparisons and unconditional no-ops.
+ *   - Documented intentional exclusions for non-redundant comparisons and branch-skip techniques.
+ *   - Gated the new advisories behind the existing -NoWarnOptSize flag.
+ *
+ * v1.15 (2026-07)
+ *   - Added 65C02-specific size-optimization advisories for common instruction sequences with shorter equivalents.
+ *   - Enforced strict adjacency requirements to safely suppress warnings across labeled entry points.
+ *  - Added the -NoWarnOptSize CLI flag to optionally suppress size-optimization warnings.
+ *
+ * v1.14 (2026-07)
+ *   - Fixed a bug where undefined symbols in instruction operands were silently evaluated as zero instead of raising an error.
+ *
+ * v1.13 (2026-07)
+ *   - Fixed stale address resolution for .ORG blocks containing forward references.
+ *   - Added an intermediate assembly pass to correctly propagate PC deltas and forward-referenced symbol values.
+ *
+ * v1.12 (2026-07)
+ *   - Fixed an expression-evaluator bug that incorrectly truncated literal-first expressions.
+ *   - Refactored unary minus evaluation for improved reliability.
+ *
+ * v1.11 (2026-07)
+ *   - Added support for conditional assembly directives (.IF, .ELSE, .ENDIF) with up to 16 levels of nesting.
+ *   - Added equality and inequality operators to the expression evaluator.
+ *   - Restricted conditional evaluation to Pass 1, explicitly disallowing forward-referenced symbols.
+ *
+ * v1.10 (2026-07)
+ *   - Added support for the .RS directive as an alias for .RES.
+ *
+ * v1.9 (2026-07)
+ *   - Added missing 6502 and 65C02 addressing modes and opcode mappings.
+ *   - Added Rockwell/WDC bit-manipulation extensions (BBR/BBS, RMB/SMB).
+ *   - Added .INCLUDE and .INCBIN core file directives.
+ *   - Added -NoWarn65c02 and -Strict6502 CLI flags for target-mode compliance.
+ *   - Fixed explicit operand widths to correctly force absolute addressing.
+ *   - Fixed an incorrect opcode mapping for LDX zp,Y.
+ *   - Suppressed diagnostic listings on assembly failure.
+ *
+ * v1.8
+ *   - Fixed parsing of explicit accumulator operands.
+ *   - Fixed a bug where hex literals were incorrectly evaluated as undefined forward symbols.
+ *   - Enforced consistent PC masking and added strict memory-overflow detection.
+ *   - Fixed potential C undefined behavior in listing-path generation.
+ *
+ * v1.7
+ *   - Enabled automatic listing file generation by default.
+ *   - Added the -NoList CLI flag to suppress listing generation.
+ *
+ * v1.6
+ *   - Added target-CPU control directives (.opt and .setcpu).
+ *   - Added a strict 6502 mode to flag 65C02-specific opcodes and syntax as errors.
+ *
+ * v1.5
+ *   - Added custom output naming (-o) and binary range extraction (-r) flags.
+ *   - Enforced strict command-line argument parsing.
+ *   - Added internal statistics tracking for source size reporting.
+ *
+ * v1.4
+ *   - Added the missing SED opcode to the master instruction table.
+ *
+ * v1.3
+ *   - Forced absolute addressing modes for expressions containing forward references to safely guarantee size constraints.
+ *
+ * v1.2
+ *   - Fixed a Windows-specific stack overflow crash by converting the source buffer to static allocation.
  */
 
 #include <stdio.h>
@@ -2569,7 +2491,7 @@ static int parse_hex_range(const char *s, int *start, int *end) {
 
 static void asm_usage(FILE *out) {
     fprintf(out,
-        "asm65c02 v1.16 — Toy 65C02/6502 two-pass assembler\n"
+        "asm65c02 v1.16 - Toy 65C02/6502 two-pass assembler\n"
         "\n"
         "Copyright Vincent Crabtree 2026, MIT License, See LICENSE file\n"
         "\n"
