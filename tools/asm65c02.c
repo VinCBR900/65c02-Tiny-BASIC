@@ -1,5 +1,5 @@
 /*
- * asm65c02.c  -  Two-pass Toy 65C02 assembler  (v1.17, Jul 2026)
+ * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.17, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *

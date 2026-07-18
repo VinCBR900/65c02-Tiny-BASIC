@@ -1,11 +1,13 @@
 /*
- * sim65c02.c  —  Toy 65C02 simulator  (v10, Jul 2026)
+ * sim65c02.c  —  Toy 65C02 simulator  (v11, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
  * Canonical simulator for:
- *   ubasic.asm    uBASIC     (2 KB ROM at $F800-$FFFF)
- *   4kbasic.asm   4K BASIC   (4 KB ROM at $F000-$FFFF)
+ *   ubasic6502.asm       uBASIC     (2 KB ROM at $F800-$FFFF)
+ *   miniBASIC65c02.asm   4K BASIC   (4 KB ROM at $F000-$FFFF)
+ *
+ * Reset vector at $FFFC/$FFFD is used to set the initial PC on startup.
  *
  * Build (requires asm65c02.c in the same directory):
  *   gcc -O2 -o sim65c02 sim65c02.c
@@ -42,27 +44,36 @@
  *                      Repeatable.\n"
  *   -m 0xADDR LEN      Dump LEN bytes from address to stderr at exit/halt.
  *                      Up to 4 -m options.
+ *   -D NAME            Predefine NAME as 1 for the assembler's .IF directive,
+ *                      as if "NAME = 1" appeared before the source file.
+ *                      Only applies to a .asm input -- ignored (with a
+ *                      warning) if given with a .bin file. Repeatable.
+ *   -D NAME=EXPR       Predefine NAME as EXPR (decimal, $hex, %binary, etc).
+ *                      Earlier -D flags on the same command line are
+ *                      visible to later ones, e.g. -D A=1 -D B=A+1 but not code.
  *   --help             Print this help and exit.
  *
- * Typical invocations:
- *   ./sim65c02 ubasic13.asm --input "PRINT 42"
- *   ./sim65c02 4kbasic_v7.asm --input "NEW" --input "10 PRINT 1+1" --input "RUN"
- *   ./sim65c02 ubasic13.bin --load-addr 0xF800 --input "PRINT 42"
+ * TYPICAL INVOCATION
+ *
+ *   ./sim65c02 ubasic.asm --input "PRINT 42"
+ *   ./sim65c02 minibasic.asm --input "NEW" --input "10 PRINT 1+1" --input "RUN"
+ *   ./sim65c02 ubasic.bin --load-addr 0xF800 --input "PRINT 42"
  *   ./sim65c02 ubasic.asm -w 0x08 -w 0x04 --input \"PRINT 1\" -m 0x08 2
- *   ./sim65c02 4kbasic_v7.asm < test_script.txt
+ *   ./sim65c02 minibasic.asm < test_script.txt
  *       (test_script.txt is a plain text file of BASIC lines/commands, one
- *        per line, exactly as you'd type them -- see "Input source" below.
- *        A script ending in a GOTO loop runs forever; Ctrl-C stops it.)
+ *        per line -- see "Input source" below.
  *
  * File types:
  *   .asm   Assembled in-process via the embedded asm65c02 assembler.
  *   .bin   Loaded as a raw binary.  Load address auto-detected from size:
- *            2048 bytes → $F800  (uBASIC v13)
- *            4096 bytes → $F000  (4K BASIC v11)
+ *            2048 bytes → $F800  (uBASIC)
+ *            4096 bytes → $F000  (miniBASIC)
  *           65536 bytes → verbatim full-image load
- *           other size   → placed at top of 64 KB (0x10000 - size)
+ *           other size  → placed at top of 64 KB (0x10000 - size)
  *          Override with --load-addr if needed.
  *
+ * NOTES
+ * 
  * Kowalski virtual I/O ports:
  *   $E000  write  TERMINAL_CLS    clear screen (ANSI ESC[2J + home)
  *   $E001  write  PUTCH           character output to stdout (configurable,
@@ -74,22 +85,17 @@
  *   $E007  write  IO_IRQ          any write triggers a maskable hardware IRQ
  *
  * GETCH/PUTCH addresses and idle-exhaustion detection (v8):
- *   GETCH ($E004 by default) and PUTCH ($E001 by default) are plain
- *   configured memory addresses -- intercepted directly by rd()/wr() --
- *   not detected or scanned for in any way. Override with --getch-addr/
- *   --putch-addr for a ROM that maps these ports elsewhere. This works
- *   identically whether the image came from assembling a .asm source or
- *   loading a raw .bin (there is no dependency on symbols or on any
- *   particular polling-loop code shape).
+ *   GETCH ($E004 by default) and PUTCH ($E001 by default) are intercepted
+ *   to emulate character IO. Override with --getch-addr and --putch-addr 
+ *   to map elsewhere, regardless of ASM or bin file.
  *
  *   Idle-exhaustion: every read of the GETCH address that finds no
  *   character available (queued-buffer empty, or stdin at EOF in live
  *   mode -- see below) increments a counter (reset to 0 the moment a
  *   real character is returned); once that counter passes 50 000
  *   consecutive empty reads, the simulator concludes input is exhausted
- *   and terminates gracefully. This check is itself skipped when
- *   --maxcycles 0 is given (see --maxcycles above) -- unlimited mode is
- *   unlimited, full stop, Ctrl-C is the only way out short of a program-
+ *   and terminates gracefully. This check is skipped --maxcycles 0 sets
+ *   unlimited mode is, Ctrl-C is the only way out short of a program-
  *   driven halt.
  *
  * Input source: --input queue vs. live stdin (v8):
@@ -97,43 +103,24 @@
  *   buffer is used exactly as before -- a non-blocking drain, 0 returned
  *   once empty. --input ALWAYS takes precedence when given.
  *
- *   Otherwise, GETCH reads real stdin directly: each poll performs a
- *   genuine BLOCKING fgetc(stdin), so typing is possible while the
- *   emulated program runs (a single 6502 "cycle" can take arbitrary
- *   wall-clock time waiting on you to type -- intentional). No isatty()
- *   check is made; this is attempted whether stdin is a live terminal, a
- *   pipe, or a redirected file -- which makes `sim65c02 rom.asm <
- *   script.txt` a plain, direct way to drive a batch test script: put
- *   BASIC lines/commands one per line in a text file exactly as you'd
- *   type them interactively (NEW / 10 PRINT ... / RUN / etc.) and
- *   redirect it in. A terminal's Enter key (or a text file's line
- *   ending) sends LF; it's translated to CR here to match the line-
- *   ending convention the BASIC ROMs expect (the same one --input's own
- *   CR-append already uses).
+ *   A terminal's Enter key (or a text file's line ending) sends LF; 
+ *   translated to CR here to match the line-ending convention the BASIC
+ *   ROMs expect..
  *
  *   Once stdin hits EOF, every later fgetc() returns EOF immediately (no
- *   re-blocking), so the idle counter races up and the normal
- *   exhaustion path above fires shortly after -- still subject to being
- *   disabled by --maxcycles 0 like any other exhaustion. That means a
- *   redirected/piped-input run with --maxcycles 0 will busy-spin on
- *   instant EOF reads until Ctrl-C rather than exit on its own -- a
- *   known, accepted consequence of "0 means unlimited, no exceptions,"
- *   not a bug. This also applies if the script itself never ends (e.g.
- *   ends on a GOTO loop): Ctrl-C is required to stop it regardless of
- *   --maxcycles, since the program is still legitimately running, not
- *   idle-polling for input.
+ *   re-blocking), so clicks up and fires.  Hence a redirected/piped-input
+ *   with --maxcycles 0 will busy spin forever until Ctrl-C. This also
+ *   applies if the script  never ends (e.g. GOTO 10 loop) 
+ */
+
+ /*
+ * VERSION HISTORY (Newest First)
  *
- * Ctrl-C (SIGINT) handling (v8):
- *   SIGINT is caught and turned into a graceful loop exit rather than an
- *   abrupt OS-default process kill, so --stats/-m output still prints
- *   afterward. This is safe because the simulator never writes to disk
- *   during the run loop (only at startup, reading the ROM/source), so
- *   there's nothing an abrupt interruption could leave half-written.
- *
- * Reset vector at $FFFC/$FFFD is used to set the initial PC on startup.
- *
- * Version History (Newest First)
- *
+ * v11 — Conditional-Assembly Predefines
+ *   - ADDED: -D NAME / -D NAME=EXPR command-line flags, forwarded straight
+ *     into the embedded assembler typically used with .IF directive. 
+ *   - -D is a no-op for .bin files with a warning.
+ * 
  * v10 — Opcode Completeness
  *   - FIXED: Added missing execution mapping for CMP (zp) ($D2) zero-page 
  *     indirect addressing mode to align with other core arithmetic opcodes.
@@ -160,8 +147,6 @@
  *
  * v6 — UX & Documentation Refreshes
  *   - ADDED: Comprehensive inline option documentation and the --help CLI flag.
- *   - FIXED: Re-synchronized software manifest targets to reference uBASIC v13 
- *     and 4K BASIC v11 accurately.
  *
  * v5 — Toolchain Native Integration
  *   - CHANGED: Migrated the external Python assembler compilation pipeline 
@@ -914,7 +899,7 @@ static int assemble_and_load(const char *asm_path) {
 /* ── main ────────────────────────────────────────────────────────────────── */
 static void sim_usage(FILE *out) {
     fprintf(out,
-        "sim65c02 v10 — 65C02 simulator for uBASIC\n"
+        "sim65c02 v11 — 65C02 simulator for uBASIC\n"
         "\n"
         "Usage:\n"
         "  sim65c02 <file.asm | file.bin> [options]\n"
@@ -938,11 +923,19 @@ static void sim_usage(FILE *out) {
         "                     Repeatable.\n"
         "  -m 0xADDR LEN      Dump LEN bytes from address to stderr at exit/halt.\n"
         "                     Up to 4 -m options.\n"
+        "  -D NAME            Predefine NAME as 1 for the assembler's .IF directive,\n"
+        "                     as if 'NAME = 1' appeared before the source file starts.\n"
+        "                     Only applies to a .asm input -- has no effect (and warns)\n"
+        "                     if given with a .bin file, since there's no assembly\n"
+        "                     step for it to affect. Repeatable.\n"
+        "  -D NAME=EXPR       Predefine NAME as EXPR (decimal, $hex, %%binary, etc).\n"
+        "                     Earlier -D flags on the same command line are visible\n"
+        "                     to later ones, e.g. -D A=1 -D B=A+1.\n"
         "  --help             Print this help and exit.\n"
         "\n"
         "Examples:\n"
-        "  sim65c02 ubasic13.asm --input \"PRINT 42\"\n"
-        "  sim65c02 4kbasic_v7.asm --input \"NEW\" --input \"10 PRINT 1+1\" --input \"RUN\"\n"
+        "  sim65c02 uBASIC.asm --input \"PRINT 42\"\n"
+        "  sim65c02 miniBASIC.asm --input \"NEW\" --input \"10 PRINT 1+1\" --input \"RUN\"\n"
         "  sim65c02 basic.asm -w 0x08 -w 0x04 --input \"PRINT 1\" -m 0x08 2\n"
         "  echo -e \"PRINT 1+1\\r\" | sim65c02 basic.asm            (piped stdin, no --input given)\n"
         "  sim65c02 4kbasic_v7.asm < test_script.txt              (redirected test script, see below)\n"
@@ -1016,6 +1009,13 @@ int main(int argc, char **argv) {
             i+=2;
             if(ndump<MAX_DUMP && len>0){ dump_addr[ndump]=a; dump_len[ndump]=len; ndump++; }
         }
+        else if(!strcmp(argv[i],"-D")) {
+            if(i+1>=argc) { fprintf(stderr,"-D requires an argument (NAME or NAME=EXPR)\n"); return 1; }
+            if(!asm_predefine(argv[++i])) {
+                fprintf(stderr,"Invalid -D argument: '%s' (expected NAME or NAME=EXPR)\n",argv[i]);
+                return 1;
+            }
+        }
         else if(argv[i][0]!='-'){
             /* positional: .asm or .bin */
             size_t l=strlen(argv[i]);
@@ -1031,6 +1031,9 @@ int main(int argc, char **argv) {
         if(assemble_and_load(src_file)<0) return 1;
         fprintf(stderr,"[SIM] Assembly OK\n");
     } else if(bin_file){
+        if(n_cli_predefines > 0) {
+            fprintf(stderr,"[SIM] Warning: -D flag(s) ignored -- loading a raw .bin file has no assembly step for them to affect.\n");
+        }
         if(load_bin(bin_file)<0) return 1;
     } else {
         sim_usage(stderr);
