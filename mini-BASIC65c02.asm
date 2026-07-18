@@ -25,8 +25,12 @@
 ; GOSUB/GOTO accept expressions eg GOTO 100+10*B
 ;
 ; KNOWN LIMITATIONS
+; All BASIC words are matched nominally using 2 chars or 3 chars when duplicate 
+;   e.g NEW/NEXT. So PRINT "HELLO" and PROCEED "HELLO" are same, so space are
+;   Necessary g.e. PRINT TAB(5);"HELLO" works, PRINTTAB(5);"HELLO" prints '5HELLO'
+; 
 ; Number literals require a leading digit before the decimal point --
-; "0.5" works, ".5" does not (parses as 0).
+;   "0.5" works, ".5" does not (parses as 0).
 ;
 ; TAN(x) raises a ?2 (overflow) error at odd multiples of pi/2 (since TAN is
 ;   undefined there - our sin/cos identity divides by cos(x) which is 0.0).
@@ -41,7 +45,8 @@
 ;   past the limit sounds BELL ($07) but is still echoed. The excess chars
 ;   are still discarded (X stops advancing), just with an audible signal.
 ;
-; `:` Multi-statement not supported due to edge cases eg. REM Comment: GOTO 20 
+; `:` Multi-statement not supported due to edge cases eg. REM Comment: GOTO 20
+;
 ; 
 ;  FLOAT FORMAT
 ; MBF4: Byte0=biased_exp($00=zero), Byte1=sign|mant[22:16], Byte2-3=mant[15:0]
@@ -54,7 +59,7 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ;
-; v2.7 (2026-07) - ROM usage  65 bytes free.
+; v2.7 (2026-07) - ROM usage 67 bytes free.
 ;   - REFACTOR for size: Removed DEG(rad) and implemented PI function for
 ;     DEG/RAD conversion, FREE converted to function, micro-optimizations.
 ;
@@ -87,7 +92,6 @@
 ;   - OPTIMIZED: replaced JMPs with 65c02 BRAs and fixed PHY/PLY in FLT_SQRT.
 ;   - FIXED: FLT_TAN float clobbering bug by stashing sin(x) in FLIM.
 ;   - FIXED: DPTB execution path for TAN(x) to support continued expressions.
-;   - VERIFIED: asmdup.py scan performed; no changes deemed beneficial.
 ;
 ; v2.2 (Jul 2026) — Float Math & Print Optimizations
 ;   - ROM usage: 41 -> 114 bytes free.
@@ -317,8 +321,10 @@ PROG:
          .DB $BE,$00,"PRINT ",$22,"=== FREE ===",$22,$0D
 ; line 200
          .DB $C8,$00,"PRINT ",$22,"Free Mem=",$22,"; FREE",$0D
+; line 210
+         .DB 210,$00,"PRINT ",$22,"=== PI Constant 355/113 ===",$22,$0D
 ; line 220
-         .DB $DC,$00,"PRINT 355/113;",$22," PI=",$22,";PI",$0D
+         .DB $DC,$00,"PRINT 355/113;",$22," PI=",$22,";PI;",$22," Delta=",$22,";355/113-PI",$0D
 ; line 230
          .DB $E6,$00,"PRINT ",$22,"=== SIN/COS identity ===",$22,$0D
 ; line 240
