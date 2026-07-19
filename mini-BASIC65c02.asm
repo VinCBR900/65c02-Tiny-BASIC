@@ -1,22 +1,24 @@
 ; =============================================================================
-; miniBASIC 65C02 v2.7
+; miniBASIC 65C02 v2.8
+; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; 4KB Float BASIC (MBF4) for the 65C02.
 ;
 ; Statements accepted
 ;   END  FOR..TO..STEP  FREE  GOSUB  GOTO  IF..THEN  INPUT  LET  LIST [n,m]
-;   NEW  NEXT  POKE  PRINT (incl. TAB(n))  REM  RETURN  RUN
+;   NEW  NEXT  POKE  PRINT [TAB(n)][;][CHR$(n)]  REM  RETURN  RUN
+;
 ; Expressions:
 ;   + - * / %   = < > <= >= <>   unary -
-;   ABS(n)   ACOS(n)   ASIN(n)   ATN(n)   CHR$(n)   COS(rad)   FREE   
-;   PEEK(addr)   PI   RND   SIN(rad)   SQR(n)   TAN(rad)   USR(addr)
+;   ABS(flt)   ACOS(flt)   ASIN(flt)   ATN(flt)   COS(rad)   FLOOR(flt)   
+;   FREE   PEEK(addr)   PI   RND   SIN(rad)   SQR(flt)   TAN(rad)   USR(addr)
 ;   A-Z variables
 ;
 ; Numbers      : MBF4 float, ~6-7 significant decimal digits (see format below)
 ; String print : "literals", `;`, TAB(n) and CHR$() only; no string variables
 ;
 ; Trig is RADIANS-native throughout (SIN/COS/ATN/ASIN/ACOS all take/return
-; radians). DEG(rad) converts a radian value to degrees for display.
+; radians). Use PI (e.g. "X*180/PI") to convert to degrees for display.
 ;
 ; FOR/NEXT : loop variable, TO limit, and STEP are all real floats.
 ;   "FOR X = 1 TO 10 STEP 0.5" and non-integer TO bounds (e.g. "TO 10.5")
@@ -25,10 +27,7 @@
 ; GOSUB/GOTO accept expressions eg GOTO 100+10*B
 ;
 ; KNOWN LIMITATIONS
-; All BASIC words are matched nominally using 2 chars or 3 chars when duplicate 
-;   e.g NEW/NEXT. So PRINT "HELLO" and PROCEED "HELLO" are same, so space are
-;   Necessary g.e. PRINT TAB(5);"HELLO" works, PRINTTAB(5);"HELLO" prints '5HELLO'
-; 
+;
 ; Number literals require a leading digit before the decimal point --
 ;   "0.5" works, ".5" does not (parses as 0).
 ;
@@ -45,8 +44,8 @@
 ;   past the limit sounds BELL ($07) but is still echoed. The excess chars
 ;   are still discarded (X stops advancing), just with an audible signal.
 ;
-; `:` Multi-statement not supported due to edge cases eg. REM Comment: GOTO 20
-;
+; TAB(n) and CHR$(n) are only valid on a PRINT line. Both accept expressions but
+;   TAB prints n spaces, not jumps to column n. 
 ; 
 ;  FLOAT FORMAT
 ; MBF4: Byte0=biased_exp($00=zero), Byte1=sign|mant[22:16], Byte2-3=mant[15:0]
@@ -59,9 +58,14 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ;
-; v2.7 (2026-07) - ROM usage 67 bytes free.
-;   - REFACTOR for size: Removed DEG(rad) and implemented PI function for
-;     DEG/RAD conversion, FREE converted to function, micro-optimizations.
+; v2.8 (2026-07) - ROM usage: 62 -> 68 bytes free (6 bytes saved).
+;   - Refactored MTCHKW & FN_DISPATCH to check for Bit 7 signal for 0 or 1 ARG
+;     Function, refactored RND/PI/FREE into FN_TAB to save a little space.
+;     Added FLOOR(flt) function which rounds down.
+;
+; v2.7WIP (2026-07) - ROM usage: 76 -> 62 bytes free.
+;   - Removed DEG, added PI and converted FREE to function form but
+;     broke due to adding to FN_TAB which expects ARG, consuming CR terminator.
 ;
 ; v2.6 (2026-07)
 ;   - Fixed a spurious division-by-zero error in ASIN() and ACOS() when evaluating 1 or -1.
@@ -322,9 +326,9 @@ PROG:
 ; line 200
          .DB $C8,$00,"PRINT ",$22,"Free Mem=",$22,"; FREE",$0D
 ; line 210
-         .DB 210,$00,"PRINT ",$22,"=== PI Constant 355/113 ===",$22,$0D
+         .DB 210,$00,"PRINT ",$22,"=== PI constant ===",$22,$0D
 ; line 220
-         .DB $DC,$00,"PRINT 355/113;",$22," PI=",$22,";PI;",$22," Delta=",$22,";355/113-PI",$0D
+         .DB $DC,$00,"PRINT 355/113;",$22,"=355/113 PI=",$22,";PI;",$22," Delta=",$22,";355/113-PI",$0D
 ; line 230
          .DB $E6,$00,"PRINT ",$22,"=== SIN/COS identity ===",$22,$0D
 ; line 240
@@ -465,7 +469,7 @@ SHOWCASE_END: ; audit
 
          .ORG $F000
 STR_PAGE = >STR_BANNER
-STR_BANNER: .DB "miniBASIC 65C02 v2.7"
+STR_BANNER: .DB "miniBASIC 65C02 v2.8"
 STR_CRLF:   .DB $0D,$8A
 STR_IN:     .DB " IN",$A0
 STR_BREAK:  .DB $0D,$0A,"BREA",$CB
@@ -487,7 +491,9 @@ KW_LET:    .DB "LE"
 KW_THEN:   .DB "TH"
 KW_CHRS:   .DB "CH"
 KW_POKE:   .DB "PO"
-KW_FREE:   .DB "FR"
+KW_FREE:   .DB "F",$D2         ; "FR" with bit7 set on 'R' -- flags FREE as a
+                                ; 0-arg keyword for MTCHKW/FN_DISPATCH (real
+                                ; ASCII letters never set bit7, so it's free)
 KW_PEEK:   .DB "PE"
 KW_USR:    .DB "US"
 KW_SIN:    .DB "SI"
@@ -496,13 +502,14 @@ KW_FOR:    .DB "FO"
 KW_TO:     .DB "TO"
 KW_STEP:   .DB "ST"
 KW_ABS:    .DB "AB"
-KW_RND:    .DB "RN"
+KW_RND:    .DB "R",$CE         ; "RN" with bit7 set on 'N' -- 0-arg flag
 KW_TAB:    .DB "TA"             
 KW_SQR:    .DB "SQ"
 KW_ATN:    .DB "AT"
 KW_ASIN:   .DB "AS"
 KW_ACOS:   .DB "AC"
-KW_PI:     .DB "PI"
+KW_PI:     .DB "P",$C9         ; "PI" with bit7 set on 'I' -- 0-arg flag
+KW_FLOOR:  .DB "FL"
 
 ; =============================================================================
 ; INIT  --  cold start
@@ -973,6 +980,20 @@ RND_SHUFFLE:
          EOR #$B4
          STA RND_SEED+1
 RS_SK:   RTS
+
+; =============================================================================
+; DO_FREE  --  FREE Memory function - returns free bytes
+;   In:  PE = current program end
+;   Clobbers: A, T0
+; =============================================================================
+DO_FREE: SEC
+         LDA #<RAM_TOP
+         SBC PE
+         STA T0
+         LDA #>RAM_TOP
+         SBC PE+1
+         STA T0+1
+         JMP FLT_FROM_INT
 
 ; =============================================================================
 ; DO_PRINT  --  PRINT statement
@@ -1489,20 +1510,6 @@ E1DV:    JSR FLT_DIV
          BRA E1L
 
 ; =============================================================================
-; DO_FREE  --  FREE Memory function - returns free bytes
-;   In:  PE = current program end
-;   Clobbers: A, T0
-; =============================================================================
-DO_FREE: SEC
-         LDA #<RAM_TOP
-         SBC PE
-         STA T0
-         LDA #>RAM_TOP
-         SBC PE+1
-         STA T0+1
-         JMP FLT_FROM_INT
-
-; =============================================================================
 ; EXPR2  --  atom level: parenthesised expr, unary +/-, CHR$/PEEK/USR/SIN/COS
 ;            function call, numeric literal, or A-Z variable
 ;
@@ -1521,39 +1528,17 @@ E2NP2:
          BRA E2NG
 E2NNG:   CMP #'+'
          BEQ E2PS
-E2NFN:   JSR FN_DISPATCH        ; Check for Functions FN_TAB that use a parameter
-;                    ; no match: A match tail-jumps into the handler and never returns here
-E2NRND2: LDA #<KW_RND
-         JSR MTCHKW
-         BCS E2NPI
-DO_RND:         
-         JSR RND_SHUFFLE
-         LDA RND_SEED
-         STA T0
-         LDA RND_SEED+1
-         AND #$7F              ; force positive (0-32767 range)
-         STA T0+1
-         JSR FLT_FROM_INT
-         LDX #IDX_32768
-         JSR FLT_LDCONST_B
-         JMP FLT_DIV           ; RND() = LFSR value / 32768, so 0 <= x < 1
-
-E2NPI:   LDA #<KW_PI           ; PI/FREE take no argument -- matched directly
-         JSR MTCHKW            ; like RND above, NOT through FN_TAB/EAT_PAREN
-         BCS E2NFREE           ; EAT_PAREN eat whatever follows, corrupting IP
-         JMP FLT_PI                ; fake parenthesized arg, corrupting IP --
-
-E2NFREE: LDA #<KW_FREE               ; see CHANGE HISTORY)
-         JSR MTCHKW
-         BCC DO_FREE
-
+E2NFN:   JSR FN_DISPATCH        ; ABS/SQR/SIN/COS/ATN/ASIN/ACOS/TAN/PEEK/USR/
+                                 ; RND/PI/FREE (all via FN_TAB now -- RND/PI/
+                                 ; FREE's KW_ entries carry the 0-arg flag,
+                                 ; see MTCHKW). Falls through to E2ND (numeric
+                                 ; literal) only if NO entry matches at all.
 E2ND:    LDA (IP)
          CMP #'0'
          BCC E2VR
          CMP #'9'+1
          BCS E2VR
          JMP FLT_PARSE
-
 E2BD:    JMP FLT_ZERO
 E2VR:    JSR UC
          CMP #'A'
@@ -2020,6 +2005,10 @@ FN_TAB:
          .DB <KW_TAB, <FLT_TAN, >FLT_TAN  
          .DB <KW_PEEK,<FLT_PEEK,>FLT_PEEK
          .DB <KW_USR, <FLT_USR, >FLT_USR
+         .DB <KW_FLOOR, <FLT_FLOOR, >FLT_FLOOR
+         .DB <KW_RND, <FLT_RND, >FLT_RND   ; 0-arg (KW_RND flags it)
+         .DB <KW_PI,  <FLT_PI,  >FLT_PI    ; 0-arg (KW_PI flags it)
+         .DB <KW_FREE,<DO_FREE, >DO_FREE   ; 0-arg (KW_FREE flags it)
          .DB $FF
 
 ; =============================================================================
@@ -2059,9 +2048,12 @@ FNL:     LDA FN_TAB,X
          BMI FNLT
          JSR MTCHKW
          BCS FNNX
+         BMI FN_NOPAREN         ; N flag (from MTCHKW): 0-arg keyword, e.g.
+                                ; RND/PI/FREE -- skip the "(expr)" parse
          PHX                    ; save table offset -- EAT_PAREN clobbers X
          JSR EAT_PAREN
          PLX
+FN_NOPAREN:
          LDA FN_TAB+1,X
          STA T2
          LDA FN_TAB+2,X
@@ -2072,19 +2064,27 @@ FNL:     LDA FN_TAB,X
                                  ; stack (the handler's own RTS must land on
                                  ; EXPR2's true caller, not back in here)
          JMP (T2)
-
 FNNX:    INX
          INX
          INX
          BRA FNL
+FNLT:    SEC
+         RTS
 
 ; =============================================================================
 ; MTCHKW  --  case-insensitive match of a 2-char keyword prefix at IP, then
 ;             consumes any further trailing letters (uBASIC's scheme)
 ;
 ;   In:  A = low byte of the 2-byte keyword prefix (on STR_PAGE)
-;   Out: match:  carry clear, IP advanced past the matched keyword
-;        no match: carry set, IP restored to its value on entry
+;   Out: match:  carry clear, IP advanced past the matched keyword,
+;                N flag = bit 7 of the keyword's 2nd stored byte (set by
+;                the keyword definition itself -- see KW_RND/KW_PI/KW_FREE --
+;                to flag a keyword that takes no parenthesized argument;
+;                real ASCII letters never set this bit, so it's free).
+;                FN_DISPATCH tests BMI/BPL right after a match to decide
+;                whether to call EAT_PAREN.
+;        no match: carry set, IP restored to its value on entry, N/Z
+;                undefined (check carry first, always)
 ;   Clobbers: A, Y, T1
 ;
 ;   After the 2-char prefix matches, any run of trailing letters at IP is
@@ -2094,13 +2094,6 @@ FNNX:    INX
 ;   the letter-skip loop computes (char-'A'), and '$'-'A' mod 256 = $E3
 ;   is checked for specially once a non-letter ends the loop.
 ; =============================================================================
-MKFL:    LDA LP
-         STA IP
-         LDA LP+1
-         STA IP+1
-FNLT:    SEC
-         RTS
-
 MTCHKW:  STA T1
          LDA #STR_PAGE
          STA T1+1
@@ -2113,9 +2106,16 @@ MTCHKW:  STA T1
          CMP (T1),Y
          BNE MKFL
          JSR GETCI
-         JSR PEEKUC
          LDY #1
-         CMP (T1),Y
+         LDA (T1),Y            ; A = raw stored 2nd byte (may carry the 0-arg
+                                ; flag in bit 7 -- see KW_RND/KW_PI/KW_FREE)
+         STA T1+1               ; stash raw byte (STR_PAGE no longer needed;
+                                 ; T1/T1+1 are already documented-clobbered,
+                                 ; so no caller can be relying on them here)
+         AND #$7F                ; mask the flag bit off for the real compare
+         STA T1
+         JSR PEEKUC               ; A = peeked char (real ASCII, bit7 always 0)
+         CMP T1
          BNE MKFL
          JSR GETCI
 MKSKIP:  JSR PEEKUC
@@ -2128,9 +2128,16 @@ MKSKIP:  JSR PEEKUC
 MKOK:    CMP #$E3              ; remainder == '$'-'A' (mod 256)?
          BNE MKRTS
          JSR GETCI             ; it IS '$': consume it
-MKRTS:   CLC
+MKRTS:   LDA T1+1              ; N flag = bit 7 of raw 2nd keyword byte (the
+                                ; 0-arg flag) -- FN_DISPATCH tests BMI/BPL
+         CLC
          RTS
-
+MKFL:    LDA LP
+         STA IP
+         LDA LP+1
+         STA IP+1
+         SEC
+         RTS
 
 ; =============================================================================
 ; FLOAT LIBRARY  --  MBF4 format, see header comment for the byte layout
@@ -2156,12 +2163,23 @@ FABL:    LDA FLT_A,X
          BPL FABL
          RTS
 
+; FLT_RND -- FLT_A = pseudorandom float, 0 <= x < 1 (LFSR value / 32768)
+;   Out: FLT_A = result.  Clobbers: as RND_SHUFFLE/FLT_FROM_INT/FLT_DIV
+FLT_RND: JSR RND_SHUFFLE
+         LDA RND_SEED
+         STA T0
+         LDA RND_SEED+1
+         AND #$7F              ; force positive (0-32767 range)
+         STA T0+1
+         JSR FLT_FROM_INT
+         LDX #IDX_32768
+         JSR FLT_LDCONST_B
+         JMP FLT_DIV           ; RND() = LFSR value / 32768, so 0 <= x < 1
+
 ; Returns PI in FLT A and FLT B for Radian/degree conversions
 FLT_PI:
         JSR LD_PI_FUNC
         ; drop through
-; FLT_A_TO_B / FLT_B_TO_A -- copy the 4-byte float FLT_A<->FLT_B.
-; Clobbers: A, X.
 FLT_B_TO_A:
          LDX #3
 FBAL:    LDA FLT_B,X
@@ -2239,32 +2257,27 @@ PFB_POPL: PLA
          BRA PRET             
 
 ; =============================================================================
+; FLT_FLOOR -- round
+;   Out: FLT_A = float(A) zero-extended to 16 bits
+;   Clobbers: A,X,Y,T0 + whatever the called routine clobbers.
+FLT_FLOOR:
+         JSR FLT_TO_INT
+         ; JMP FLT_FROM_INT
+        ; drop through
+; =============================================================================
 ; FLT_FROM_INT / FLT_FROM_INT_B  --  convert a signed 16-bit integer to float
 ;
 ;   In:  T0 = signed 16-bit value
 ;   Out: FLT_A (FLT_FROM_INT) or FLT_B (FLT_FROM_INT_B) = float(T0)
 ;   Clobbers: A, X, T0, FLT_ER, FLT_SA
-;
-;   Was two near-identical 35-line routines differing only in destination
-;   (FLT_A vs FLT_B) -- asmdup.py flagged the shared "negate 16-bit T0"
-;   fragment as duplicated. Unified via FLT_B_OFFSET (X-indexed into
-;   FLT_A,X / FLT_A+1,X / FLT_A+2,X / FLT_A+3,X; X=0 hits FLT_A, X=4 hits
-;   FLT_B since the two floats are contiguous 4-byte blocks in ZP). Also
-;   drops the separate FLT_SB: the sign is only live within this routine's
-;   own body (consumed by F_PACK before returning), so FLT_SA doubles as
-;   scratch for both destinations -- nothing depends on FLT_FROM_INT_B
-;   leaving a fresh FLT_SB behind (checked: its only caller immediately
-;   follows with FLT_SUB, which recomputes FLT_SB from scratch anyway).
 ; =============================================================================
-FLT_B_OFFSET = FLT_B - FLT_A
-
-FLT_FROM_INT_B:
-         LDX #FLT_B_OFFSET
-         .byte $2C             ; [OPT] BIT trick: assembles as BIT $A9xx,
+FLT_B_OFFSET = FLT_B - FLT_A ; page zero offset
 
 FLT_FROM_INT:
          LDX #0
-
+         .byte $2C             ; [OPT] BIT trick: assembles as BIT $A9xx,
+FLT_FROM_INT_B:
+         LDX #FLT_B_OFFSET
 FLT_SHARED:
          LDA T0
          ORA T0+1
@@ -2496,11 +2509,8 @@ FAZE:    ; drop through
 
 ; FLT_ZERO -- FLT_A = 0.0.  Clobbers: A, X.
 FLT_ZERO:
-         LDX #3
-FZL:     STZ FLT_A,X
-         DEX
-         BPL FZL
-         RTS
+        LDX #0 ; zp offset
+        JMP F_ZERO
 
 ; FLT_MOD: FLT_A = FLT_A - FLT_B*trunc(FLT_A/FLT_B)
 ; =============================================================================
@@ -2700,7 +2710,6 @@ FMS:     JSR SHR_A               ; shift accumulator right
          ROL FLT_A+1
          DEC FLT_ER
 FMPK:    ; drop through
-
 
 ; =============================================================================
 ; NORM_PACK  --  normalise an unpacked mantissa and pack it into FLT_A
