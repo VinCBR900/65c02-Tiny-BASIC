@@ -1,5 +1,5 @@
 ; =============================================================================
-; miniBASIC 65C02 v2.8
+; miniBASIC 65C02 v2.9
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; 4KB Float BASIC (MBF4) for the 65C02.
@@ -28,11 +28,16 @@
 ;
 ; KNOWN LIMITATIONS
 ;
+; Two Character keyword matching - To save ROM space, only 2 chars are 
+;   matched, then rest of word consumed until a space or `(`.  So spaces
+;   are needed eg `10 PRINT TAB(5);"HELLO"` works, `10 PR TA(5);"Hello"`
+;   also works, but `10 PRINTTAB(5);"Hello"` prints '5Hello'
+;
 ; Number literals require a leading digit before the decimal point --
 ;   "0.5" works, ".5" does not (parses as 0).
 ;
-; TAN(x) raises a ?2 (overflow) error at odd multiples of pi/2 (since TAN is
-;   undefined there - our sin/cos identity divides by cos(x) which is 0.0).
+; TAN(x) raises a ?2 (overflow) error at odd multiples of pi/2 since TAN is
+;   undefined there - our sin/cos identity divides by cos(x) which is 0.0.
 ;
 ; Measured Trig accuracy: ATN is well-behaved across whole domain, correctly
 ;   saturates toward +-pi/2 for large |x|) with error up to ~0.005 rad, worst around
@@ -46,6 +51,8 @@
 ;
 ; TAB(n) and CHR$(n) are only valid on a PRINT line. Both accept expressions but
 ;   TAB prints n spaces, not jumps to column n. 
+;
+; FLOOR(flt) rounds towards zero eg floor(3.5) is 3, floor (-3.5) is -3, NOT -4.
 ; 
 ;  FLOAT FORMAT
 ; MBF4: Byte0=biased_exp($00=zero), Byte1=sign|mant[22:16], Byte2-3=mant[15:0]
@@ -58,10 +65,14 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ;
+; v2.9 (2026-07) - ROM usage: 94 bytes free .
+;   - Refactord FLT push/pop, A->B and B->A for size. Refactored FLT_MOD to use
+;     Push/Pop FLT_B rather than manual memory move.
+;
 ; v2.8 (2026-07) - ROM usage: 62 -> 68 bytes free (6 bytes saved).
 ;   - Refactored MTCHKW & FN_DISPATCH to check for Bit 7 signal for 0 or 1 ARG
 ;     Function, refactored RND/PI/FREE into FN_TAB to save a little space.
-;     Added FLOOR(flt) function which rounds down.
+;     Added FLOOR(flt) function which rounds towrads zero.
 ;
 ; v2.7WIP (2026-07) - ROM usage: 76 -> 62 bytes free.
 ;   - Removed DEG, added PI and converted FREE to function form but
@@ -169,7 +180,6 @@
 ;
 ; v1.2 — Zero Page Contiguity & Documentation Pass
 ;   - ADDED: Standardized In/Out/Clobbers headers across all subroutines.
-;   - ADDED: Rewritten showcase program testing CORDIC sine and Mandelbrot.
 ;   - CHANGED: Reorganized Zero Page into a fully contiguous $00-$B9 block.
 ;
 ; v1.1 — Memory Copy & Stack Protection Fixes
@@ -288,7 +298,7 @@ PROG:
 ; line 10
          .DB $0A,$00,"REM miniBASIC 65C02 Float BASIC - showcase",$0D
 ; line 20
-         .DB $14,$00,"PRINT ",$22,"=== LET and arithmetic ===",$22,$0D
+         .DB $14,$00,"PRINT ",$22,"=== LET and Arithmetic ===",$22,$0D
 ; line 30
          .DB $1E,$00,"LET A=7",$0D
 ; line 40
@@ -469,7 +479,7 @@ SHOWCASE_END: ; audit
 
          .ORG $F000
 STR_PAGE = >STR_BANNER
-STR_BANNER: .DB "miniBASIC 65C02 v2.8"
+STR_BANNER: .DB "miniBASIC 65C02 v2.9"
 STR_CRLF:   .DB $0D,$8A
 STR_IN:     .DB " IN",$A0
 STR_BREAK:  .DB $0D,$0A,"BREA",$CB
@@ -653,7 +663,7 @@ GLD:     STA IBUF,X
          STA IP
          LDA #>IBUF
          STA IP+1
-         RTS
+PND:     RTS
 
 ; =============================================================================
 ; PNUM  --  parse an unsigned decimal integer from IP into T0
@@ -689,7 +699,6 @@ PNML:    LDA T2                ; CMP #10 above guarantees carry clear here
          BNE PNL
          INC IP+1
          BRA PNL
-PND:     RTS
 
 ; =============================================================================
 ; T2DEC  --  decrement the 16-bit counter at T0/T1 (used by DELINE/INSLINE's
@@ -802,7 +811,7 @@ ELIS:    JSR WPEEK
          CMP #CR
          BNE ELIS2
          BRA ELD         ; no body: done
-ELIS2:
+ELIS2:   ; drop through
 ; =============================================================================
 ; INSLINE  --  insert one line at LP; body text comes from IP (in IBUF)
 ;
@@ -1001,12 +1010,6 @@ DO_FREE: SEC
 ;   In:  IP->print-list "string", expr, TAB(n) (n is spaces), CHR$(n), separated by ';'
 ;   Out: items printed; trailing ';' suppresses the final CRLF
 ;   Clobbers: A, X, Y, T0-T2, FLT_A, IP
-; =============================================================================
-; =============================================================================
-; DO_PRINT -- Ultra-golfed print sub-system
-;
-; Squeezes an additional 9 bytes out of the previous pass by leveraging 
-; C-flag comparison boundaries and direct-to-PRNL relative branching.
 ; =============================================================================
 DO_PRINT:
 DPT:        JSR WPEEK
@@ -2156,12 +2159,9 @@ SIGN_XOR:
 ; FLT_A_TO_B / FLT_B_TO_A -- copy the 4-byte float FLT_A<->FLT_B.
 ; Clobbers: A, X.
 FLT_A_TO_B:
-         LDX #3
-FABL:    LDA FLT_A,X
-         STA FLT_B,X
-         DEX
-         BPL FABL
-         RTS
+        JSR PUSH_FLT_A
+        JSR POP_FLT_B ; must be JSR as routine cleans up return address
+        RTS
 
 ; FLT_RND -- FLT_A = pseudorandom float, 0 <= x < 1 (LFSR value / 32768)
 ;   Out: FLT_A = result.  Clobbers: as RND_SHUFFLE/FLT_FROM_INT/FLT_DIV
@@ -2181,88 +2181,66 @@ FLT_PI:
         JSR LD_PI_FUNC
         ; drop through
 FLT_B_TO_A:
-         LDX #3
-FBAL:    LDA FLT_B,X
-         STA FLT_A,X
-         DEX
-         BPL FBAL
-         RTS
+        JSR PUSH_FLT_B
+        JSR POP_FLT_A ; must be JSR as routine cleans up return address
+        RTS
 
-; PUSH_FLT_A / POP_FLT_A -- save/restore the 4-byte float FLT_A on the
-; hardware stack, straddling arbitrary caller code (relational ops parking
-; the left operand across a recursive EXPR_ADD call, FLT_PRINT parking the
-; original value across its digit-scaling loop, etc).
-;
-; These can't be plain JSR/RTS wrappers around PHA x4 / PLA x4: the pushed
-; frame is meant to sit on the stack for the FULL gap between the push
-; call site and a LATER, separate pop call site -- with arbitrary other
-; JSR/RTS activity (recursion, nested FLT_CMP, etc) happening in between.
+; =============================================================================
+; PUSH_FLT_A,B / POP_FLT_A,B -- save/restore a 4-byte float FLT_x on the
+; hardware stack.
 ;
 ; Must be entered via JSR, not tail-called: each pops its own return
 ; address out of the way first, does the real push/pop, then pushes the
-; address back before RTS. A plain JSR/RTS wrapper around PHA x4/PLA x4
-; would break -- the parked frame must survive underneath the JSR's own
-; return address across arbitrary intervening code, so its own RTS would
-; otherwise consume the last 2 bytes of parked float data as a return
-; address (confirmed by an earlier crash before this trampoline was added).
+; address back before RTS.
 ;
-;   PUSH_FLT_A  In: FLT_A  Out: FLT_A pushed beneath caller's return addr
-;               Clobbers: A, X, PFA_RL/PFA_RH
-;   POP_FLT_A   In: -- (matching PUSH_FLT_A frame beneath the return addr)
-;               Out: FLT_A restored  Clobbers: A, X, PFA_RL/PFA_RH
-PUSH_FLT_A:
-         LDX #3
-         .DB $2C               ; BIT-trick: swallows POP_FLT_A's "LDX #-4"
-POP_FLT_A:
-         LDX #<-4
-         PLA
-         STA PFA_RL
-         PLA
-         STA PFA_RH
-         TXA
-         BMI POPL
-PSHL:    LDA FLT_A,X
-         PHA
-         DEX
-         BPL PSHL
-PRET:    LDA PFA_RH
-         PHA
-         LDA PFA_RL
-         PHA
-         RTS
-POPL:    PLA
-         STA FLT_A+4,X
-         INX
-         BNE POPL
-         BRA PRET              ; unconditional: X==0 here (BNE just fell through)
-
-; POP_FLT_B -- same trampoline mechanism as POP_FLT_A (return address is
-;   juggled out of the way, the parked float is pulled off underneath it,
-;   then the return address goes back on top), but restores into FLT_B
-;   instead of FLT_A. Only pairs with PUSH_FLT_A (there's no separate
-;   "PUSH_FLT_B" -- the thing being parked is always whatever's in FLT_A
-;   at push time; this just chooses where it lands on the way back out).
-;   In: -- (matching PUSH_FLT_A frame beneath the return addr)
-;   Out: FLT_B restored  Clobbers: A, X, PFA_RL/PFA_RH
-POP_FLT_B:
-         PLA
-         STA PFA_RL
-         PLA
-         STA PFA_RH
-         LDX #<-4
-PFB_POPL: PLA
-         STA FLT_B+4,X
-         INX
-         BNE PFB_POPL
-         BRA PRET             
-
+; Entry Points: PUSH_FLT_A, PUSH_FLT_B, POP_FLT_A, POP_FLT_B
+; Clobbers:     A, X, Y
 ; =============================================================================
-; FLT_FLOOR -- round
+
+PUSH_FLT_A: LDX #FLT_A + 3
+            .DB $2C             ; BIT abs: swallows "LDX #FLT_B + 3"
+PUSH_FLT_B: LDX #FLT_B + 3
+            SEC                 ; C=1 indicates PUSH operation
+            BRA DO_FLT
+
+POP_FLT_A:  LDX #FLT_A
+            .DB $2C             ; BIT abs: swallows "LDX #FLT_B"
+POP_FLT_B:  LDX #FLT_B
+            CLC                 ; C=0 indicates POP operation
+
+DO_FLT:     PLA
+            STA PFA_RL          ; Preserve return address LSB
+            PLA
+            STA PFA_RH          ; Preserve return address MSB
+            LDY #4              ; Transfer 4 bytes for float
+            BCS DO_PUSH
+
+POPL:       PLA
+            STA 0,X             ; Pop stack byte into ZP address X
+            INX
+            DEY
+            BNE POPL
+            BRA PRETA           ; Restore return address and RTS
+
+DO_PUSH:
+PSHL:       LDA 0,X             ; Read byte from ZP address X and push
+            PHA
+            DEX
+            DEY
+            BNE PSHL
+
+PRETA:      LDA PFA_RH
+            PHA
+            LDA PFA_RL
+            PHA
+            RTS
+      
+; =============================================================================
+; FLT_FLOOR -- round to zero i.e. 3.5 becomes 3, -3.5 becomes -3
 ;   Out: FLT_A = float(A) zero-extended to 16 bits
 ;   Clobbers: A,X,Y,T0 + whatever the called routine clobbers.
 FLT_FLOOR:
          JSR FLT_TO_INT
-         ; JMP FLT_FROM_INT
         ; drop through
 ; =============================================================================
 ; FLT_FROM_INT / FLT_FROM_INT_B  --  convert a signed 16-bit integer to float
@@ -2359,6 +2337,7 @@ FTIS2:   LSR T0+1
 FTIG:    LDA FLT_A+1
          BMI FTIN
 FTID:    RTS
+
 FTIN:    LDA #0
          SEC
          SBC T0
@@ -2367,6 +2346,7 @@ FTIN:    LDA #0
          SBC T0+1
          STA T0+1
          RTS
+
 FTIS:    LDA #$FF
          STA T0
          LDA #$7F
@@ -2379,20 +2359,9 @@ FTIS:    LDA #$FF
          STA T0+1
          RTS
 
-; FLT_TEN_B -- FLT_B = 10.0.  Clobbers: A.
-FLT_TEN_B:
-         LDA #$84
-         STA FLT_B
-         LDA #$20
-         STA FLT_B+1
-         STZ FLT_B+2
-         STZ FLT_B+3
-         RTS
-
 ; =============================================================================
 ; SHARED UTILITY ROUTINES  --  used by both FLT_ADD and FLT_MUL
 ; =============================================================================
-
 ; ADD_A_B -- 24-bit addition: FLT_A = FLT_A + FLT_B
 ;   In:  FLT_A, FLT_B
 ;   Out: FLT_A = FLT_A + FLT_B; carry = carry out of bit 23 (mantissa overflow)
@@ -2510,7 +2479,7 @@ FAZE:    ; drop through
 ; FLT_ZERO -- FLT_A = 0.0.  Clobbers: A, X.
 FLT_ZERO:
         LDX #0 ; zp offset
-        JMP F_ZERO
+        JMP F_ZERO      ; tail call
 
 ; FLT_MOD: FLT_A = FLT_A - FLT_B*trunc(FLT_A/FLT_B)
 ; =============================================================================
@@ -2521,31 +2490,16 @@ FLT_ZERO:
 ;   Out: FLT_A = FLT_A - FLT_B*trunc(FLT_A/FLT_B).  ?2 if FLT_B is 0.0
 ;   Clobbers: A, X, Y, FLT_A, FLT_B, and everything FLT_DIV/FLT_MUL/FLT_SUB do
 ; =============================================================================
-FLT_MOD: JSR PUSH_FLT_A        ; park FLT_A on hardware stack
-         LDA FLT_B+3
-         PHA
-         LDA FLT_B+2
-         PHA
-         LDA FLT_B+1
-         PHA
-         LDA FLT_B
-         PHA
-         JSR FLT_DIV
-         JSR FLT_TO_INT
-         JSR FLT_FROM_INT
-         PLA
-         STA FLT_B
-         PLA
-         STA FLT_B+1
-         PLA
-         STA FLT_B+2
-         PLA
-         STA FLT_B+3
-         JSR FLT_MUL
-         JSR FLT_A_TO_B
-         JSR POP_FLT_A         ; restore FLT_A
-         ;JMP FLT_SUB
-         ; drop through
+FLT_MOD: 
+        JSR PUSH_FLT_A        ; park FLT_A on hardware stack
+        JSR PUSH_FLT_B        ; park FLT_B on hardware stack
+        JSR FLT_DIV
+        JSR FLT_FLOOR
+        JSR POP_FLT_B
+        JSR FLT_MUL
+        JSR FLT_A_TO_B
+        JSR POP_FLT_A         ; restore FLT_A
+        ; drop through
 
 ; =============================================================================
 ; FLT_SUB  --  FLT_A = FLT_A - FLT_B (negates FLT_B and falls into FLT_ADD)
@@ -2554,7 +2508,6 @@ FLT_MOD: JSR PUSH_FLT_A        ; park FLT_A on hardware stack
 ; =============================================================================
 FLT_SUB: JSR FLT_NEGATE_B
          JSR FLT_ADD
-;         JMP FLT_NEGATE_B
         ; drop through
 ; FLT_NEGATE / FLT_NEGATE_B -- flip the sign bit of FLT_A / FLT_B (no-op on
 ; zero, so -0.0 can't arise).  Clobbers: A.
@@ -2613,7 +2566,6 @@ FLT_SQRT:
          RTS                    ; S == 0: FLT_A already 0.0, nothing to do
 FSQ_NZ:  LDA FLT_A+1
          BPL FSQ_OK
-         ;JMP FLT_ZERO           ; S < 0: no complex support, clamp to 0.0
          BRA FLT_ZERO
 FSQ_OK:  LDX #3                 ; T_S = S (preserved across all iterations)
 FSQSV:   LDA FLT_A,X
@@ -2654,7 +2606,6 @@ NRRB:    LDA T_X,X
 ; MUL_BY_TEN -- FLT_A = FLT_A * 10.  Clobbers: as FLT_MUL.
 MUL_BY_TEN:
          JSR FLT_TEN_B
-         ;JMP FLT_MUL
         ; drop through
 
 ; FLT_MUL: FLT_A = FLT_A * FLT_B  (24-iter shift-and-accumulate)
@@ -2768,7 +2719,6 @@ NPPK:    LDA FLT_ER
 ; DIV_BY_TEN -- FLT_A = FLT_A / 10.  Clobbers: as FLT_DIV.
 DIV_BY_TEN:
          JSR FLT_TEN_B
-         ;JMP FLT_DIV
         ; drop through
 
 ; FLT_DIV: FLT_A = FLT_A / FLT_B  (32-iter shift-subtract)
@@ -2783,9 +2733,11 @@ FLT_DIV: LDA FLT_B
          BNE FDBNZ
 ERR_OV_J: LDA #ERR_OV
          JMP DO_ERROR
+
 FDBNZ:   LDA FLT_A
          BNE FDANZ
          RTS
+
 FDANZ:   LDA FLT_A
          SEC
          SBC FLT_B
@@ -3066,7 +3018,6 @@ FPDT:    CMP #'.'
          JSR FLT_ADD
 FPSG:    LDA FLT_DE
          BEQ FPSND
-;         JMP FLT_NEGATE
         ; drop through
 ; FLT_NEGATE / FLT_NEGATE_B -- flip the sign bit of FLT_A / FLT_B (no-op on
 ; zero, so -0.0 can't arise).  Clobbers: A.
@@ -3107,7 +3058,6 @@ PARSE_FRAC:
          JSR FLT_ADD
          JMP DIV_BY_TEN
 PFE:     JMP FLT_ZERO
-
 
 ; =============================================================================
 ; FLT_ATAN_CORE  --  FLT_A = atan(FLT_A), RADIANS, single-term Pade approx
@@ -3189,7 +3139,6 @@ ASIN_INDOMAIN:
 ASIN_RTS: RTS
 ASIN_NORMAL:
          JSR FLT_DIV            ; FLT_A = x / sqrt(1-x^2)
-;         JMP FLT_ATAN           ; tail: atan(...), radians
         ; drop through
 ; =============================================================================
 ; FLT_ATAN  --  FLT_A = atan(FLT_A), RADIANS, valid for any x
@@ -3256,8 +3205,7 @@ FLT_ACOS:
 
 ; ===========================================================================
 ; SIN(x)/COS(x), x in RADIANS (float, any range/sign) -- float-native
-; polynomial implementation (MBF4 throughout; replaces the old fixed-point
-; CORDIC engine, freeing 323 ROM bytes / 12 ZP bytes it used exclusively).
+; polynomial implementation,
 ;
 ; Pipeline: FLT_A (radians) --abs+mod 2pi--> [0,2pi)
 ;           --fold--> [0,pi] --fold--> [0,pi/2] --polynomial--> sin
@@ -3273,19 +3221,14 @@ FLT_COS:
          LDX #IDX_PI_2
          JSR FLT_LDCONST        ; FLT_A = pi/2
          JSR FLT_SUB            ; FLT_A = pi/2 - x
-;         JMP FLT_SIN            ; sin(pi/2-x) = cos(x)
         ; drop through
 ; =============================================================================
 ; FLT_SIN  --  FLT_A = sin(FLT_A), RADIANS (any magnitude/sign)
 ;
 ;   In:  FLT_A = angle, radians
-;   Out: FLT_A = sin(angle), accurate to ~0.0002 (better than the old
-;        CORDIC's documented ~0.05%, back when this was degrees/fixed-point)
+;   Out: FLT_A = sin(angle), accurate to ~0.0002
 ;   Clobbers: A, X, Y, T0, T1, FLT_B, FLT_SA, FLT_SB, FLT_ER, FLT_DE, FLT_DB,
 ;             FLT_MA, FLT_MB, FLT_MC, FLT_DVH, FLT_DVM, FLT_DVL, PFA_RL/PFA_RH
-;   (T_X/T_S no longer touched here as of v2.4 -- uses the PUSH_FLT_A/
-;    POP_FLT_A/POP_FLT_B hardware-stack trampoline instead. T_X/T_S still
-;    exist and are still used by FLT_SQRT elsewhere.)
 ;
 ;   sin(x) ~= x*(1 - x^2*(0.16605 - 0.00761*x^2)), valid for x in [0,pi/2]
 ;   (max abs error ~0.000164 there). Range reduction folds any input into
@@ -3380,16 +3323,6 @@ FS_POLY:                        ; sin(x) ~= x*(1 - x^2*(C1 - C2*x^2))
 ;   Clobbers: as FLT_SIN/FLT_COS, plus FLT_DIV's own (FLT_B, FLT_DVH/M/L),
 ;             plus FLIM (see below)
 ;
-;   sin(x) can't be parked in FLT_B across the FLT_COS call the way
-;   PUSH_FLT_A parks things across "arbitrary" code: FLT_SIN and FLT_COS
-;   both use FLT_B as their OWN internal scratch, so whichever of the two
-;   runs last unconditionally clobbers it -- there's no ordering that
-;   avoids this. sin(x) is stashed in FLIM instead: it's 4 bytes, and
-;   DO_FOR only ever writes it *after* its own JSR EXPR returns (so any
-;   TAN() nested inside a FOR's start/limit/step expression has already
-;   finished with FLIM before DO_FOR touches it) -- no lifetime overlap,
-;   safe to borrow. x itself still uses PUSH_FLT_A/POP_FLT_A, since that
-;   part only needs to survive across ONE trig call, not both.
 ; =============================================================================
 FLT_TAN: JSR PUSH_FLT_A          ; park x across the FLT_SIN call
          JSR FLT_SIN             ; FLT_A = sin(x)
@@ -3414,12 +3347,6 @@ TNRS:    LDA FLIM,X
 ;   loaded via FLT_LDCONST (-> FLT_A) / FLT_LDCONST_B (-> FLT_B). Values
 ;   computed to nearest MBF4 representation (round-to-nearest mantissa).
 ; =============================================================================
-IDX_ATANCOEF = 0
-IDX_ONE      = 1
-IDX_PI_2     = 2
-IDX_C1_SIN   = 3
-IDX_C2_SIN   = 4
-IDX_32768    = 5
 
 ; FLT_CONST_PTR -- point T0 at constant X's 4 ROM bytes. All constants
 ;   (C_ATANCOEF..C_32768 above) must to stay within One page ($FFxx
@@ -3461,6 +3388,24 @@ LD_PI_FUNC:
          INC FLT_B             ; FLT_B = pi (exponent-INC = *2)
          RTS
 
+; FLT_TEN_B -- FLT_B = 10.0.  Clobbers: A.
+FLT_TEN_B:
+         LDA #$84
+         STA FLT_B
+         LDA #$20
+         STA FLT_B+1
+         STZ FLT_B+2
+         STZ FLT_B+3
+         RTS
+; indices
+IDX_ATANCOEF = 0
+IDX_ONE      = 1
+IDX_PI_2     = 2
+IDX_C1_SIN   = 3
+IDX_C2_SIN   = 4
+IDX_32768    = 5
+IDX_TEN      = 6
+
 CTAB_LO: .DB <C_ATANCOEF,<C_ONE,<C_PI_2,<C_C1_SIN,<C_C2_SIN,<C_32768
 C_ATANCOEF: .DB $7F,$0F,$CC,$E2  ; 0.28086 (FLT_ATAN_CORE Pade coefficient)
 C_ONE:      .DB $81,$00,$00,$00  ; 1.0
@@ -3468,7 +3413,6 @@ C_PI_2:     .DB $81,$49,$0F,$DB  ; 1.5707963 (pi/2, radians)
 C_C1_SIN:   .DB $7E,$2A,$09,$03  ; 0.16605 (FLT_SIN polynomial coefficient)
 C_C2_SIN:   .DB $79,$79,$5D,$4F  ; 0.00761 (FLT_SIN polynomial coefficient)
 C_32768:    .DB $90,$00,$00,$00  ; 32768.0 (RND's LFSR->float divisor)
-
 
 ROMEND: ; audit
 
