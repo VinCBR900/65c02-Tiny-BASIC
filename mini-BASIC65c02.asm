@@ -1,5 +1,5 @@
 ; =============================================================================
-; miniBASIC 65C02 v3.1
+; miniBASIC 65C02 v3.2
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; 4KB Float BASIC (MBF4) for the 65C02.
@@ -11,13 +11,13 @@
 ; Expressions:
 ;   + - * / % ^   = < > <= >= <>   unary -
 ;   ABS(flt)  ACOS(flt)  ASIN(flt)  ATN(flt)  COS(rad)  EXP(flt)  FLOOR(flt)   
-;   FREE   LN(flt)   PEEK(addr)   PI   RND   SIN(rad)   SQR(flt)   USR(addr)
-;   A-Z variables
+;   FREE  LN(flt)  PEEK(addr)  PI  RND  SIN(rad)  TAN(rad)  SQR(flt)  USR(addr)
+;   26 single letter variables, A-Z 
 ;
 ; Numbers      : MBF4 float, ~6-7 significant decimal digits (see format below)
 ; String print : "literals", `;`, TAB(n) and CHR$() only; no string variables
 ;
-; Trig is RADIANS-native throughout (SIN/COS/ATN/ASIN/ACOS all take/return
+; Trig is RADIANS-native throughout (SIN/COS/TAN/ATN/ASIN/ACOS all take/return
 ; radians). Use PI (e.g. "X*180/PI") to convert to degrees for display.
 ;
 ; FOR/NEXT : loop variable, TO limit, and STEP are all real floats.
@@ -50,13 +50,6 @@
 ;   (roughly |x| > 88, i.e. beyond this float format's representable range
 ;   in either direction) raises a "?2" error.
 ;
-; X^Y (v3.0, new) is computed as EXP(Y*LN(X)), so:
-;   - X must be positive; X<=0 raises LN's "?2" domain error.
-;   - Same precedence as * / % (left-to-right), NOT the conventional
-;     higher-than-multiplication binding -- "2*3^2" is "(2*3)^2"=36 here,
-;     not the "2*(3^2)"=18 you'd get in most languages. 
-;   - Inherits EXP's overflow/underflow "?2" error for extreme results.
-;
 ; SIN/COS accurate to ~0.0002 rad on their core polynomial domain (see
 ;   FLT_SIN/FLT_COS headers). Range reduction (mod 2*PI) itself breaks down
 ;   for |x| gtr-or-eq ~205,887 (32767 * 2*PI) -- FLT_MOD's FLOOR step
@@ -83,8 +76,13 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ;
+; v3.2 (2026-07) - 21 bytes free
+;   - Restored TAN function, modified DO_PRINT for TAB vs TAN.
+;   - Deleted POWER `^` due to incorrect Operater precidence, no space to fix.
+;   - Cleaned up Page Zero for stale entries - 16 zp bytes free for expansion. 
+;
 ; v3.1 (2026-07) - 34 bytes free
-;   - Refactored MATCH_DISPATCH/MTCHKW  for a merged UNI_TAB/FUNC_TAB
+;   - Refactored MATCH_DISPATCH/MTCHKW for a merged UNI_TAB/FUNC_TAB
 ;     keyword+jump table (4 bytes/entry, keyword chars inline).
 ;
 ; v3.0 (2026-07) - 0 bytes free
@@ -315,9 +313,6 @@ FLIM:     .RS 4              ; 4-byte: staged limit float (contiguous with
                              ;  FVAR/FSTEP for FSTK_PUSH's indexed copy loop)
 FSTEP:    .RS 4              ; 4-byte: staged step float
 FSTK:     .RS 1              ; 8-bit: count of active FOR loops (0-4)
-T_S:      .RS 4              ; 4-byte: FLT_SQRT's original-S scratch (preserved
-                             ;  across all Newton-Raphson iterations)
-T_X:      .RS 4              ; 4-byte: FLT_SQRT's per-iteration guess scratch
 LSLO:     .RS 2              ; 16-bit: DO_LIST range low bound (dedicated --
                              ;  T0-T2 all get clobbered by PRT16 inside the
                              ;  listing loop, so these can't live there)
@@ -451,19 +446,18 @@ PROG:
          .DB $C2,$01,"IF X=0 THEN GOTO 480",$0D
          .DB $CC,$01,"LET T=ATN(Y/X)",$0D
          .DB $D6,$01,"GOTO 490",$0D
-         .DB $E0,$01,"LET T=1.5708",$0D
+         .DB $E0,$01,"LET T=PI/2",$0D
          .DB $EA,$01,"REM --- TEST SIN/COS ---",$0D
          .DB $F4,$01,"LET W=SIN(6*D-3*T)",$0D
-         .DB $FE,$01,"REM --- TAN Deprecated ---",$0D
-         .DB $08,$02,"REM LET U=TAN(W*0.5)",$0D
-         .DB $0D,$02,"LET U=SIN(W*0.5)/COS(W*0.5)",$0D
-         .DB $12,$02,"REM --- BOUND VALUE TO [-0.99, 0.99] ---",$0D
-         .DB $1C,$02,"LET P=COS(U)*0.99",$0D
+         .DB $FE,$01,"REM --- TAN ---",$0D
+         .DB $08,$02,"LET U=TAN(W*0.5)",$0D
+;         .DB $0D,$02,"LET U=SIN(W*0.5)/COS(W*0.5)",$0D
+         .DB $1C,$02,"LET P=COS(U)",$0D
          .DB $26,$02,"REM --- TEST ASIN/ACOS ---",$0D
          .DB $30,$02,"LET A=ACOS(P)",$0D
          .DB $3A,$02,"LET B=ASIN(P)",$0D
          .DB $44,$02,"REM --- MATH SHADE VALUE ---",$0D
-         .DB $4E,$02,"LET Z=ABS(A-B)/3.1416",$0D
+         .DB $4E,$02,"LET Z=ABS(A-B)/PI",$0D
          .DB $58,$02,"REM --- MAP TO ASCII CHARS ---",$0D
          .DB $62,$02,"LET S=32",$0D
          .DB $6C,$02,"IF Z>0.15 THEN LET S=46",$0D
@@ -504,7 +498,7 @@ SHOWCASE_END: ; audit
 
          .ORG $F000
 STR_PAGE = >STR_BANNER
-STR_BANNER: .DB "miniBASIC 65C02 v3.1"
+STR_BANNER: .DB "miniBASIC 65C02 v3.2"
 STR_CRLF:   .DB $0D,$8A
 STR_IN:     .DB " IN",$A0
 STR_BREAK:  .DB $0D,$0A,"BREA",$CB
@@ -537,6 +531,7 @@ KW_ABS:    .DB "A",$C2, <FLT_ABS, >FLT_ABS         ; "AB" with bit7 set on 'B' -
 KW_SQR:    .DB "S",$D1, <FLT_SQRT,>FLT_SQRT        ; "SQ" with bit7 set on 'Q' -- 1-arg flag
 KW_SIN:    .DB "S",$C9, <FLT_SIN, >FLT_SIN         ; "SI" with bit7 set on 'I' -- 1-arg flag
 KW_COS:    .DB "C",$CF, <FLT_COS, >FLT_COS         ; "CO" with bit7 set on 'O' -- 1-arg flag
+KW_TAN:    .DB "T",$C1, <FLT_TAN, >FLT_TAN         ; "TA" with bit7 set on 'A' -- 1-arg flag
 KW_ATN:    .DB "A",$D4, <FLT_ATAN,>FLT_ATAN        ; "AT" with bit7 set on 'T' -- 1-arg flag
 KW_ASIN:   .DB "A",$D3, <FLT_ASIN,>FLT_ASIN        ; "AS" with bit7 set on 'S' -- 1-arg flag
 KW_ACOS:   .DB "A",$C3, <FLT_ACOS,>FLT_ACOS        ; "AC" with bit7 set on 'C' -- 1-arg flag
@@ -1073,6 +1068,16 @@ DO_CHRS:    JSR EAT_PAREN
             LDA T0              ; Load targeted CHR$ value
             BRA DPTL_ENTRY      ; Re-use the space loop infrastructure
 CHK_TAB:
+            LDY #2
+            LDA (IP),Y
+            AND #$DF            ; uppercase-normalize
+            CMP #'B'
+            BEQ TAB_OK          ; 3rd char is 'B' -> real TAB
+            SEC
+            SBC #'A'
+            CMP #26
+            BCC DPNC            ; a letter, not 'B' (e.g. "TAN") -> not TAB
+TAB_OK:
             LDX #KW_TAB-UNI_TAB
             JSR MTCHKW
             BCS DPNC            ; not TAB so jump          
@@ -1531,8 +1536,6 @@ E1L:     JSR WPEEK
          BEQ E1MD
          CMP #'%'
          BEQ E1MD
-         CMP #'^'
-         BEQ E1MD
 E1R:     RTS
 E1MD:    PHA                  ; save operator
          JSR PUSH_FLT_A        ; park FLT_A on hardware stack
@@ -1544,11 +1547,7 @@ E1MD:    PHA                  ; save operator
          BEQ E1ML
          CMP #'/'
          BEQ E1DV
-         CMP #'^'
-         BEQ E1PW
          JSR FLT_MOD
-         BRA E1L
-E1PW:    JSR FLT_POW
          BRA E1L
 E1ML:    JSR FLT_MUL
          BRA E1L
@@ -1575,7 +1574,8 @@ E2NNG:   CMP #'+'
          BEQ E2PS
 E2NFN:   LDX #FUNC_TAB_OFF             ; offset to function section of UNI_TAB - needs Define
          JMP MATCH_DISPATCH   ; enter MATCH_DISPATCH loop at function section
-E2ND:    LDA (IP)
+
+E2ND:    LDA (IP)               ; resume here if no match
          CMP #'0'
          BCC E2VR
          CMP #'9'+1
@@ -2378,19 +2378,6 @@ SHL_MANTISSA:
          RTS
 
 ; =============================================================================
-; FLT_POW -- FLT_A = FLT_A ^ FLT_B  (base^exponent), via EXP(exponent*LN(base))
-;   Domain: base > 0 (inherits FLT_LN's ?2 domain error for base<=0; negative
-;   or non-positive bases -- e.g. (-2)^2 -- are NOT supported).
-;   Clobbers: as FLT_LN, FLT_MUL, FLT_EXP combined
-; =============================================================================
-FLT_POW: 
-         JSR PUSH_FLT_B       ; stash exponent (FLT_LN clobbers FLT_B)
-         JSR FLT_LN            ; FLT_A = ln(base)
-         JSR POP_FLT_B          ; FLT_B = exponent (restored)
-         JSR FLT_MUL             ; FLT_A = exponent * ln(base)
-         JMP FLT_EXP              ; FLT_A = exp(...) = base^exponent; tail-call
-         RTS
-; =============================================================================
 ; FLT_LN -- FLT_A = ln(FLT_A), x > 0 required (?2 domain error otherwise --
 ;   FLT_SQRT still separately clamps negative input to 0.0, its own
 ;   established legacy behavior, rather than erroring)
@@ -2731,7 +2718,7 @@ HORNER_ODD:
 ;   TO-DO: accuracy not formally audited (unlike FLT_ATAN_CORE, which has a
 ;     documented ~1.9e-4 rad bound). One data point: SQRT(4) observed as
 ;     2.00001, i.e. ~5e-5 relative error -- likely fine, not verified further.
-;   Clobbers: A, X, Y, T_S, T_X, FLT_B, FLT_SA, FLT_SB, FLT_ER, FLT_DE,
+;   Clobbers: A, X, Y, FLT_B, FLT_SA, FLT_SB, FLT_ER, FLT_DE,
 ;             FLT_DB, FLT_MA, FLT_MB, FLT_MC, FLT_DVH, FLT_DVM, FLT_DVL
 ; =============================================================================
 FLT_SQRT: LDA FLT_A
@@ -3308,6 +3295,21 @@ FLT_ACOS: JSR FLT_ASIN
           LDX #IDX_PI_2
           JSR FLT_LDCONST      ; FLT_A = pi/2
           JMP FLT_SUB          ; tail: pi/2 - asin(x)
+
+; =============================================================================
+; FLT_TAN -- FLT_A = tan(FLT_A), RADIANS.  tan(x) = sin(x)/cos(x)
+;   Asymptotes (x = pi/2 + n*pi) hit FLT_DIV's zero-divisor trap -> "?2",
+;   same as any other undefined-result case in this library.
+;   Clobbers: as FLT_SIN/FLT_COS/FLT_DIV combined, plus the hardware stack
+;   (one float parked across FLT_SIN, one across FLT_COS).
+; =============================================================================
+FLT_TAN: JSR PUSH_FLT_A       ; park x
+         JSR FLT_SIN            ; FLT_A = sin(x)
+         JSR GET_RIGHT            ; FLT_B = sin(x), FLT_A = x (restored)
+         JSR PUSH_FLT_B             ; park sin(x)
+         JSR FLT_COS                  ; FLT_A = cos(x) (uses restored x)
+         JSR GET_RIGHT                  ; FLT_B = cos(x), FLT_A = sin(x) (restored)
+         JMP FLT_DIV                      ; FLT_A = sin(x)/cos(x); tail-call
 
 ; =============================================================================
 ; FLT_COS  --  FLT_A = cos(FLT_A), RADIANS.  cos(x) = sin(pi/2-x)
