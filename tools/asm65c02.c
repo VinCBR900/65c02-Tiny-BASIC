@@ -1,5 +1,5 @@
 /*
- * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.17, Jul 2026)
+ * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.18, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
@@ -75,6 +75,24 @@
 
  /*
  *  VERSION HISTORY
+ *
+ * v1.18 (2026-07)
+ *   - Fixed strip_comment() silently swallowing the rest of a line
+ *     (including any real ';' comment) when the line contained an odd
+ *     number of '"'/''' characters (e.g. a doubled closing quote); now
+ *     flagged as an "Unterminated quote" error at the offending line.
+ *   - Fixed .byte/.db string literals with no closing '"' being silently
+ *     accepted to end-of-operand instead of raising an error.
+ *   - Fixed .opt/.setcpu silently ignoring an unrecognized or malformed
+ *     CPU-mode argument (missing closing quote, misspelled mode) instead
+ *     of erroring -- cpu_mode was previously left unchanged with no
+ *     diagnostic.
+ *   - Fixed find_binop()/find_cmpop() treating an operator-like character
+ *     inside a 'x' char literal (e.g. the '+' in '+' , or the ',' in ',')
+ *     as a real operator/separator; added mark_quoted() helper.
+ *   - Fixed .byte/.db and .word comma-splitting treating a comma inside a
+ *     quoted char literal as a list separator (e.g. .db ',' now correctly
+ *     assembles as the single byte value 44).
  *
  * v1.17 (2026-07)
  *   - Added -D NAME / -D NAME=EXPR command-line predefines, for use with
@@ -656,10 +674,46 @@ static int asm_predefine(const char *arg) {
     return 1;
 }
 
-/* helper: find rightmost binary operator outside parentheses at given level */
+/*
+ * mark_quoted (v1.18)
+ *   In:  s, len -- expression text and its length
+ *   Out: mask[i] = 1 for every index that lies inside a '...' or "..."
+ *        literal (including the quote characters themselves), 0 otherwise.
+ *        mask must be at least len bytes.
+ *   Clobbers: mask[0..len-1]
+ *
+ *   Used by find_binop()/find_cmpop() so a character that happens to look
+ *   like an operator but is actually the payload of a char literal -- e.g.
+ *   the '+' inside '+' , or the ',' inside ',' -- is never mistaken for a
+ *   real operator/separator. A left-to-right scan is required (unlike the
+ *   right-to-left operator search itself) because quote state can only be
+ *   determined by which quote opened first.
+ */
+static void mark_quoted(const char *s, int len, char *mask) {
+    int in_str = 0; char sq = 0;
+    for (int i = 0; i < len; i++) {
+        char c = s[i];
+        if (in_str) {
+            mask[i] = 1;
+            if (c == sq) in_str = 0;
+        } else if (c == '\'' || c == '"') {
+            mask[i] = 1;
+            in_str = 1; sq = c;
+        } else {
+            mask[i] = 0;
+        }
+    }
+}
+
+/* helper: find rightmost binary operator outside parentheses at given level.
+ * v1.18: now quote-aware via mark_quoted() -- see its header comment. */
 static int find_binop(const char *s, int len, const char *ops) {
+    if (len <= 0 || len >= LINE_LEN) return -1;
+    char mask[LINE_LEN];
+    mark_quoted(s, len, mask);
     int depth = 0;
     for (int i = len-1; i > 0; i--) {
+        if (mask[i]) continue;
         if (s[i] == ')') depth++;
         else if (s[i] == '(') depth--;
         if (depth == 0 && strchr(ops, s[i])) {
@@ -691,8 +745,12 @@ static int find_binop(const char *s, int len, const char *ops) {
  *   '=', never a bare '<' or '>'.
  */
 static int find_cmpop(const char *s, int len) {
+    if (len <= 0 || len >= LINE_LEN) return -1;
+    char mask[LINE_LEN];
+    mark_quoted(s, len, mask);
     int depth = 0;
     for (int i = len-2; i >= 1; i--) {
+        if (mask[i] || mask[i+1]) continue;
         if (s[i] == ')') depth++;
         else if (s[i] == '(') depth--;
         if (depth == 0 && s[i+1]=='=' && (s[i]=='=' || s[i]=='!')) return i;
@@ -1134,8 +1192,16 @@ static int instr_size(const char *mn, Mode m) {
 /*
  * Strip ';' comment, honouring quoted strings.
  * Writes result into buf (max buflen).
+ *
+ * v1.18: added 'unterminated' out-param. Previously a line with an odd
+ * number of '"'/''' characters (e.g. a doubled closing quote, or a
+ * genuinely missing one) left in_str=1 at end-of-line with no signal
+ * to the caller -- the rest of the line, including any real ';' comment,
+ * was silently absorbed as "still inside a string" instead of being
+ * flagged. Caller (parse_line) now surfaces this as a hard error instead
+ * of assembling whatever followed as if it were source text.
  */
-static void strip_comment(const char *src, char *buf, int buflen) {
+static void strip_comment(const char *src, char *buf, int buflen, int *unterminated) {
     int in_str = 0; char sq = 0;
     int j = 0;
     for (int i = 0; src[i] && j < buflen-1; i++) {
@@ -1150,19 +1216,23 @@ static void strip_comment(const char *src, char *buf, int buflen) {
         }
     }
     buf[j] = '\0';
+    if (unterminated) *unterminated = in_str;
 }
 
 /*
  * parse_line: split one source line into label, mnemonic, operand.
  * All three output buffers must be at least LINE_LEN bytes.
  * Returns 1 if line is an equate (NAME = expr), 0 otherwise.
+ * v1.18: unterminated_str (out, may be NULL) is set to 1 if the line had
+ * an unmatched '"' or ''' -- see strip_comment() header comment.
  */
 static int parse_line(const char *raw,
-                      char *label, char *mnem, char *operand) {
+                      char *label, char *mnem, char *operand,
+                      int *unterminated_str) {
     label[0] = mnem[0] = operand[0] = '\0';
 
     char line[LINE_LEN];
-    strip_comment(raw, line, LINE_LEN);
+    strip_comment(raw, line, LINE_LEN, unterminated_str);
     str_trim(line);
     if (!line[0]) return 0;
 
@@ -1253,13 +1323,31 @@ static int parse_dot_byte(const char *operand, int pc, int pass2,
                 if (count < max_out) out[count++] = (uint8_t)*p;
                 p++;
             }
-            if (*p == '"') p++;
+            if (*p == '"') {
+                p++;
+            } else if (pass2) {
+                /* v1.18: ran off the end of the operand without a closing
+                 * quote -- previously this silently accepted whatever text
+                 * followed (often the remains of a swallowed comment, see
+                 * strip_comment()) as literal data bytes with no diagnostic. */
+                add_error(lineno, ".byte: unterminated string literal (missing closing \")");
+            }
         } else {
-            /* expression: read until next comma outside parens */
+            /* expression: read until next comma outside parens and outside
+             * any quoted char literal.
+             * v1.18: previously depth-tracked parens only, so a literal
+             * comma char like .db ',' was split at the comma INSIDE the
+             * quotes, producing two malformed one-character fragments
+             * instead of the single token "','" (value 44). */
             int depth = 0;
+            int in_str = 0; char sq = 0;
             const char *start = p;
             while (*p) {
-                if (*p == '(') depth++;
+                if (in_str) {
+                    if (*p == sq) in_str = 0;
+                } else if (*p == '\'' || *p == '"') {
+                    in_str = 1; sq = *p;
+                } else if (*p == '(') depth++;
                 else if (*p == ')') depth--;
                 else if (*p == ',' && depth == 0) break;
                 p++;
@@ -1737,7 +1825,12 @@ static int assemble(const char *source) {
     for (int li = 0; li < nl; li++) {
         int lineno = li + 1;
         char label[LINE_LEN], mnem[LINE_LEN], operand[LINE_LEN];
-        int is_eq = parse_line(raw_lines[li], label, mnem, operand);
+        int unterm = 0;
+        int is_eq = parse_line(raw_lines[li], label, mnem, operand, &unterm);
+        if (unterm) {
+            add_error(lineno, "Unterminated quote: unmatched ' or \" on this line "
+                               "(a real comment after it may have been swallowed)");
+        }
 
         /* store in pc_map */
         LineInfo *info = &pc_map[nlines++];
@@ -1817,9 +1910,17 @@ static int assemble(const char *source) {
             pc += n; continue;
         }
         if (!strcmp(mn, ".word")) {
-            /* count comma-separated items */
+            /* count comma-separated items.
+             * v1.18: skip quote-interior commas, e.g. .word ',' is one
+             * item (the char literal), not two -- same bug class as the
+             * .byte comma-splitter fix above. */
             int cnt = 1;
-            for (const char *q = operand; *q; q++) if (*q == ',') cnt++;
+            int in_str = 0; char sq = 0;
+            for (const char *q = operand; *q; q++) {
+                if (in_str) { if (*q == sq) in_str = 0; }
+                else if (*q == '\'' || *q == '"') { in_str = 1; sq = *q; }
+                else if (*q == ',') cnt++;
+            }
             if (!operand[0]) cnt = 0;
             pc += cnt * 2; continue;
         }
@@ -2114,10 +2215,13 @@ static int assemble(const char *source) {
             while (*q) {
                 q = skip_ws(q);
                 if (!*q) break;
-                /* read one comma-delimited item */
-                int depth=0; const char *start=q;
+                /* read one comma-delimited item (v1.18: quote-aware, see
+                 * the matching .byte expression-scan fix above) */
+                int depth=0; int in_str=0; char sq=0; const char *start=q;
                 while (*q) {
-                    if (*q=='(') depth++;
+                    if (in_str) { if (*q==sq) in_str=0; }
+                    else if (*q=='\'' || *q=='"') { in_str=1; sq=*q; }
+                    else if (*q=='(') depth++;
                     else if (*q==')') depth--;
                     else if (*q==',' && depth==0) break;
                     q++;
@@ -2210,7 +2314,9 @@ static int assemble(const char *source) {
             char arg[LINE_LEN]; str_lower(arg, op);
             char *ap = arg;
             if (*ap == '"') { ap++; char *eq = strchr(ap,'"'); if(eq) *eq='\0'; }
+            int recognised = 0;
             if (!strcmp(ap,"proc6502") || !strcmp(ap,"6502")) {
+                recognised = 1;
                 if (g_nowarn65c02) {
                     add_error(lineno,
                         "'.opt proc6502' conflicts with -NoWarn65c02 on the command line");
@@ -2218,11 +2324,25 @@ static int assemble(const char *source) {
                 cpu_mode = 1;
             }
             if (!strcmp(ap,"proc65c02")|| !strcmp(ap,"65c02")) {
+                recognised = 1;
                 if (g_strict6502) {
                     add_error(lineno,
                         "'.opt proc65c02' conflicts with -Strict6502 on the command line");
                 }
                 cpu_mode = 2;
+            }
+            /* v1.18: a malformed or misspelled mode (missing closing quote,
+             * "6503", "proc6052", etc) previously fell through both checks
+             * above silently -- cpu_mode was left unchanged with no
+             * diagnostic at all, so every later 65C02-only-instruction
+             * check ran against the wrong assumption for the rest of the
+             * file. Only .opt/.setcpu are checked here -- .code/.segment
+             * are accepted-but-ignored compatibility no-ops and were never
+             * documented as taking a CPU-mode argument. */
+            if (!recognised && (!strcmp(mn,".opt") || !strcmp(mn,".setcpu"))) {
+                char msg[ERR_LEN];
+                snprintf(msg, ERR_LEN, "%s: unrecognized mode '%s'", mn, op);
+                add_error(lineno, msg);
             }
             continue;
         }
@@ -2585,7 +2705,7 @@ static int parse_hex_range(const char *s, int *start, int *end) {
 
 static void asm_usage(FILE *out) {
     fprintf(out,
-        "asm65c02 v1.17 - Toy 65C02/6502 two-pass assembler\n"
+        "asm65c02 v1.18 - Toy 65C02/6502 two-pass assembler\n"
         "\n"
         "Copyright Vincent Crabtree 2026, MIT License, See LICENSE file\n"
         "\n"
