@@ -1,5 +1,5 @@
 ; =============================================================================
-; miniBASIC 65C02 v3.2
+; miniBASIC 65C02 v3.4
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; 4KB Float BASIC (MBF4) for the 65C02.
@@ -50,6 +50,13 @@
 ;   (roughly |x| > 88, i.e. beyond this float format's representable range
 ;   in either direction) raises a "?2" error.
 ;
+; X^Y is computed as EXP(Y*LN(X)):
+;   - X must be positive; X<=0 raises LN's "?2" domain error, negative base 
+;     not supported e.g. (-2)^2.
+;   - Binds tighter than * / % (proper BODMAS/PEMDAS) and is right-
+;     associative, so "2*3^2"=18 and "2^3^2"=512, matching convention.
+;   - Inherits EXP's overflow/underflow "?2" error for extreme results.
+;
 ; SIN/COS accurate to ~0.0002 rad on their core polynomial domain (see
 ;   FLT_SIN/FLT_COS headers). Range reduction (mod 2*PI) itself breaks down
 ;   for |x| gtr-or-eq ~205,887 (32767 * 2*PI) -- FLT_MOD's FLOOR step
@@ -76,9 +83,33 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ;
+; v3.4 (2026-07) - 10 bytes free
+;   - RESTORED: X^Y power operator, this time with correct BODMAS/PEMDAS
+;     precedence - binds tighter than * / %, right-associative 
+;   - DEDUPED: E1_RHS -- shared "park left, consume operator, parse right
+;     via EXPR1P, GET_RIGHT to combine" glue, previously duplicated between
+;     EXPR1's E1MD (*/ %) and EXPR1P's own recursive ^ case (found via
+;     asmdup.py). +5 bytes. Must be entered via JSR+RTS, never a tail-call
+;     JMP into GET_RIGHT -- GET_RIGHT/PUSH_FLT_A/POP_FLT_A rely on stealing
+;     a genuine JSR return address for their park/restore trick; a JMP
+;     doesn't provide one, and an earlier attempt at this exact extraction
+;     used JMP and silently corrupted FLT_MUL's first real call, confirmed
+;     via full regression before landing the corrected version.
+;
+; v3.3 (2026-07) - 42 bytes free
+;   - ADDED: "Hypnotic Eye" showcase section (lines 262-289) -- a logarithmic
+;     ripple stress-testing SQRT/SIN/EXP/LN together, including a deliberate
+;     LN(0)-avoidance guard (D<0.05 check) at the ripple's exact center.
+;     RAM-resident showcase text only; no ROM code changed, no byte-budget
+;     impact.
+;   - Refactor for size:
+;       - NEG16 -- shared 16-bit negate, previously duplicated in FLT_TO_INT
+;       - CALC_INT_LN2 -- shared "float(staged int)*ln(2)" step
+;
 ; v3.2 (2026-07) - 21 bytes free
 ;   - Restored TAN function, modified DO_PRINT for TAB vs TAN.
-;   - Deleted POWER `^` due to incorrect Operater precidence, no space to fix.
+;   - Deleted POW `^` due to incorrect Operater precidence no space to fix
+;     at the time, and limited range that could catch you out.
 ;   - Cleaned up Page Zero for stale entries - 16 zp bytes free for expansion. 
 ;
 ; v3.1 (2026-07) - 34 bytes free
@@ -92,13 +123,11 @@
 ;   - FIXED: FLT_SQRT negative input clamps to 0.0 corrected
 ;   - FIXED: TAB(n) for negative n now correctly prints nothing 
 ;   - ADDED: domain guard on LN(x<=0) -- raises "?2" instead of returning a
-;     large-but-finite nonsense value.
+;     large nonsense value.
 ;   - ADDED: range guard on EXP(x) -- raises "?2" for |x| beyond what the
-;     8-bit EXP_K scratch byte can hold, instead of silently wrapping to a
-;     wrong-signed, wrong-magnitude result
-;   - ADDED: X^Y power operator via EXP(Y*LN(X)), same precedence tier as
-;     * / % to fit the ROM budget (see Known Limitations for the precedence
-;     and negative-base caveats).
+;     8-bit EXP_K scratch byte can hold, instead of silently wrapping.
+;   - ADDED: X^Y power operator via EXP(Y*LN(X)), same precedence as * / % to
+;     fit ROM, Base must be >=0 (No negative or zero base). No space to fix. 
 
 ; v2.15 (2026-07) - 34 bytes free
 ;   - Removed TAN() to reclaim ROM space; users can implement it via SIN()/COS().
@@ -157,7 +186,7 @@
 ;   - ADDED: DO_LIST range support (LIST n,m) using persistent 16-bit bounds.
 ;   - REFACTORED: DO_POKE inline body promoted to shared GET_TWO_ARGS routine.
 ;   - OPTIMIZED: FLT_LDCONST and FLT_LDCONST_B merged via BIT-trick.
-;   - OPTIMIZED: Extracted LD_PI_FUNC helper to factor out duplicated sequences 
+;   - OPTIMIZED: Extracted LD_PI_B helper to factor out duplicated sequences 
 ;     in FLT_SIN.
 ;   - OPTIMIZED: FLT_SIN RAM-buffer save/restore replaced with stack 
 ;     trampolines (PUSH_FLT_A, POP_FLT_B).
@@ -410,30 +439,34 @@ PROG:
          .DB $F2,$00,"PRINT ",$22,"EXP(LN(2))=",$22,";EXP(LN(2));",$22," LN(EXP(2))=",$22,";LN(EXP(2))",$0D
          .DB $F3,$00,"PRINT ",$22,"=== Power Math (X^Y) ===",$22,$0D
          .DB $F4,$00,"PRINT ",$22,"2^8 = EXP(8*LN(2)) = ",$22,";EXP(8*LN(2))",$0D
-         .DB $F5,$00,"PRINT ",$22,"=== Damped Wave w/ Axis ===",$22,$0D
-         .DB $F6,$00,"FOR T=0 TO 15 STEP 0.4",$0D
-         .DB $F7,$00,"LET Y=30 + 25 * EXP(-0.25*T) * SIN(T)",$0D
-         .DB $F8,$00,"REM -- IS THE WAVE LEFT OF CENTER? --",$0D
-         .DB $F9,$00,"IF Y<29 THEN GOTO 256",$0D
-         .DB $FA,$00,"REM -- IS THE WAVE RIGHT OF CENTER? --",$0D
-         .DB $FB,$00,"IF Y>31 THEN GOTO 259",$0D
-         .DB $FC,$00,"REM -- WAVE IS CROSSING THE CENTER LINE --",$0D
-         .DB $FD,$00,"PRINT TAB(30);",$22,"*",$22,$0D
-         .DB $FE,$00,"GOTO 261",$0D
-         .DB $FF,$00,"REM -- PRINT LEFT WAVE THEN AXIS --",$0D
-         .DB $00,$01,"PRINT TAB(Y);",$22,"*",$22,";TAB(30-Y-1);",$22,"|",$22,$0D
-         .DB $01,$01,"GOTO 261",$0D
-         .DB $02,$01,"REM -- PRINT AXIS THEN RIGHT WAVE --",$0D
-         .DB $03,$01,"PRINT TAB(30);",$22,"|",$22,";TAB(Y-30-1);",$22,"*",$22,$0D
-         .DB $04,$01,"REM -- NEXT STEP --",$0D
-         .DB $05,$01,"NEXT T",$0D
-         .DB $22,$01,"REM ============================================",$0D
-         .DB $2C,$01,"REM VORTEX.BAS V1.1 - TRIG LIBRARY STRESS TEST",$0D
+         .DB $09,$01,"PRINT ",$22,"=== HYPNOTIC EYE - LN/EXP/TRIG STRESS TEST ===",$22,$0D
+         .DB $0A,$01,"FOR R=0 TO 26",$0D
+         .DB $0B,$01,"LET Y=(R-13)/10",$0D
+         .DB $0C,$01,"LET L=0",$0D
+         .DB $0D,$01,"FOR C=0 TO 60",$0D
+         .DB $0E,$01,"LET X=(C-30)/20",$0D
+         .DB $0F,$01,"LET D=SQRT(X*X+Y*Y)",$0D
+         .DB $10,$01,"REM -- Catch center to avoid LN(0) crash --",$0D
+         .DB $11,$01,"IF D<0.05 THEN GOTO 284",$0D
+         .DB $12,$01,"REM -- The Math: Sine wave dampened by EXP and LN --",$0D
+         .DB $13,$01,"LET W=SIN(10*D) * EXP(-0.5 * (LN(D)*LN(D)))",$0D
+         .DB $14,$01,"REM -- Map to positive space --",$0D
+         .DB $15,$01,"LET Z=(W+1)/2",$0D
+         .DB $16,$01,"LET S=32",$0D
+         .DB $17,$01,"IF Z>0.30 THEN LET S=46",$0D
+         .DB $18,$01,"IF Z>0.45 THEN LET S=45",$0D
+         .DB $19,$01,"IF Z>0.60 THEN LET S=43",$0D
+         .DB $1A,$01,"IF Z>0.75 THEN LET S=42",$0D
+         .DB $1B,$01,"IF Z>0.90 THEN LET S=64",$0D
+         .DB $1C,$01,"IF D<0.05 THEN LET S=32",$0D
+         .DB $1D,$01,"PRINT TAB(C-L);CHR$(S);",$0D
+         .DB $1E,$01,"LET L=C+1",$0D
+         .DB $1F,$01,"NEXT C",$0D
+         .DB $20,$01,"PRINT",$0D
+         .DB $21,$01,"NEXT R",$0D
          .DB $36,$01,"PRINT ",$22,"=== Render A Warped 3D Spiral Vortex to Test: ===",$22,$0D
          .DB $40,$01,"PRINT ",$22,"SIN, COS, TAN, ASIN, ACOS, ATN, SQRT",$22,$0D
-         .DB $4A,$01,"REM L TRACKS LAST COLUMN SINCE TAB() HERE PRINTS",$0D
-         .DB $54,$01,"REM N SPACES, NOT AN ABSOLUTE COLUMN",$0D
-         .DB $5E,$01,"REM ============================================",$0D
+         .DB $4A,$01,"REM L TRACKS LAST COLUMN SINCE TAB(n) HERE PRINTS n spaces",$0D
          .DB $68,$01,"LET H=27",$0D
          .DB $72,$01,"LET V=13",$0D
          .DB $7C,$01,"FOR R=0 TO 26",$0D
@@ -498,7 +531,7 @@ SHOWCASE_END: ; audit
 
          .ORG $F000
 STR_PAGE = >STR_BANNER
-STR_BANNER: .DB "miniBASIC 65C02 v3.2"
+STR_BANNER: .DB "miniBASIC 65C02 v3.4"
 STR_CRLF:   .DB $0D,$8A
 STR_IN:     .DB " IN",$A0
 STR_BREAK:  .DB $0D,$0A,"BREA",$CB
@@ -1528,7 +1561,7 @@ EASB:    JSR FLT_SUB
 ;   Out: FLT_A = product/quotient/remainder; IP advanced
 ;   Clobbers: A, X, Y, FLT_A, FLT_B, IP
 ; =============================================================================
-EXPR1:   JSR EXPR2
+EXPR1:   JSR EXPR1P
 E1L:     JSR WPEEK
          CMP #'*'
          BEQ E1MD
@@ -1538,10 +1571,7 @@ E1L:     JSR WPEEK
          BEQ E1MD
 E1R:     RTS
 E1MD:    PHA                  ; save operator
-         JSR PUSH_FLT_A        ; park FLT_A on hardware stack
-         JSR GETCI
-         JSR EXPR2             ; right -> FLT_A
-         JSR GET_RIGHT          ; FLT_B = FLT_A (right), restore parked FLT_A
+         JSR E1_RHS            ; FLT_B = right (via EXPR1P), FLT_A restored
          PLA                   ; pull operator
          CMP #'*'
          BEQ E1ML
@@ -1553,6 +1583,8 @@ E1ML:    JSR FLT_MUL
          BRA E1L
 E1DV:    JSR FLT_DIV
          BRA E1L
+
+
 
 ; =============================================================================
 ; EXPR2  --  atom level: parenthesised expr, unary +/-, CHR$/PEEK/USR/SIN/COS
@@ -2087,8 +2119,10 @@ MKFL:    LDA LP
          SEC
          RTS
 
+; =============================================================================
 ; FLT_RND -- FLT_A = pseudorandom float, 0 <= x < 1 (LFSR value / 32768)
 ;   Out: FLT_A = result.  Clobbers: as RND_SHUFFLE/FLT_FROM_INT/FLT_DIV
+; =============================================================================
 FLT_RND: JSR RND_SHUFFLE
          LDA RND_SEED
          STA T0
@@ -2109,6 +2143,7 @@ FLT_ABS: LDA FLT_A+1
          STA FLT_A+1
          RTS
 
+; =============================================================================
 ; SIGN_XOR -- FLT_SA = sign bit of (FLT_A's sign XOR FLT_B's sign); used by
 ; FLT_MUL/FLT_DIV to work out the result's sign before combining magnitudes.
 ; Clobbers: A.
@@ -2117,6 +2152,21 @@ SIGN_XOR:
          EOR FLT_B+1
          AND #$80
          STA FLT_SA
+         RTS
+
+; =============================================================================
+; CALC_SIGN_EXP -- shared FLT_MUL/FLT_DIV tail: A in = staged FLT_ER value.
+;   Stores FLT_ER, XORs the result sign, sets both operands' sign bits
+;   positive (magnitude-only from here on), and leaves X=2 for the caller's
+;   own copy loop. Found via asmdup.py. Clobbers: A, X, FLT_ER, FLT_SA.
+; =============================================================================
+CALC_SIGN_EXP:
+         STA FLT_ER
+         JSR SIGN_XOR
+         LDA #$80
+         TSB FLT_A+1
+         TSB FLT_B+1
+         LDX #2
          RTS
          
 ; =============================================================================
@@ -2140,7 +2190,7 @@ FLT_A_TO_B:
 
 ; Returns PI in FLT A and FLT B for Radian/degree conversions
 FLT_PI:
-        JSR LD_PI_FUNC
+        JSR LD_PI_B
         ; drop through
 FLT_B_TO_A:
         JSR PUSH_FLT_B
@@ -2239,13 +2289,7 @@ F_NONZERO:
          STA FLT_SA
          BEQ F_POS
 
-         LDA #0
-         SEC
-         SBC T0
-         STA T0
-         LDA #0
-         SBC T0+1
-         STA T0+1
+         JSR NEG16
 
 F_POS:   LDA #$90
          STA FLT_ER
@@ -2305,6 +2349,7 @@ FTIG:    LDA FLT_A+1
          BMI FTIN
 FTID:    RTS
 
+NEG16:
 FTIN:    LDA #0
          SEC
          SBC T0
@@ -2375,7 +2420,60 @@ SHL_MANTISSA:
          ROL FLT_A+3
          ROL FLT_A+2
          ROL FLT_A+1
+E1PR:    RTS
+
+; =============================================================================
+; CALC_INT_LN2 -- FLT_A = float(T0)*ln(2), where T0 is an already-staged
+;   16-bit signed int (FLT_FROM_INT's input). Shared by FLT_LN (E*ln2) and
+;   FLT_EXP (k*ln2) -- found via asmdup.py. Clobbers: as FLT_FROM_INT,
+;   FLT_MUL combined.
+; =============================================================================
+CALC_INT_LN2:
+        JSR FLT_FROM_INT
+        LDX #IDX_LN2
+        JSR FLT_LDCONST_B
+        JMP FLT_MUL            ; tail call
+
+; =============================================================================
+; E1_RHS -- shared by EXPR1's E1MD and EXPR1P's own recursive ^ case: park
+;   the left operand, consume the operator char, parse the right operand
+;   (through EXPR1P, so ^ chains bind correctly), then GET_RIGHT to combine.
+;   Must use JSR+RTS here, not a tail-call JMP into GET_RIGHT -- GET_RIGHT
+;   relies on stealing a genuine JSR return address for its park/restore
+;   trick, and a tail-call doesn't provide one (confirmed the hard way).
+;   Found via asmdup.py. Clobbers: as PUSH_FLT_A/GETCI/EXPR1P/GET_RIGHT.
+; =============================================================================
+E1_RHS:  JSR PUSH_FLT_A
+         JSR GETCI
+         JSR EXPR1P
+         JSR GET_RIGHT
          RTS
+
+; =============================================================================
+; EXPR1P -- power level: right-associative x^y, binds tighter than * / %
+;   (BODMAS/PEMDAS-correct, unlike the earlier same-precedence attempt).
+;   Recursive on the right operand so "2^3^2" = "2^(3^2)" = 512, matching
+;   convention -- and cheaper than a left-associative loop besides, since
+;   the recursive tail-call skips needing its own BRA back-edge.
+; =============================================================================
+EXPR1P:  JSR EXPR2
+         JSR WPEEK
+         CMP #'^'
+         BNE E1PR
+         JSR E1_RHS            ; FLT_B = right (via EXPR1P), FLT_A restored
+;         JMP FLT_POW              ; tail call
+        ; drop through
+; =============================================================================
+; FLT_POW -- FLT_A = FLT_A ^ FLT_B  (base^exponent), via EXP(exponent*LN(base))
+;   Domain: base > 0 (inherits FLT_LN's ?2 domain error for base<=0; negative
+;   or non-positive bases -- e.g. (-2)^2 -- are NOT specially supported).
+;   Clobbers: as FLT_LN, FLT_MUL, FLT_EXP combined.
+; =============================================================================
+FLT_POW: JSR PUSH_FLT_B       ; stash exponent (FLT_LN clobbers FLT_B)
+         JSR FLT_LN            ; FLT_A = ln(base)
+         JSR POP_FLT_B          ; FLT_B = exponent (restored)
+         JSR FLT_MUL             ; FLT_A = exponent * ln(base)
+         JMP FLT_EXP              ; FLT_A = exp(...) = base^exponent; tail call
 
 ; =============================================================================
 ; FLT_LN -- FLT_A = ln(FLT_A), x > 0 required (?2 domain error otherwise --
@@ -2403,12 +2501,10 @@ LN_SAVEM: LDA FLT_A,X
         STA LN_M,X              ; stash m (dedicated scratch, not FP_TMP)
         DEX
         BPL LN_SAVEM
-
         LDX #IDX_ONE
         JSR FLT_LDCONST_B       ; FLT_B = 1.0
         JSR FLT_SUB              ; FLT_A = m - 1  (FLT_B now permanently -1.0)
         JSR PUSH_FLT_A            ; stash (m-1) -- paired with POP_FLT_A below
-
         LDX #3
 LN_RESTM: LDA LN_M,X
         STA FLT_A,X               ; FLT_A = m (restored)
@@ -2436,10 +2532,7 @@ LN_RESTM: LDA LN_M,X
 LN_EPOS: STA T0+1
 
         JSR PUSH_FLT_A            ; NOW park ln(m)
-        JSR FLT_FROM_INT            ; FLT_A = float(E)
-        LDX #IDX_LN2
-        JSR FLT_LDCONST_B             ; FLT_B = ln(2)
-        JSR FLT_MUL                     ; FLT_A = E*ln(2)
+        JSR CALC_INT_LN2            ; FLT_A = float(E)*ln(2)
         JSR POP_FLT_B                     ; FLT_B = ln(m) -- balances the
                                            ;  PUSH_FLT_A just above
         ;JMP FLT_ADD                         ; FLT_A = E*ln2 + ln(m); tail call
@@ -2763,10 +2856,7 @@ EK_FITS:
                                        ;  scratch -- simpler and safer than
                                        ;  interleaving a raw PHA inside the
                                        ;  x park/restore pair above)
-        JSR FLT_FROM_INT                ; FLT_A = float(k)
-        LDX #IDX_LN2
-        JSR FLT_LDCONST_B                 ; FLT_B = ln(2)
-        JSR FLT_MUL                         ; FLT_A = k*ln(2)
+        JSR CALC_INT_LN2                ; FLT_A = float(k)*ln(2)
         JSR GET_RIGHT          ; FLT_B = FLT_A (right), restore parked FLT_A
                                                  ;  balances the PUSH_FLT_A
                                                  ;  at entry
@@ -2812,12 +2902,7 @@ FMNZ:    LDA FLT_A              ; Er = A + B - 128 (XOR $80 == -128 mod 256)
          CLC
          ADC FLT_B
          EOR #$80
-         STA FLT_ER
-         JSR SIGN_XOR
-         LDA #$80
-         TSB FLT_A+1
-         TSB FLT_B+1
-         LDX #2                 ; copy A to MA..MC (multiplicand, gets shifted)
+         JSR CALC_SIGN_EXP
 FM_CPY:  LDA FLT_A+1,X          ; and clear FLT_A+1..3 (accumulator)
          STA FLT_MA,X
          STZ FLT_A+1,X
@@ -2917,12 +3002,7 @@ FDANZ:   LDA FLT_A
          SBC FLT_B
          CLC
          ADC #$80
-         STA FLT_ER
-         JSR SIGN_XOR
-         LDA #$80
-         TSB FLT_A+1
-         TSB FLT_B+1
-         LDX #2                ; looped copy: FLT_B+1..+3 -> DVH/DVM/DVL,
+         JSR CALC_SIGN_EXP
 FD_CPY:  LDA FLT_B+1,X         ;              FLT_A+1..+3 -> T0/T0+1/T1
          STA FLT_DVH,X
          LDA FLT_A+1,X
@@ -3335,16 +3415,16 @@ FLT_SIN:
          PHA                   ; stash original sign
          RMB7 FLT_A+1            ; FLT_A = |x| (radians)
 
-         JSR LD_PI_FUNC        ; FLT_B = pi
+         JSR LD_PI_B        ; FLT_B = pi
          INC FLT_B              ; FLT_B = 2*pi (NORM_PACK always leaves
                                  ;               constants normalised)
          JSR FLT_MOD           ; FLT_A = |x| mod 2*pi
 
-         JSR LD_PI_FUNC         ; fold [0,2pi) -> [0,pi]
+         JSR LD_PI_B         ; fold [0,2pi) -> [0,pi]
          JSR FLT_SUB            ; FLT_A = (x mod 2pi) - pi
          LDA FLT_A+1
          BPL FS_GT_PI
-         JSR LD_PI_FUNC          ; <= pi: undo the subtraction (add pi back)
+         JSR LD_PI_B          ; <= pi: undo the subtraction (add pi back)
          JSR FLT_ADD
          BRA FS_FOLD2
 FS_GT_PI: PLA
@@ -3369,9 +3449,7 @@ FS_LE_PI2:
 
 FS_POLY:                        ; sin(x) ~= x*P(x^2) via the shared
                                  ; HORNER_ODD evaluator (squares z, evals
-                                 ; P(z^2), multiplies back by z). Same
-                                 ; coefficients as the original hand-
-                                 ; unrolled form, just Horner-ordered.
+                                 ; P(z^2), multiplies back by z).
          LDA #<SIN_POLY_TBL
          LDX #>SIN_POLY_TBL
          JSR HORNER_ODD         ; FLT_A = x * P(x^2) = sin(x)
@@ -3416,9 +3494,9 @@ FLCLP:   LDA (T0),Y
          BPL FLCLP
          RTS
 
-; LD_PI_FUNC -- FLT_B = pi. 
+; LD_PI_B -- FLT_B = pi. 
 ;   Out: FLT_B = pi.  Clobbers: A, X, Y, T0, T1
-LD_PI_FUNC:
+LD_PI_B:
          LDX #IDX_PI_2
          JSR FLT_LDCONST_B     ; FLT_B = pi/2
          INC FLT_B             ; FLT_B = pi (exponent-INC = *2)
