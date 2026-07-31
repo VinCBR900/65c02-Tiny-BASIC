@@ -17,7 +17,7 @@ KOWALSKI   = 1
 ;
 ; RAM layout for 1 KB target:
 ;   $0000-$008C  zero-page (IP/CURLN/PE/LP/T0-T2/RUN/OP/IBUF/T3
-;                GCHRX/VARS/RUNSP/T3/GOSUB_SP/GOSUB stack)
+;                VARS/RUNSP/GOSUB_SP/GOSUB stack)
 ;   $0100-$017F  Hardware stack (page 1, mandatory)
 ;   $0180-$03FF  BASIC program store (RAM_TOP=$0400)
 ;
@@ -34,11 +34,10 @@ KOWALSKI   = 1
 ;
 ; KNOWN LIMITATIONS
 ;
-; Two Character keyword matching - to save ROM space, only 2 chars are
-;   matched, then the rest of the word is consumed until a space or `(`.
-;   So spaces are needed: `10 PRINT TAB(5)` works, `10 PR TA(5)` also
-;   works, but `10 PRINTTAB(5)` is parsed as PRINT with "(5)" as its first
-;   expression, printing "5" (not 5 spaces).
+; Two Character keyword matching - only 2 chars matched then rest of the word
+;   is consumed until a space or `(`.  Spaces are needed: `10 PRINT TAB(5);"Hello"`
+;   works, `10 PR TA(5);"Hello"` also works, but `10 PRINTTAB(5);"Hello"` prints
+;   "5Hello", not 5 spaces.
 ;
 ; Variables: 26 single-letter A-Z only; anything else (e.g. "LET AB=5")
 ;   raises "?4 bad variable name".
@@ -58,14 +57,13 @@ KOWALSKI   = 1
 ;
 ; GOTO/GOSUB to an undefined line number raises "?1".
 ;
-; Input buffer is 31 usable chars + CR terminator. Each keypress past the
-;   limit sounds BELL ($07) and is discarded outright -- not stored, not
+; Input buffer is 40 usable chars + CR terminator. Each keypress past the
+;   limit sounds BELL ($07) and is discarded -- not stored, not
 ;   echoed, index does not advance. Backspace still deletes normally from
 ;   a full buffer.
 ;
 ; TAB(n) and CHR$(n) are valid only in PRINT line 
-;   TAB(n) prints n spaces (not jump to column n). TAB(0) is skipped, but 
-;   TAB(n) is MOD 256 low byte e.g. TAB(-5) prints 251 spaces (256-5). 
+;   TAB(n) prints n=1..127 spaces, not jump to col n. Negative/Zero n ignored.
 ;
 ; Error codes (printed as "?N"):
 ;   ?0  syntax / bad expression
@@ -83,10 +81,10 @@ KOWALSKI   = 1
 ;   Base $0180 to ceiling RAM_TOP ($0400 for 1 KB SRAM).
 ;   Line format:  <lineno_lo> <lineno_hi> <raw ASCII body> <CR>
 ;   No tokenisation; body bytes are stored exactly as typed.
-;
 ; ---- version lineage --------------------------------------------------------
-;   V1.7 (Jul 2026)   10 bytes free.  Fixed Kowalski-incompatible syntax in UNI_TAB 
-;                     `<(label-1), >(label-1)` rewritten as `.DW label-1` instead.  
+;   V1.7 (Jul 2026)   21 bytes free.  Fixed Kowalski-incompatible syntax in UNI_TAB 
+;                     `<(label-1), >(label-1)` rewritten as `.DW label-1` instead.
+;                     Refactored GETLINE to Y counter, updated DELAY for ZP not Y.  
 ;   V1.6 (Jul 2026)   Fixed GETLINE buffer-overflow: GETCH echoed every character
 ;                     unconditionally before GETLINE could check for buffer-full.
 ;   V1.5 (Jul 2026)   Merged ST_TAB (statements) and EXPR2's linear 
@@ -125,7 +123,7 @@ RAM_TOP  = $0400             ; Bell board has 1k SRAM (1 KB: 2x 2114)
 
 HWSTACK  = $7f               ; Give more space to PROG
 PROG     = $101 + HWSTACK    ; Prog Start above Stack 
-IBUF_MAX = 31                ; highest valid index into IBUF
+IBUF_MAX = 41                ; highest valid index into IBUF
 CR       = $0D               ; ASCII carriage return
 LF       = $0A               ; ASCII line feed
 BS       = $08               ; ASCII backspace
@@ -150,7 +148,7 @@ ERR_RET  = 5                 ; RETURN without GOSUB
         .IF KOWALSKI
         JMP INIT	; 3 bytes
         NOP		; 1 byte
-T0	         = 0		; Manually overwrite trampoline
+T0	     = 0		; Manually overwrite trampoline
 T1          = 2
 	.ELSE        
 T0:         .RS 2              ; 16-bit: primary scratch word / expression result
@@ -160,20 +158,19 @@ T1:         .RS 2              ; 16-bit: secondary scratch word
 ; Note IP and CURLN must be sequential for GOSUB/RETURN stack push
 T2:         .RS 2              ; 16-bit: tertiary scratch word / STMT jump target
 T3:         .RS 2              ; 16-bit: PNUM x10-multiply scratch, RXCHAR/TXCHAR
-T4:         .RS 2              ; 16-bit: Used in DO_POKE, free for others
+T4:         .RS 2              ; 16-bit: General scratch, DO_POKE, DELAY, free for others
 IP:         .RS 2              ; 16-bit: interpreter pointer
 CURLN:      .RS 2              ; 16-bit: currently-executing line number
 PE:         .RS 2              ; 16-bit: program end (one past last byte)
 LP:         .RS 2              ; 16-bit: line pointer / multi-purpose scratch
-RND_SEED:   .RS 2              ; 16-bit: Galois LFSR state for RND (lo=$8A, hi=$8B)
+RND_SEED:   .RS 2              ; 16-bit: Galois LFSR state for RND 
 RUN:        .RS 1              ; 8-bit:  run flag ($00 = immediate, $FF = running)
 OP:         .RS 1              ; 8-bit:  saved operator for MUL/DIV/MOD ('*'/'/'/'%')
-GCHRX:      .RS 1              ; 8-bit:  GETLINE: buffer index X saved across JSR GETCH
 RUNSP:      .RS 1              ; 8-bit:  stack-pointer snapshot for GOTO/BREAK unwind
-GOSUB_SP:   .RS 1              ; 8-bit:  GOSUB/RETURN stack pointer (holds a ZP address directly)
+GOSUB_SP:   .RS 1              ; 8-bit:  GOSUB/RETURN stack pointer (holds ZP address directly)
 GOSUB_LO:   .RS 32             ; base of the 8-level GOSUB return-frame stack (32 bytes)
 VARS:       .RS 52             ; 52-byte variable store (A-Z, 2 bytes each)
-IBUF:       .RS IBUF_MAX+1   ; 32-byte input line buffer - coudl be bigger
+IBUF:       .RS IBUF_MAX+1     ; Input line buffer 
 ZPEND:		; audit
 ; Defined here so no forward reference
 GOSUB_FULL = GOSUB_LO+3    ; lowest X for which a full 4-byte push still fits 
@@ -200,7 +197,6 @@ GOSUB_TOP  = GOSUB_LO+31   ; initial/empty GOSUB_SP value (topmost stack byte)
 ;   v1.8:  Added GOSUB/RETURN, TAB, FREE, and POKE/PEEK sections
 ;   v1.1:  Mandelbrot column scan adjusted from -128..16 to -120..4
 ; =============================================================================
-         .ORG PROG
 
          .DB $0A,$00,"REM uBASIC v1.4 - SHOWCASE",CR        ; 10 REM uBASIC - SHOWCASE
          .DB $14,$00,"PRINT ",$22,"-- uBASIC v1.4 SHOWCASE --",$22,CR ; 20 PRINT "-- uBASIC SHOWCASE --"
@@ -291,7 +287,6 @@ SHOWCASE_END:	.DB 0
 
         .ENDIF
 
-
 ; =============================================================================
 ; ROM START  ($F800)
          .ORG $F800
@@ -316,9 +311,9 @@ T_K   = 203              ; $4B + $80  ('K' -- BREAK, PEEK)
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
         .IF KOWALSKI
 STR_BANNER: .DB "uBASIC6502 v1.7"  ; startup banner, rolls into CRLF
-.ELSE
+        .ELSE
 STR_BANNER: .DB "JB uBASIC v1.7"  ; startup banner, rolls into CRLF
-.ENDIF
+        .ENDIF
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
 STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
@@ -332,8 +327,7 @@ STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
 ;     function section, offset FUNC_TAB_OFF -- sentinel resumes at E2_LIT
 ;                                            (numeric literal / variable atom)
 ;   Addresses are stored as (target-1), not target: MATCH_DISPATCH pushes
-;   them hi/lo and RTS's, the same push+RTS trick the old ST_TAB used --
-;   cheaper than building a ZP pointer for JMP (indirect).
+;   them hi/lo and RTS's.
 ;   Bit 7 of a keyword's 2nd stored char: set = 1-arg function (its "(expr)"
 ;   is eaten by MATCH_DISPATCH's EAT_PAREN before the handler runs), clear =
 ;   statement or 0-arg function. All 2-char prefixes within a section are
@@ -341,10 +335,6 @@ STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
 ; =============================================================================
 UNI_TAB:
 ; -- statement section (offset 0) --
-; Note: "<(label-1)" / ">(label-1)" is written here as .DW label-1 instead --
-; Kowalski's assembler doesn't accept a parenthesized sub-expression right
-; after a lo/hi-byte prefix operator; .DW sidesteps that while emitting the
-; exact same 2 bytes (lo, hi) in the exact same order.
 KW_PRINT: .DB "PR"
           .DW DO_PRINT-1
 KW_IF:    .DB "IF"
@@ -506,7 +496,7 @@ IRQ_HANDLER:
 ;
 ;   In:  IP -> variable name in source
 ;   Out: named variable updated; IP restored to position after variable name
-;   Clobbers: A X Y T0 T1 T2 IP GCHRX
+;   Clobbers: A X Y T0 T1 T2 IP
 ; =============================================================================
 DO_INPUT:
          JSR PARSE_VAR         ; skip spaces; peek var name uppercased
@@ -534,69 +524,59 @@ DO_INPUT:
 ;
 ;   In:  --
 ;   Out: IBUF filled with input, CR-terminated; IP = IBUF
-;   Clobbers: A X Y IP GCHRX TEMP
+;   Clobbers: A X Y IP TEMP
 ;
 ;   Supports backspace (BS) to delete the last character.
 ;   GETCH itself no longer echoes -- GETLINE echoes explicitly per branch
 ;   below, so it can substitute BELL for the echo when the buffer is full
-;   instead of printing the rejected character. PUTCH clobbers X on both
-;   builds, so X (the buffer index) is saved/restored via GCHRX around
-;   every PUTCH call here, same protection the old code relied on around
-;   GETCH's internal echo.
+;   instead of printing the rejected character. 
 ;   At IBUF_MAX, further characters are rejected with a BELL (not stored,
 ;   not echoed, not advanced); backspace still deletes normally from there.
 ;   After CR is received, outputs CR+LF via PRNL before returning.
 ; =============================================================================
 GETLINE_M:
-         LDA #'>'            ; 
-         .DB $2C             ; BIT abs trick skips next 2 bytes
+         LDA #'>'            ; Prompt for multi-line / direct mode
+         .DB $2C             ; BIT abs trick (skips 'LDA #'?'')
 GETLINE_I:
-         LDA #'?'            ; 
-         JSR PUTCH           ; 
-         LDA #' '            ; 
-         JSR PUTCH           ; s
-; Can jump in here with no prompt
-         LDX #0              ; 
-         STX IP+1            ; Since IBUF is on ZP, >IBUF is strictly 0
-         LDA #<IBUF          ; 
-         STA IP              ; 
+         LDA #'?'            ; Prompt for INPUT statement
+         JSR PUTCH
+         LDA #' '
+         JSR PUTCH
 
-GL_BS:   DEX                 ; Backspace handler placed right before loop
-         BPL GL_ENTRY        ; If X >= 0, valid backspace, loop back
-         INX                 ; X was 0 (wrapped to $FF), restore it to 0
-                             ; Falls through to GL_ENTRY safely
+         ; Initialize IP pointer to point to IBUF
+         LDY #0
+         STY IP+1            ; >IBUF is strictly 0 (IBUF is on ZP)
+         LDA #<IBUF
+         STA IP
+
+GL_BS:   DEY                 ; Backspace: decrement buffer index
+         BPL GL_ENTRY        ; Valid index (>= 0), loop back for next char
+         INY                 ; Y wrapped from 0 to $FF: clamp back to 0
+
 GL_ENTRY:
-         STX GCHRX           ; save value
-         JSR GETCH           ; raw read -- no echo (see header note)
-         LDX GCHRX           ; 
-         CMP #CR             ; 
-         BEQ GL_DONE         ; 
-         CMP #BS             ; 
-         BEQ GL_BSECHO       ; 
-         CPX #IBUF_MAX       ; s
-         BCS GL_FULL         ; If full, beep instead of storing/echoing
-         STA IBUF,X          ; Assumes ZP indexing opcode $95 (A unaffected)
-         STX GCHRX           ; preserve index across the echoing PUTCH call
-         JSR PUTCH           ; echo the stored character
-         LDX GCHRX           ; restore index (PUTCH clobbers X)
-         INX                 ;  
-         BPL GL_ENTRY        ; 
+         JSR GETCH           ; Read raw key (char in A; Y preserved)
+         CMP #CR
+         BEQ GL_DONE         ; Line finished
+         CMP #BS
+         BEQ GL_BSECHO       ; Backspace key pressed
+         CPY #IBUF_MAX
+         BCS GL_FULL         ; Buffer full: sound bell
+         STA IBUF,Y          ; Store char in line buffer (STA abs,Y)
+         JSR PUTCH           ; Echo char (clobbers A; Y preserved)
+         INY                 ; Advance buffer index
+         BPL GL_ENTRY        ; Always taken (Y < 128)
 
-GL_FULL: STX GCHRX           ; preserve index across the echoing PUTCH call
-         LDA #BELL           ; buffer full: beep instead of echoing
-         JSR PUTCH           ; 
-         LDX GCHRX           ; restore index (PUTCH clobbers X)
-         BPL GL_ENTRY        ; X is 0..IBUF_MAX, bit7 clear -- always taken
+GL_FULL: LDA #BELL           ; Ring bell on buffer overflow
+         JSR PUTCH
+         BNE GL_ENTRY        ; Always taken (PUTCH leaves Z=0)
 
 GL_BSECHO:
-         JSR PUTCH           ; echo the backspace byte (A=BS, GCHRX already
-                              ; holds the current index from GL_ENTRY above)
-         LDX GCHRX           ; restore index (PUTCH clobbers X)
-         JMP GL_BS           ; run the existing delete logic
+         JSR PUTCH           ; Echo backspace character
+         BNE GL_BS           ; Always taken (PUTCH leaves Z=0); decrement index
 
-GL_DONE: STA IBUF,X          ; Store CR terminator (A unaffected by STA)
-         JSR PUTCH           ; echo the raw CR
-         JMP PRNL            ; Tail-call optimization (replaces JSR + RTS)
+GL_DONE: STA IBUF,Y          ; Store CR terminator
+         JSR PUTCH           ; Echo CR
+         JMP PRNL            ; Tail-call print LF / newline and RTS
 
 ; =============================================================================
 ; DELINE  --  remove the line at LP from the program store; adjust PE
@@ -798,7 +778,8 @@ DP_TAB:  LDX #KW_TAB-UNI_TAB    ; x destroyed so reload
          JSR MTCHKW           ; matched "TAB"?
          BCS DP_NORM
          JSR E2_PAR           ; Yes it is, Swallow `(`, get value, and swallow closing `)`
-	     LDY T0               ; get number of Spaces mod 256
+	 LDY T0               ; get number of Spaces 
+         BMI DP_AFT           ; Ignore negative
 DP_TLOOP:	 
     	 BEQ DP_AFT           ; If TAB(0) or loop is zero, skip printing spaces entirely
          LDA #' '              ; reload each iteration: PUTCH clobbers A too
@@ -848,7 +829,6 @@ PUTSTR:  STA T2               ; store lo-byte; hi-byte set below
 PS_LP:   LDA (T2),Y           ; fetch next character
          BMI PS_LAST          ; bit 7 set: this is the last character
          JSR PUTCH            ; print character
-;         INC T2               ; advance string pointer (lo-byte only; page never wraps)
          INY                  ; advance string pointer (lo-byte only; page never wraps)
          BNE PS_LP            ; always taken: string table constrained to one page
 PS_LAST: AND #$7F             ; strip bit 7 from last character
@@ -1842,7 +1822,7 @@ STMT:
          CMP #' '             ; anything below space (CR, NUL) means empty line
          BCC GETCI_SK         ; return via nearest preceding RTS
          LDX #0                ; statement section offset, falls through
-
+        ; drop through
 ; =============================================================================
 ; MATCH_DISPATCH -- shared keyword search across UNI_TAB (STMT falls
 ;   through at offset 0, EXPR2 enters at offset FUNC_TAB_OFF). Each section
@@ -1884,8 +1864,6 @@ MD_FAIL:                       ; sentinel stores (resume-1), same trick
          PHA
          LDA UNI_TAB+1,X
          PHA
-         RTS
-
 DL_DN:   RTS                   ; shared bare RTS -- see DO_LET/NEG16 header note
 
 ; =============================================================================
@@ -1901,8 +1879,8 @@ DL_DN:   RTS                   ; shared bare RTS -- see DO_LET/NEG16 header note
 ;   WEAT directly; inserting anything between them breaks that).
 ; =============================================================================
 EAT_PAREN: JSR EAT_EXPR
-         JMP WEAT
-
+;         JMP WEAT
+        BNE WEAT        ; always taken as basic lines dont contain NUL
 ; =============================================================================
 ; DO_LET  --  LET <var> = <expr>  or implicit  <var> = <expr>
 ;
@@ -1977,8 +1955,8 @@ RTS_1:   RTS
 ; =============================================================================
 UCIP:    LDY #0
          LDA (IP),Y
-         JMP UC
-
+;         JMP UC
+        BNE UC  ; always taken as BASIC lines never contain a nul
 ; =============================================================================
 ; WSKIP / WPEEK  --  skip spaces; return first non-space in A
 ;
@@ -2112,7 +2090,7 @@ PC_LOOP: LSR T3             ; bit 0 -> carry
 ;
 ;   In:  -- (entry point selects delay count)
 ;   Out: Y = 0 on return
-;   Clobbers: Y
+;   Clobbers: T4
 ;
 ;   Inner loop: DEY (2 cy) + BNE (3 cy taken, 2 cy exit) = ~5 cy/iter.
 ;   JSR overhead ~12 cy included in totals above.
@@ -2122,7 +2100,8 @@ DELAY_BIT:
          JSR DELAY_HALF       ; full bit period (~833 cy at 1 MHz)
 DELAY_HALF:
          LDY #80              ; half bit period (~417 cy at 1 MHz)
-DL_LOOP: DEY
+         STY T4
+DL_LOOP: DEC T4
          BNE DL_LOOP
          RTS
 
@@ -2131,7 +2110,7 @@ DL_LOOP: DEY
 ;
 ;   In:  --
 ;   Out: A = received character
-;   Clobbers: A X Y TEMP  (caller must save X if needed; see GETLINE/GCHRX)
+;   Clobbers: A X Y TEMP  (caller must save X if needed)
 ;
 ;   The received byte is assembled in TEMP[$30] via 8x ROR from the MSB.
 ;   No longer echoes -- GETLINE (its only caller) echoes explicitly so it
