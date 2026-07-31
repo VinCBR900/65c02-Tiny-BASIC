@@ -1,5 +1,5 @@
 ; =============================================================================
-; JB-uBASIC6502 v1.4  --  2 KB Tiny BASIC (NMOS 6502) for John Bell 80-153 SBC
+; JB-uBASIC6502 v1.7  --  2 KB Tiny BASIC (NMOS 6502) for John Bell 80-153 SBC
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Note: Due to bitbang serial IO, either use the JB-Sim65c02 simulator for 
@@ -32,7 +32,40 @@ KOWALSKI   = 1
 ; Numbers      : signed 16-bit  (-32768 .. 32767)
 ; String print : "literals", `;`, TAB(n) and CHR$(char); no string variables
 ;
-; Note: `:` multi-statement not supported. Input buffer is 31 chars long.  
+; KNOWN LIMITATIONS
+;
+; Two Character keyword matching - to save ROM space, only 2 chars are
+;   matched, then the rest of the word is consumed until a space or `(`.
+;   So spaces are needed: `10 PRINT TAB(5)` works, `10 PR TA(5)` also
+;   works, but `10 PRINTTAB(5)` is parsed as PRINT with "(5)" as its first
+;   expression, printing "5" (not 5 spaces).
+;
+; Variables: 26 single-letter A-Z only; anything else (e.g. "LET AB=5")
+;   raises "?4 bad variable name".
+;
+; No `:` multi-statement separator, no FOR/NEXT, no arrays/DIM, no string
+;   variables -- see the Statements/Expressions lists above for the full
+;   accepted set.
+;
+; Numbers are signed 16-bit only (-32768..32767); arithmetic overflow
+;   wraps silently (e.g. 32767+1 = -32768) -- it does not raise an error.
+;
+; Division and modulo by zero both raise "?2"; modulo follows the sign of
+;   the dividend (truncating, C-style), not floored: (0-7)%3 = -1.
+;
+; GOSUB nesting is limited to 8 levels; a 9th nested call raises "?3 out
+;   of memory" rather than corrupting the return-frame stack.
+;
+; GOTO/GOSUB to an undefined line number raises "?1".
+;
+; Input buffer is 31 usable chars + CR terminator. Each keypress past the
+;   limit sounds BELL ($07) and is discarded outright -- not stored, not
+;   echoed, index does not advance. Backspace still deletes normally from
+;   a full buffer.
+;
+; TAB(n) and CHR$(n) are valid only in PRINT line 
+;   TAB(n) prints n spaces (not jump to column n). TAB(0) is skipped, but 
+;   TAB(n) is MOD 256 low byte e.g. TAB(-5) prints 251 spaces (256-5). 
 ;
 ; Error codes (printed as "?N"):
 ;   ?0  syntax / bad expression
@@ -52,6 +85,13 @@ KOWALSKI   = 1
 ;   No tokenisation; body bytes are stored exactly as typed.
 ;
 ; ---- version lineage --------------------------------------------------------
+;   V1.7 (Jul 2026)   10 bytes free.  Fixed Kowalski-incompatible syntax in UNI_TAB 
+;                     `<(label-1), >(label-1)` rewritten as `.DW label-1` instead.  
+;   V1.6 (Jul 2026)   Fixed GETLINE buffer-overflow: GETCH echoed every character
+;                     unconditionally before GETLINE could check for buffer-full.
+;   V1.5 (Jul 2026)   Merged ST_TAB (statements) and EXPR2's linear 
+;                     PEEK/USR/RND/FREE/ABS chain into a keyword+jump table 
+;                     walked by a single MATCH_DISPATCH loop.
 ;   V1.4 (Jul 2026)   Added showcase and Syntax edits for Kowalski Simulator.
 ;   V1.3 (Jul 2026)   10 bytes free before vectors.  Multiple helpers to 
 ;                     refactor for size. Added optional LIST start,end and ABS.
@@ -65,7 +105,7 @@ KOWALSKI   = 1
 ;
 ; ---- assembler mode ---------------------------------------------------------
          .opt proc6502
-         
+
 ; ---- Hardware I/O (John Bell Engineering PN 80-153 -- 6522 VIA) -------------
 VIA_DDRA = $1C03             ; 6522 Port A Data Direction Register
 VIA_ORA  = $1C0F             ; 6522 Port A Output/Input Register (no handshake)
@@ -89,6 +129,7 @@ IBUF_MAX = 31                ; highest valid index into IBUF
 CR       = $0D               ; ASCII carriage return
 LF       = $0A               ; ASCII line feed
 BS       = $08               ; ASCII backspace
+BELL     = $07               ; ASCII bell -- GETLINE buffer-full feedback
 
 ; ---- error codes -------------------------------------------------------------
 ERR_SN   = 0                 ; syntax / bad expression
@@ -109,7 +150,7 @@ ERR_RET  = 5                 ; RETURN without GOSUB
         .IF KOWALSKI
         JMP INIT	; 3 bytes
         NOP		; 1 byte
-T0	    = 0		; Manually overwrite trampoline
+T0	         = 0		; Manually overwrite trampoline
 T1          = 2
 	.ELSE        
 T0:         .RS 2              ; 16-bit: primary scratch word / expression result
@@ -255,15 +296,14 @@ SHOWCASE_END:	.DB 0
 ; ROM START  ($F800)
          .ORG $F800
 ; =============================================================================
-; STRING / KEYWORD TABLE  (page $F8)
+; STRING TABLE  (page $F8)
 ;
-; All strings and 2-byte keyword entries are kept on STR_PAGE ($F8).
-; PUTSTR uses STR_PAGE as the fixed hi-byte, and MTCHKW sets T1+1 to STR_PAGE
-; when reading keyword bytes by (T1),Y.
+; Human-readable strings are kept on STR_PAGE ($F8). PUTSTR uses STR_PAGE as
+; the fixed hi-byte.
 ;
 ; TERMINATION: the last byte of every string has bit 7 set (value |= $80).
 ; =============================================================================
-STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string/keyword addresses
+STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string addresses
 
 ; ---- bit-7 terminated character constants - few needed as 2 word KW match ---
 ; Naming: T_<char>  where <char> is the ASCII letter or symbol.
@@ -274,33 +314,84 @@ T_K   = 203              ; $4B + $80  ('K' -- BREAK, PEEK)
 
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
-STR_BANNER: .DB "JB uBASIC v1.4"  ; startup banner, rolls into free
+        .IF KOWALSKI
+STR_BANNER: .DB "uBASIC6502 v1.7"  ; startup banner, rolls into CRLF
+.ELSE
+STR_BANNER: .DB "JB uBASIC v1.7"  ; startup banner, rolls into CRLF
+.ENDIF
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
 STR_BREAK:  .DB CR, LF, "BREA", T_K  ; "\r\nBREAK"
 
-; ---- keyword strings --------------------------------------------------------
-; Two uppercase ASCII bytes per keyword (no bit-7 terminator).
-; MTCHKW compares a 16-bit prefix and then skips trailing letters in input.
-KW_PRINT:   .DB 'P','R'
-KW_IF:      .DB 'I','F'
-KW_GOTO:    .DB 'G','O'
-KW_LIST:    .DB 'L','I'
-KW_RUN:     .DB 'R','U'
-KW_NEW:     .DB 'N','E'
-KW_INPUT:   .DB 'I','N'
-KW_REM:     .DB 'R','E'
-KW_END:     .DB 'E','N'
-KW_LET:     .DB 'L','E'
-KW_THEN:    .DB 'T','H'
-KW_CHRS:    .DB 'C','H'      
-KW_POKE:    .DB 'P','O'
-KW_PEEK:    .DB 'P','E'
-KW_USR:     .DB 'U','S'
-KW_TAB:     .DB 'T','A'	     
-KW_RND:     .DB 'R','N'
-KW_FREE:    .DB 'F','R'
-KW_ABS:     .DB 'A','B'
+; =============================================================================
+; UNI_TAB -- unified keyword+dispatch table (4 bytes/entry: 2 raw ASCII
+;   keyword chars, (handler-1)_lo, (handler-1)_hi). Two sections, each
+;   terminated by a 3-byte $FF sentinel ($FF, (resume-1)_lo, (resume-1)_hi):
+;     statement section, offset 0        -- sentinel resumes at DO_LET
+;                                            (implicit "X=..." assignment)
+;     function section, offset FUNC_TAB_OFF -- sentinel resumes at E2_LIT
+;                                            (numeric literal / variable atom)
+;   Addresses are stored as (target-1), not target: MATCH_DISPATCH pushes
+;   them hi/lo and RTS's, the same push+RTS trick the old ST_TAB used --
+;   cheaper than building a ZP pointer for JMP (indirect).
+;   Bit 7 of a keyword's 2nd stored char: set = 1-arg function (its "(expr)"
+;   is eaten by MATCH_DISPATCH's EAT_PAREN before the handler runs), clear =
+;   statement or 0-arg function. All 2-char prefixes within a section are
+;   unique. See MATCH_DISPATCH/MTCHKW for the search+dispatch mechanics.
+; =============================================================================
+UNI_TAB:
+; -- statement section (offset 0) --
+; Note: "<(label-1)" / ">(label-1)" is written here as .DW label-1 instead --
+; Kowalski's assembler doesn't accept a parenthesized sub-expression right
+; after a lo/hi-byte prefix operator; .DW sidesteps that while emitting the
+; exact same 2 bytes (lo, hi) in the exact same order.
+KW_PRINT: .DB "PR"
+          .DW DO_PRINT-1
+KW_IF:    .DB "IF"
+          .DW DO_IF-1
+KW_GO:    .DB "GO"
+          .DW DO_GO-1
+KW_LIST:  .DB "LI"
+          .DW DO_LIST-1
+KW_RUN:   .DB "RU"
+          .DW DO_RUN-1
+KW_NEW:   .DB "NE"
+          .DW DO_NEW-1
+KW_INPUT: .DB "IN"
+          .DW DO_INPUT-1
+KW_REM:   .DB "RE"
+          .DW DO_REM_CHK-1
+KW_END:   .DB "EN"
+          .DW DO_END-1
+KW_LET:   .DB "LE"
+          .DW DO_LET-1
+KW_POKE:  .DB "PO"
+          .DW DO_POKE-1
+          .DB $FF               ; sentinel: no-match -> DO_LET
+          .DW DO_LET-1
+
+FUNC_TAB: ; -- function section --
+KW_PEEK:  .DB "P",$C5           ; "PE" bit7 set on 'E' -- 1-arg
+          .DW DO_PEEK-1
+KW_USR:   .DB "U",$D3           ; "US" bit7 set on 'S' -- 1-arg
+          .DW DO_USR-1
+KW_ABS:   .DB "A",$C2           ; "AB" bit7 set on 'B' -- 1-arg
+          .DW DO_ABS-1
+KW_RND:   .DB "RN"              ; 0-arg
+          .DW DO_RND-1
+KW_FREE:  .DB "FR"              ; 0-arg
+          .DW DO_FREE-1
+          .DB $FF               ; sentinel: no-match -> E2_LIT
+          .DW E2_LIT-1
+
+; ---- Special one-off keywords: NOT part of the dispatch walk above; matched
+; directly via a standalone JSR MTCHKW with X = <label>-UNI_TAB (must stay
+; within 256 bytes of UNI_TAB -- true here by a wide margin).
+KW_THEN:  .DB "TH"
+KW_CHRS:  .DB "CH"
+KW_TAB:   .DB "TA"
+
+FUNC_TAB_OFF = FUNC_TAB-UNI_TAB
 
 ; =============================================================================
 ; INIT  --  cold start
@@ -337,6 +428,7 @@ INIT:
         ;  STR_BANNER
          LDA #<STR_BANNER
          JSR PUTSTR           ; print banner + CR+LF
+         ; delete next 3 lines if really tight on ROM
          JSR DO_FREE          ; Free bytes      
          JSR PRT16            ; print  
          JSR PRNL
@@ -445,7 +537,14 @@ DO_INPUT:
 ;   Clobbers: A X Y IP GCHRX TEMP
 ;
 ;   Supports backspace (BS) to delete the last character.
-;   Overflow characters (beyond IBUF_MAX) are silently discarded.
+;   GETCH itself no longer echoes -- GETLINE echoes explicitly per branch
+;   below, so it can substitute BELL for the echo when the buffer is full
+;   instead of printing the rejected character. PUTCH clobbers X on both
+;   builds, so X (the buffer index) is saved/restored via GCHRX around
+;   every PUTCH call here, same protection the old code relied on around
+;   GETCH's internal echo.
+;   At IBUF_MAX, further characters are rejected with a BELL (not stored,
+;   not echoed, not advanced); backspace still deletes normally from there.
 ;   After CR is received, outputs CR+LF via PRNL before returning.
 ; =============================================================================
 GETLINE_M:
@@ -468,19 +567,35 @@ GL_BS:   DEX                 ; Backspace handler placed right before loop
                              ; Falls through to GL_ENTRY safely
 GL_ENTRY:
          STX GCHRX           ; save value
-         JSR GETCH           ; 
+         JSR GETCH           ; raw read -- no echo (see header note)
          LDX GCHRX           ; 
          CMP #CR             ; 
          BEQ GL_DONE         ; 
          CMP #BS             ; 
-         BEQ GL_BS           ; 
+         BEQ GL_BSECHO       ; 
          CPX #IBUF_MAX       ; s
-         BCS GL_ENTRY        ; If full, ignore character and loop back
-         STA IBUF,X          ; Assumes ZP indexing opcode $95
+         BCS GL_FULL         ; If full, beep instead of storing/echoing
+         STA IBUF,X          ; Assumes ZP indexing opcode $95 (A unaffected)
+         STX GCHRX           ; preserve index across the echoing PUTCH call
+         JSR PUTCH           ; echo the stored character
+         LDX GCHRX           ; restore index (PUTCH clobbers X)
          INX                 ;  
          BPL GL_ENTRY        ; 
 
-GL_DONE: STA IBUF,X          ; Store CR terminator
+GL_FULL: STX GCHRX           ; preserve index across the echoing PUTCH call
+         LDA #BELL           ; buffer full: beep instead of echoing
+         JSR PUTCH           ; 
+         LDX GCHRX           ; restore index (PUTCH clobbers X)
+         BPL GL_ENTRY        ; X is 0..IBUF_MAX, bit7 clear -- always taken
+
+GL_BSECHO:
+         JSR PUTCH           ; echo the backspace byte (A=BS, GCHRX already
+                              ; holds the current index from GL_ENTRY above)
+         LDX GCHRX           ; restore index (PUTCH clobbers X)
+         JMP GL_BS           ; run the existing delete logic
+
+GL_DONE: STA IBUF,X          ; Store CR terminator (A unaffected by STA)
+         JSR PUTCH           ; echo the raw CR
          JMP PRNL            ; Tail-call optimization (replaces JSR + RTS)
 
 ; =============================================================================
@@ -658,22 +773,20 @@ IN_DN:   RTS
 ; =============================================================================
 DO_PRINT:
 DP_TOP:  JSR WPEEK
-         CMP #CR
-         BEQ DP_NL
-         TAX		      ; Check for NUL - Transfer sets EQ flag for free
-         BEQ DP_NL
+         CMP #CR+1            ; NUL(0) and CR(13) are both < CR+1 -- one check
+         BCC DP_NL            ; catches both "end of line" cases at once
          CMP #'"'
          BNE DP_CHR
          JSR GETCI            ; consume opening '"'
 DP_STR:  JSR GETCI            ; read string body char by char
          CMP #'"'
          BEQ DP_AFT           ; closing '"' -- go check for ';'
-         CMP #CR
-         BEQ DP_NL            ; unterminated string -- print CR/LF and stop
+         CMP #CR+1
+         BCC DP_NL            ; unterminated string -- print CR/LF and stop
          JSR PUTCH
          BNE DP_STR           ; PUTCH always leaves A=VIA_TX=1 (Z=0): unconditional
 
-DP_CHR: LDA #<KW_CHRS
+DP_CHR: LDX #KW_CHRS-UNI_TAB
          JSR MTCHKW           ; matched "CHR$"?
          BCS DP_TAB
          JSR E2_PAR           ; Yes it is, Swallow `(`, get value, and swallow closing `)`
@@ -681,19 +794,18 @@ DP_CHR: LDA #<KW_CHRS
          JSR PUTCH
          BNE DP_AFT            ; PUTCH always leaves A=VIA_TX=1 (Z=0): unconditional
 
-DP_TAB:  LDA #<KW_TAB
+DP_TAB:  LDX #KW_TAB-UNI_TAB    ; x destroyed so reload 
          JSR MTCHKW           ; matched "TAB"?
          BCS DP_NORM
          JSR E2_PAR           ; Yes it is, Swallow `(`, get value, and swallow closing `)`
-	 LDA T0
-    	 BEQ DP_AFT           ; If TAB(0), skip printing spaces entirely
-         STA GCHRX            ; counter in ZP: PUTCH clobbers X, can't loop on X
+	     LDY T0               ; get number of Spaces mod 256
 DP_TLOOP:	 
+    	 BEQ DP_AFT           ; If TAB(0) or loop is zero, skip printing spaces entirely
          LDA #' '              ; reload each iteration: PUTCH clobbers A too
          JSR PUTCH 
-         DEC GCHRX
-         BNE DP_TLOOP       
-         BEQ DP_AFT
+         DEY
+         BPL DP_TLOOP         ; always taken
+
 DP_NORM: JSR EXPR             ; numeric expression
          JSR PRT16
 DP_AFT:  JSR WPEEK
@@ -701,11 +813,9 @@ DP_AFT:  JSR WPEEK
          BNE DP_NL
          JSR GETCI            ; consume ';'
          JSR WPEEK
-         CMP #CR
-         BEQ DP_RET           ; trailing ';': suppress CR/LF (DP_RET = IN_DN = RTS above)
-         TAX			; check for NUL
-         BEQ DP_RET
-         BNE DP_TOP		; always taken
+         CMP #CR+1            ; NUL(0) and CR(13) are both < CR+1 -- one check
+         BCC DP_RET           ; trailing ';': suppress CR/LF (DP_RET = IN_DN = RTS above)
+         BCS DP_TOP            ; always taken (just proved carry set, i.e. A >= CR+1)
 
 ; =============================================================================
 ; PRNL / PUTSTR   --  print a bit-7-terminated string
@@ -738,7 +848,8 @@ PUTSTR:  STA T2               ; store lo-byte; hi-byte set below
 PS_LP:   LDA (T2),Y           ; fetch next character
          BMI PS_LAST          ; bit 7 set: this is the last character
          JSR PUTCH            ; print character
-         INC T2               ; advance string pointer (lo-byte only; page never wraps)
+;         INC T2               ; advance string pointer (lo-byte only; page never wraps)
+         INY                  ; advance string pointer (lo-byte only; page never wraps)
          BNE PS_LP            ; always taken: string table constrained to one page
 PS_LAST: AND #$7F             ; strip bit 7 from last character
          JMP PUTCH            ; Tail call print last character
@@ -1076,38 +1187,43 @@ RUNEND:  LDA #0
          RTS
 
 ; =============================================================================
-; MTCHKW  --  case-insensitive keyword match at IP
+; MTCHKW  --  case-insensitive match of a 2-char keyword prefix at IP against
+;             UNI_TAB entry X, then consumes any further trailing letters/'$'.
 ;
-;   In:  A = lo-byte of keyword string (hi-byte = STR_PAGE, always)
-;   Out: C=0  matched -- IP advanced past the keyword
-;        C=1  no match -- IP restored to entry value
-;   Clobbers: A Y T1  (T2 is NOT clobbered -- caller may hold STMT jump addr)
+;   In:  X = byte offset of the keyword entry within UNI_TAB (its first two
+;        bytes are the raw keyword chars -- see KW_PEEK/KW_ABS/etc; the
+;        special one-off keywords KW_THEN/CHRS/TAB are matched the same way,
+;        X = <label>-UNI_TAB)
+;   Out: match:    C=0, IP advanced past the keyword, N = bit7 of the
+;                  entry's 2nd stored char (the 1-arg flag -- see
+;                  KW_PEEK/KW_USR/KW_ABS) -- MATCH_DISPATCH tests BPL/BMI.
+;                  X unchanged.
+;        no match: C=1, IP restored to entry value, X unchanged, N/Z
+;                  undefined -- check carry first, always.
+;   Clobbers: A Y T1  (T2 is NOT clobbered -- caller may hold a jump target)
 ;
-;   IP is saved in LP on entry and restored on failure.
-;   Leading spaces at IP are skipped before attempting the match.
-;   Keyword entries are 2-byte uppercase prefixes; MTCHKW then skips any
-;   remaining trailing alphabetic characters so full BASIC keywords work.
+;   IP is saved in LP on entry and restored on failure. Shares its fail exit
+;   (MK_FAIL/MK_SEC) and success exit (GT_R) with GOTOL -- do not rename.
 ; =============================================================================
 MTCHKW:
-         STA T1               ; keyword address lo
-         LDA #STR_PAGE
-         STA T1+1             ; keyword address hi (always STR_PAGE)
          LDA IP
          STA LP               ; save IP in LP for restore on failure
          LDA IP+1
          STA LP+1
 
-         ; compare first keyword character
+         ; compare first keyword character (direct against UNI_TAB,X)
          JSR WPEEK_UC
-         LDY #0
-         CMP (T1),Y
+         CMP UNI_TAB,X
          BNE MK_FAIL
          JSR GETCI
-         
-         ; compare second keyword character
+
+         ; compare second keyword character (bit7 may carry the 1-arg flag)
+         LDA UNI_TAB+1,X
+         STA T1               ; stash raw byte -- becomes the N-flag return below
+         AND #$7F
+         STA T1+1
          JSR UCIP
-         LDY #1
-         CMP (T1),Y
+         CMP T1+1
          BNE MK_FAIL
          JSR GETCI
 
@@ -1120,9 +1236,12 @@ MK_SKIP: JSR UCIP
          JSR GETCI
          BNE MK_SKIP           ; always taken (token chars are nonzero)
 MK_OK:   CMP #$E3              ; remainder == '$'-'A' (mod 256)? reuses A, no re-peek
-         BNE GT_R              ; not '$': clear carry, return success
+         BNE MK_RTS            ; not '$': fall through to return success
          JSR GETCI             ; it IS '$': consume it
-         BNE GT_R              ; A = '$' ($24), always nonzero -- return success
+MK_RTS:  LDA T1                ; N = bit7 of raw 2nd keyword char (1-arg flag)
+         BNE GT_R              ; T1 always nonzero (ASCII char) -- unconditional;
+                                ; GT_R does CLC;RTS -- shared with GOTOL, N flag
+                                ; survives CLC untouched
 
 MK_FAIL: LDA LP               ; restore IP to saved position
          STA IP
@@ -1507,33 +1626,32 @@ E2_NOTPAR:
          CMP #'+'
          BEQ E2_POS
 
-        ; start function matching - we dont match CHR$ as handled by PRINT
-         LDA #<KW_PEEK
-         JSR MTCHKW           ; matched "PEEK"?
-         BCS E2_NOT_PEEK
-         JSR E2_PAR           ; Yes it is, Swallow `(`, get value, and swallow closing `)`
-         LDY #0
-         LDA (T0),Y           ; read byte at address
-         STA T0               ; Store it
-         STY T0+1             ; Clear high byte
+        ; function matching (CHR$ excluded -- PRINT-only, see DP_CHR) via
+        ; the shared UNI_TAB/MATCH_DISPATCH walk. Match: handler runs and
+        ; RTS's straight through to EXPR2's caller (tail call). No match:
+        ; falls through to E2_LIT below (FUNC_TAB's sentinel resume target).
+         LDX #FUNC_TAB_OFF
+         JMP MATCH_DISPATCH
+
+; --- DO_PEEK/DO_USR/DO_RND/DO_FREE/DO_ABS -- UNI_TAB function-section
+;     handlers. Paren-eating for the 1-arg ones (PEEK/USR/ABS) is done by
+;     MATCH_DISPATCH's EAT_PAREN before entry -- T0 already holds the
+;     parsed argument on entry, and the handler does NOT re-consume it.
+;     DO_RND falls through into RND_SHUFFLE (also JSR'd directly by GETCH);
+;     DO_FREE is also JSR'd directly by INIT.
+DO_PEEK: LDY #0                  ; T0 = *T0 (byte at address in T0)
+         LDA (T0),Y
+         STA T0
+         STY T0+1                ; clear high byte
          RTS
 
-E2_NOT_PEEK:
-         LDA #<KW_USR
-         JSR MTCHKW           ; matched "USR"?
-         BCS E2_NOT_USR
-         JSR E2_PAR           ; Yes it is, Swallow `(`, get value, and swallow closing `)`
-         JMP (T0)             ; And jump, fingers crossed we return with retval in T0
+DO_USR:  JMP (T0)                ; jump to address in T0; fingers crossed
+                                  ; caller returns with retval in T0
 
-E2_NOT_USR:
-         LDA #<KW_RND
-         JSR MTCHKW           ; matched "RND"?
-         BCS E2_NOT_RND       ; nope
-         ; Drop through
-         LDA RND_SEED         ; LDA/STA don't touch Carry -- safe before BCC
+DO_RND:  LDA RND_SEED            ; LDA/STA don't touch Carry -- safe before BCC
          STA T0
-         LDA RND_SEED+1         ; LDA/STA don't touch Carry -- safe before BCC
-         AND #$7F             ; force positive (clear bit 15) for T0
+         LDA RND_SEED+1          ; LDA/STA don't touch Carry -- safe before BCC
+         AND #$7F                ; force positive (clear bit 15) for T0
          STA T0+1
         ; drop through
 ; =============================================================================
@@ -1552,12 +1670,7 @@ E2_RND_SK:
          PLA
          RTS                   ; end of RND
 
-E2_NOT_RND:
-         LDA #<KW_FREE
-         JSR MTCHKW           ; matched "FREE"?
-         BCS E2_NOT_FREE      ; nope
-DO_FREE:         
-         SEC                  ; T0 = RAM_TOP - PE (free program-store bytes)
+DO_FREE: SEC                  ; T0 = RAM_TOP - PE (free program-store bytes)
          LDA #<RAM_TOP
          SBC PE
          STA T0
@@ -1566,14 +1679,9 @@ DO_FREE:
          STA T0+1
          RTS                    ; end of FREE
 
-E2_NOT_FREE:
-         LDA #<KW_ABS
-         JSR MTCHKW             ; matched "ABS" ?
-         BCS E2_LIT             ; nope
-         JSR E2_PAR             ; Yes it is, Swallow `(`, get expression, and swallow closing `)`
-         LDA T0+1               ; check high byte
+DO_ABS:  LDA T0+1               ; check high byte
          BMI NEG16              ; It is Negative so negate
-         RTS                    ; otherwise return                            
+         RTS                    ; otherwise return
 
 E2_NEG:  JSR E2_POS           ; consume '-', evaluate atom
         ; drop through
@@ -1676,7 +1784,8 @@ E2_PAR:  JSR GETCI            ; consume '('
 ;   Out: A = char consumed; IP advanced past it
 ;   Clobbers: A IP
 ;
-;   Falls through into GETCI after skipping spaces.
+;   Falls through into GETCI after skipping spaces. E2_PAR falls through
+;   into this directly from above -- do not insert anything between them.
 ; =============================================================================
 WEAT:    JSR WSKIP            ; skip spaces, then fall through
 
@@ -1712,7 +1821,7 @@ DO_IF:
          LDA T0
          ORA T0+1              ; check for zero
          BEQ DO_IF_F          ; false: return
-         LDA #<KW_THEN
+         LDX #KW_THEN-UNI_TAB
          JSR MTCHKW           ; consume optional THEN keyword
          ; fall through into STMT to execute the consequent
 
@@ -1723,30 +1832,76 @@ DO_IF:
 ;   Out: statement executed; IP advanced
 ;   Clobbers: A X Y T0 T1 T2 IP
 ;
-;   Walks ST_TAB: tries MTCHKW for each 3-byte entry (kw_lo, hdlr_lo, hdlr_hi).
-;   The $FF sentinel terminates the table; no match falls through to DO_LET.
+;   Falls through directly into MATCH_DISPATCH at the statement section
+;   (offset 0) of UNI_TAB; a match runs the handler and RTS's to STMT's
+;   caller, no match falls through to DO_LET (implicit "X=...") via the
+;   sentinel. Nothing may be inserted between here and MATCH_DISPATCH.
 ; =============================================================================
 STMT:
          JSR WPEEK
          CMP #' '             ; anything below space (CR, NUL) means empty line
          BCC GETCI_SK         ; return via nearest preceding RTS
-         LDX #0
-ST_LP:   LDA ST_TAB,X         ; read keyword lo-byte from table
-         BMI ST_LET            ; $FF sentinel: nothing matched
-         JSR MTCHKW            ; try to match keyword at IP
-         BCS ST_NX             ; no match: advance to next entry
-         LDA ST_TAB+2,X        ; matched: push handler-1 hi, then lo, RTS to dispatch
-         PHA
-         LDA ST_TAB+1,X
-         PHA
-DL_DN:
-         RTS                   ; ST_TAB stores (handler-1); RTS pulls+1 -> handler
+         LDX #0                ; statement section offset, falls through
 
-ST_NX:   INX
+; =============================================================================
+; MATCH_DISPATCH -- shared keyword search across UNI_TAB (STMT falls
+;   through at offset 0, EXPR2 enters at offset FUNC_TAB_OFF). Each section
+;   ends with a 3-byte $FF sentinel whose next 2 bytes ARE the no-match
+;   resume address (read directly, no loop-back -- see UNI_TAB header).
+;   NMOS-SAFE: unlike the 65C02 miniBASIC original, this avoids PHX/PLX,
+;   BRA, and indexed-indirect JMP (none exist on NMOS 6502) -- costs a few
+;   extra bytes over the 65C02 version but stays within the JB SBC's CPU.
+;
+;   In:  X = section offset (0 = statements, FUNC_TAB_OFF = functions)
+;   Out: matched handler executed (tail call, RTS's to MATCH_DISPATCH's
+;        caller); IP advanced
+;   Clobbers: A, X, Y, T1, T2
+; =============================================================================
+MATCH_DISPATCH:
+MD_LP:   LDA UNI_TAB,X
+         BMI MD_FAIL           ; $FF sentinel: no match in this section
+         JSR MTCHKW            ; X = entry offset, passed straight through
+         BCS MD_NX
+         BPL MD_NOPAREN        ; bit7 clear: statement/0-arg, skip paren-eat
+         TXA                   ; save table offset -- EAT_PAREN clobbers X
+         PHA
+         JSR EAT_PAREN
+         PLA
+         TAX
+MD_NOPAREN:                    ; table stores (handler-1) -- see UNI_TAB header
+         LDA UNI_TAB+3,X
+         PHA
+         LDA UNI_TAB+2,X
+         PHA
+         RTS                   ; pulls lo,hi -> PC = (handler-1)+1 = handler
+MD_NX:   INX
          INX
          INX
-         BNE ST_LP            ; always taken before $FF sentinel
-ST_LET:  ; fall through into DO_LET
+         INX
+         BNE MD_LP             ; always taken (table well under 256 bytes)
+MD_FAIL:                       ; sentinel stores (resume-1), same trick
+         LDA UNI_TAB+2,X
+         PHA
+         LDA UNI_TAB+1,X
+         PHA
+         RTS
+
+DL_DN:   RTS                   ; shared bare RTS -- see DO_LET/NEG16 header note
+
+; =============================================================================
+; EAT_PAREN  --  consume a delimiter+expr (EAT_EXPR), then a closing ')'
+;
+;   In:  IP -> '(' (possible leading spaces; see EAT_EXPR)
+;   Out: T0 = parsed argument; IP advanced past the closing ')'
+;   Clobbers: A X Y T0 T1 T2 IP
+;
+;   Used by MATCH_DISPATCH to eat a 1-arg function's "(expr)" once, centrally,
+;   before jumping to the handler -- PEEK/USR/ABS no longer eat it themselves.
+;   Standalone (NOT placed next to WEAT -- E2_PAR already falls through into
+;   WEAT directly; inserting anything between them breaks that).
+; =============================================================================
+EAT_PAREN: JSR EAT_EXPR
+         JMP WEAT
 
 ; =============================================================================
 ; DO_LET  --  LET <var> = <expr>  or implicit  <var> = <expr>
@@ -1900,18 +2055,18 @@ PUTCH:   STA IO_OUT
          RTS
 
 ; =============================================================================
-; GETCH  --  read one character from Kowalski terminal (blocking); echo it
+; GETCH  --  read one character from Kowalski terminal (blocking)
 ;
 ;   In:  --
 ;   Out: A = character read
 ;   Clobbers: A
+;
+;   No longer echoes -- GETLINE (its only caller) echoes explicitly so it
+;   can substitute BELL for the echo on a full input buffer. See GETLINE.
 ; =============================================================================
 GETCH:   JSR RND_SHUFFLE
          LDA IO_IN
          BEQ GETCH          ; spin until a char is available
-         PHA                  ; save the actual typed character
-         JSR PUTCH            ; echo it (PUTCH's own return value is discarded)
-         PLA                  ; restore the typed character as GETCH's result
          RTS
 	.ELSE
 ; =============================================================================
@@ -1973,14 +2128,14 @@ DL_LOOP: DEY
 
 ; =============================================================================
 ; GETCH  --  receive one character via 6522 VIA PA1 (bitbang, 1200 baud)
-;            then echo it via PUTCH
+;
 ;   In:  --
 ;   Out: A = received character
 ;   Clobbers: A X Y TEMP  (caller must save X if needed; see GETLINE/GCHRX)
 ;
 ;   The received byte is assembled in TEMP[$30] via 8x ROR from the MSB.
-;   It is saved on the hardware stack (PHA) before JSR PUTCH (which clobbers
-;   TEMP), then restored via PLA.  
+;   No longer echoes -- GETLINE (its only caller) echoes explicitly so it
+;   can substitute BELL for the echo on a full input buffer. See GETLINE.
 ; =============================================================================
 GETCH:   JSR RND_SHUFFLE
          ; --- Wait for start bit: PA1 goes LOW ---
@@ -2003,46 +2158,12 @@ GC_LOOP: LDA VIA_ORA         ; read port
          BNE GC_LOOP
          ; After 8 RORs: T3 holds the received byte (LSB-first serial,
          ; ROR accumulates from MSB down -> correct byte in T3).
-
-         ; --- Echo, then restore caller's X and return char in A ---
-         LDA T3+1
-         JSR PUTCH            ; echo
          LDA T3+1
          RTS
 	.ENDIF
 
-; =============================================================================
-; STMT DISPATCH TABLE
-;
-; Each 3-byte entry:  <kw_lo_byte, <handler_lo, >handler_hi
-; STMT walks the table calling MTCHKW on each keyword.
-; $FF sentinel causes STMT to fall through to DO_LET (implicit assignment).
-; =============================================================================
-; NOTE: handler addresses stored as (handler-1) for the RTS-dispatch trick in STMT.
-ST_TAB:
-         .DB <KW_PRINT
-           .DW DO_PRINT-1
-         .DB <KW_IF 
-           .DW DO_IF-1
-         .DB <KW_GOTO 
-           .DW DO_GO-1
-         .DB <KW_LIST 
-           .DW DO_LIST-1
-         .DB <KW_RUN 
-           .DW DO_RUN-1
-         .DB <KW_NEW 
-           .DW DO_NEW-1
-         .DB <KW_INPUT
-           .DW DO_INPUT-1
-         .DB <KW_REM 
-           .DW DO_REM_CHK-1
-         .DB <KW_END 
-           .DW DO_END-1
-         .DB <KW_LET 
-           .DW DO_LET-1
-         .DB <KW_POKE 
-           .DW DO_POKE-1
-         .DB $FF  ; sentinel: fall through to implicit assign
+; Statement and function dispatch table (UNI_TAB) now lives up near the
+; string table, right after ROM START -- see its header for the layout.
 
 ROMEND: ; for auditing
 
