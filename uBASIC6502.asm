@@ -82,7 +82,7 @@ KOWALSKI   = 1
 ;   Line format:  <lineno_lo> <lineno_hi> <raw ASCII body> <CR>
 ;   No tokenisation; body bytes are stored exactly as typed.
 ; ---- version lineage --------------------------------------------------------
-;   V1.7 (Jul 2026)   21 bytes free.  Fixed Kowalski-incompatible syntax in UNI_TAB 
+;   V1.7 (Jul 2026)   31 bytes free.  Fixed Kowalski-incompatible syntax in UNI_TAB 
 ;                     `<(label-1), >(label-1)` rewritten as `.DW label-1` instead.
 ;                     Refactored GETLINE to Y counter, updated DELAY for ZP not Y.  
 ;   V1.6 (Jul 2026)   Fixed GETLINE buffer-overflow: GETCH echoed every character
@@ -148,7 +148,7 @@ ERR_RET  = 5                 ; RETURN without GOSUB
         .IF KOWALSKI
         JMP INIT	; 3 bytes
         NOP		; 1 byte
-T0	     = 0		; Manually overwrite trampoline
+T0	    = 0		; Manually overwrite trampoline
 T1          = 2
 	.ELSE        
 T0:         .RS 2              ; 16-bit: primary scratch word / expression result
@@ -418,10 +418,6 @@ INIT:
         ;  STR_BANNER
          LDA #<STR_BANNER
          JSR PUTSTR           ; print banner + CR+LF
-         ; delete next 3 lines if really tight on ROM
-         JSR DO_FREE          ; Free bytes      
-         JSR PRT16            ; print  
-         JSR PRNL
          
          ; fall through into MAIN
 
@@ -2048,21 +2044,13 @@ GETCH:   JSR RND_SHUFFLE
          RTS
 	.ELSE
 ; =============================================================================
-; PUTCH  --  transmit one character via 6522 VIA PA0 (bitbang, 1200 baud)
-;
+; PUTCH  --  transmit one character via 6522 VIA PA0 (1200 baud @ 1 MHz)
 ;   In:  A = character to transmit
-;   Out: TX line left in mark (idle high) state
-;   Clobbers: A X Y TEMP
-;
-;   Protocol: 8N1 (start bit / 8 data bits LSB-first / stop bit).
-;   Baud rate: ~1200 baud at 1 MHz (DELAY_BIT = 160 iterations x ~5 cy = 800+
-;   overhead ~= 833 cy per bit).  Adjust BAUD_FULL / BAUD_HALF for other rates.
-;
-;   The entire Port A byte is written each time; PA1-PA7 are inputs so the
-;   written value is masked by DDRA and only PA0 is driven.
+;   Out: TX line left high (idle mark state)
+;   Clobbers: A, X, T3, T4 (Preserves Y)
 ; =============================================================================
 PUTCH:
-         STA T3             ; save character to shift out
+         STA T3              ; Save character to shift out
 
          ; --- Start bit: TX = 0 ---
          LDA #$00
@@ -2071,73 +2059,61 @@ PUTCH:
 
          ; --- 8 data bits, LSB first ---
          LDX #8
-PC_LOOP: LSR T3             ; bit 0 -> carry
+PC_LOOP: LSR T3              ; Bit 0 -> Carry
          LDA #$00
-         ADC #$00             ; A = 0 + carry = 0 or 1 (the bit to send)
-         STA VIA_ORA
-         JSR DELAY_BIT
+         ROL                 ; A = 0 + Carry (0 or 1) -- 1 byte smaller than ADC
+         STA VIA_ORA         ; Drive bit on PA0
+         JSR DELAY_BIT       ; Delay ~818 cy (+14 cy loop = 832 cy total bit time)
          DEX
          BNE PC_LOOP
 
          ; --- Stop bit: TX = 1 ---
-         ; Note: stop-bit delay omitted; caller overhead provides >1 bit period
          LDA #VIA_TX
          STA VIA_ORA
          RTS
 
 ; =============================================================================
 ; DELAY_BIT / DELAY_HALF  --  serial timing delays for 1200 baud @ 1 MHz
-;
-;   In:  -- (entry point selects delay count)
-;   Out: Y = 0 on return
-;   Clobbers: T4
-;
-;   Inner loop: DEY (2 cy) + BNE (3 cy taken, 2 cy exit) = ~5 cy/iter.
-;   JSR overhead ~12 cy included in totals above.
-;   Timing is approximate; adjust BAUD_FULL / BAUD_HALF for exact match.
+;   In:  Entry point selects delay count
+;   Out: T4 = 0, Z=1
+;   Clobbers: A, T4
 ; =============================================================================
 DELAY_BIT:
-         JSR DELAY_HALF       ; full bit period (~833 cy at 1 MHz)
+         LDA #100            ; Full bit delay count (~818 cycles)
+         .DB $2C             ; BIT abs trick (skips 'LDA #50')
 DELAY_HALF:
-         LDY #80              ; half bit period (~417 cy at 1 MHz)
-         STY T4
-DL_LOOP: DEC T4
-         BNE DL_LOOP
+         LDA #50             ; Half bit delay count (~416 cycles)
+         STA T4
+DL_LOOP: DEC T4              ; 5 cycles
+         BNE DL_LOOP         ; 3 cycles (8 cycles per loop iteration)
          RTS
 
 ; =============================================================================
-; GETCH  --  receive one character via 6522 VIA PA1 (bitbang, 1200 baud)
-;
-;   In:  --
+; GETCH  --  receive one character via 6522 VIA PA1 (1200 baud @ 1 MHz)
 ;   Out: A = received character
-;   Clobbers: A X Y TEMP  (caller must save X if needed)
-;
-;   The received byte is assembled in TEMP[$30] via 8x ROR from the MSB.
-;   No longer echoes -- GETLINE (its only caller) echoes explicitly so it
-;   can substitute BELL for the echo on a full input buffer. See GETLINE.
+;   Clobbers: A, X, T3, T4 (Preserves Y)
 ; =============================================================================
-GETCH:   JSR RND_SHUFFLE
-         ; --- Wait for start bit: PA1 goes LOW ---
+GETCH:   
+GC_WAIT: JSR RND_SHUFFLE     ; Harvest keystroke timing entropy for RNG seed
          LDA VIA_ORA
-         AND #VIA_RX          ; isolate PA1
-         BNE GETCH            ; non-zero = mark (idle high): keep waiting
+         AND #VIA_RX         ; Test PA1 (RX line)
+         BNE GC_WAIT         ; Non-zero = mark (idle high): keep waiting
 
-         ; --- Delay to centre of start bit, then one full bit to bit 0 ---
-         JSR DELAY_HALF       ; 0.5 bit: reach mid-point of start bit
-         JSR DELAY_BIT        ; 1.0 bit: advance to centre of data bit 0
+         ; --- Align to center of Data Bit 0 ---
+         JSR DELAY_HALF      ; Advance to mid-point of Start bit (~420 cy)
+         JSR DELAY_BIT       ; Advance to mid-point of Bit 0 (~1254 cy total)
 
          ; --- Sample 8 data bits LSB first into T3 ---
          LDX #8
-GC_LOOP: LDA VIA_ORA         ; read port
-         LSR                  ; PA0 -> carry (TX bit discarded)
-         LSR                  ; PA1 -> carry (RX data bit)
-         ROR T3+1           ; carry -> MSB of TEMP; shift right
-         JSR DELAY_BIT        ; advance to centre of next bit
+GC_LOOP: LDA VIA_ORA         ; Sample Port A
+         LSR                 ; PA0 -> Carry
+         LSR                 ; PA1 (RX bit) -> Carry
+         ROR T3              ; Shift Carry into MSB of T3
+         JSR DELAY_BIT       ; Delay ~818 cy (+18 cy loop = 836 cy total bit time)
          DEX
          BNE GC_LOOP
-         ; After 8 RORs: T3 holds the received byte (LSB-first serial,
-         ; ROR accumulates from MSB down -> correct byte in T3).
-         LDA T3+1
+
+         LDA T3              ; Return received character in A
          RTS
 	.ENDIF
 
