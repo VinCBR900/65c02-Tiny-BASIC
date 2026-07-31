@@ -1,5 +1,5 @@
 ; =============================================================================
-; miniBASIC 65C02 v3.4
+; miniBASIC 65C02 v3.6
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; 4KB Float BASIC (MBF4) for the 65C02.
@@ -63,12 +63,13 @@
 ;   saturates its 16-bit intermediate there, producing garbage well outside
 ;   [-1,1] beyond that magnitude.
 ;
-; Input buffer is 41 bytes, truncated at IBUF_MAX - each keypress past the 
-;   limit sounds BELL ($07) but is still echoed. The excess chars
-;   are still discarded (X stops advancing), just with an audible signal.
+; Input buffer is 41 bytes (40 usable chars + CR terminator). Each keypress
+;   past IBUF_MAX sounds BELL ($07) and is discarded outright -- not stored,
+;   not echoed, index does not advance. Backspace still deletes normally
+;   from a full buffer.
 ;
 ; TAB(n) and CHR$(n) are only valid on a PRINT line. Both accept expressions but
-;   TAB prints n spaces, not jumps to column n. TAB(n) for n<=0 prints nothing
+;   TAB(n) prints n spaces, not jumps to column n. TAB(n) for n<=0 skipped.
 ;   TAB(n) for n>255 wraps mod 256.
 ;
 ; FLOOR(flt) rounds towards zero eg floor(3.5) is 3, floor (-3.5) is -3, NOT -4.
@@ -83,18 +84,24 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ;
+; v3.6 (2026-07) - 35 bytes free
+;   - FIXED: NEG16 duplicated, deleted.  
+;   - FIXED: Kowalski syntax - RMB7/SMB7 changed to RMB#7,/SMB#7 format.
+;    `.DB <(label-1), >(label-1)` not supported by Kowalski's assembler so
+;     changed to `.DW label-1`. 
+;   - OPT: Refactor EXPR's relational-operator mask scan ported from uBASIC6502's
+;     equivalent for size;
+; v3.5 (2026-07) - 4 bytes free
+;   - FIXED: GETLINE buffer-overflow feedback
+;   - OPT: MATCH_DISPATCH's MD_NOPAREN (matched-entry path) now uses the
+;     push-hi/push-lo/RTS UNI_TAB/FUNC_TAB non-sentinel entries store 
+;     (handler-1) rather than handler as 65c02 auto increments. 
+;
 ; v3.4 (2026-07) - 10 bytes free
 ;   - RESTORED: X^Y power operator, this time with correct BODMAS/PEMDAS
 ;     precedence - binds tighter than * / %, right-associative 
 ;   - DEDUPED: E1_RHS -- shared "park left, consume operator, parse right
-;     via EXPR1P, GET_RIGHT to combine" glue, previously duplicated between
-;     EXPR1's E1MD (*/ %) and EXPR1P's own recursive ^ case (found via
-;     asmdup.py). +5 bytes. Must be entered via JSR+RTS, never a tail-call
-;     JMP into GET_RIGHT -- GET_RIGHT/PUSH_FLT_A/POP_FLT_A rely on stealing
-;     a genuine JSR return address for their park/restore trick; a JMP
-;     doesn't provide one, and an earlier attempt at this exact extraction
-;     used JMP and silently corrupted FLT_MUL's first real call, confirmed
-;     via full regression before landing the corrected version.
+;     via EXPR1P, GET_RIGHT to combine" glue.
 ;
 ; v3.3 (2026-07) - 42 bytes free
 ;   - ADDED: "Hypnotic Eye" showcase section (lines 262-289) -- a logarithmic
@@ -531,7 +538,7 @@ SHOWCASE_END: ; audit
 
          .ORG $F000
 STR_PAGE = >STR_BANNER
-STR_BANNER: .DB "miniBASIC 65C02 v3.4"
+STR_BANNER: .DB "miniBASIC 65C02 v3.6"
 STR_CRLF:   .DB $0D,$8A
 STR_IN:     .DB " IN",$A0
 STR_BREAK:  .DB $0D,$0A,"BREA",$CB
@@ -543,40 +550,72 @@ STR_BREAK:  .DB $0D,$0A,"BREA",$CB
 ;   STMT searches section 0 (offset 0), E2NFN searches section 1 (offset 39).
 ;   Bit 7 of keyword's 2nd stored byte: set = 1-arg func (EAT_PAREN),
 ;   clear = statement/0-arg func (no EAT_PAREN).  All 2-char prefixes unique.
+;   Non-sentinel entries store (handler-1), not handler: MATCH_DISPATCH's
+;   MD_NOPAREN pushes them hi/lo and RTS's (push+RTS trick). Sentinel
+;   entries store the literal target instead -- read by MD_FAIL via a plain
+;   JMP (indirect), a different mechanism that doesn't want the -1 bias.
 UNI_TAB:
 ; -- Statement section (offset 0) --
-KW_PRINT: .DB "PR", <DO_PRINT, >DO_PRINT
-KW_IF:    .DB "IF", <DO_IF,   >DO_IF
-KW_GO:    .DB "GO", <DO_GOTO, >DO_GOTO
-KW_LIST:  .DB "LI", <DO_LIST, >DO_LIST
-KW_RUN:   .DB "RU", <DO_RUN,  >DO_RUN
-KW_NEW:   .DB "NE", <DO_NEW_CHK,>DO_NEW_CHK
-KW_FOR:   .DB "FO", <DO_FOR,  >DO_FOR
-KW_INPUT: .DB "IN", <DO_INPUT,>DO_INPUT
-KW_REM:   .DB "RE", <DO_REM_CHK,>DO_REM_CHK
-KW_END:   .DB "EN", <DO_END,  >DO_END
-KW_LET:   .DB "LE", <DO_LET,  >DO_LET
-LW_POKE:  .DB "PO", <DO_POKE, >DO_POKE
-          .DB $FF, <DO_LET, >DO_LET     ; sentinel: no-match → DO_LET
+KW_PRINT: .DB "PR"; , <(DO_PRINT-1), >(DO_PRINT-1)
+          .DW DO_PRINT-1
+KW_IF:    .DB "IF"; , <(DO_IF-1),   >(DO_IF-1)
+          .DW DO_IF-1
+KW_GO:    .DB "GO"; , <(DO_GOTO-1), >(DO_GOTO-1)
+          .DW DO_GOTO-1
+KW_LIST:  .DB "LI"; , <(DO_LIST-1), >(DO_LIST-1)
+          .DW DO_LIST-1
+KW_RUN:   .DB "RU"; , <(DO_RUN-1),  >(DO_RUN-1)
+          .DW DO_RUN-1
+KW_NEW:   .DB "NE"; , <(DO_NEW_CHK-1),>(DO_NEW_CHK-1)
+          .DW DO_NEW_CHK-1
+KW_FOR:   .DB "FO"; , <(DO_FOR-1),  >(DO_FOR-1)
+          .DW DO_FOR-1
+KW_INPUT: .DB "IN"; , <(DO_INPUT-1),>(DO_INPUT-1)
+          .DW DO_PRINT-1
+KW_REM:   .DB "RE"; , <(DO_REM_CHK-1),>(DO_REM_CHK-1)
+          .DW DO_REM_CHK-1
+KW_END:   .DB "EN"; , <(DO_END-1),  >(DO_END-1)
+          .DW DO_END-1
+KW_LET:   .DB "LE"; , <(DO_LET-1),  >(DO_LET-1)
+          .DW DO_LET-1
+LW_POKE:  .DB "PO"; , <(DO_POKE-1), >(DO_POKE-1)
+          .DW DO_POKE-1
+          .DB $FF, <DO_LET, >DO_LET     ; sentinel: no-match → DO_LET (literal, not -1)
 
 FUNC_TAB: ; -- function section --
-KW_ABS:    .DB "A",$C2, <FLT_ABS, >FLT_ABS         ; "AB" with bit7 set on 'B' -- 1-arg flag
-KW_SQR:    .DB "S",$D1, <FLT_SQRT,>FLT_SQRT        ; "SQ" with bit7 set on 'Q' -- 1-arg flag
-KW_SIN:    .DB "S",$C9, <FLT_SIN, >FLT_SIN         ; "SI" with bit7 set on 'I' -- 1-arg flag
-KW_COS:    .DB "C",$CF, <FLT_COS, >FLT_COS         ; "CO" with bit7 set on 'O' -- 1-arg flag
-KW_TAN:    .DB "T",$C1, <FLT_TAN, >FLT_TAN         ; "TA" with bit7 set on 'A' -- 1-arg flag
-KW_ATN:    .DB "A",$D4, <FLT_ATAN,>FLT_ATAN        ; "AT" with bit7 set on 'T' -- 1-arg flag
-KW_ASIN:   .DB "A",$D3, <FLT_ASIN,>FLT_ASIN        ; "AS" with bit7 set on 'S' -- 1-arg flag
-KW_ACOS:   .DB "A",$C3, <FLT_ACOS,>FLT_ACOS        ; "AC" with bit7 set on 'C' -- 1-arg flag
-KW_PEEK:   .DB "P",$C5, <FLT_PEEK,>FLT_PEEK        ; "PE" with bit7 set on 'E' -- 1-arg flag
-KW_USR:    .DB "U",$D3, <FLT_USR, >FLT_USR         ; "US" with bit7 set on 'S' -- 1-arg flag
-KW_FLOOR:  .DB "F",$CC, <FLT_FLOOR,>FLT_FLOOR     ; "FL" with bit7 set on 'L' -- 1-arg flag
-KW_EXP:    .DB "E",$D8, <FLT_EXP, >FLT_EXP         ; "EX" with bit7 set on 'X' -- 1-arg flag
-KW_LN:     .DB "L",$CE, <FLT_LN,  >FLT_LN          ; "LN" with bit7 set on 'N' -- 1-arg flag
-KW_PI:     .DB "PI",    <FLT_PI,  >FLT_PI          ; "PI" (0-arg, bit7 clear)
-KW_FREE:   .DB "FR",    <DO_FREE, >DO_FREE         ; "FREE" (0-arg, bit7 clear)
-KW_RND:    .DB "RN",    <FLT_RND, >FLT_RND         ; RND (0-arg, bit7 clear)
-         .DB $FF, <E2ND, >E2ND             ; sentinel: no-match → E2ND
+KW_ABS:    .DB "A",$C2; , <(FLT_ABS-1), >(FLT_ABS-1)         ; "AB" with bit7 set on 'B' -- 1-arg flag
+           .DW FLT_ABS-1
+KW_SQR:    .DB "S",$D1; , <(FLT_SQRT-1),>(FLT_SQRT-1)        ; "SQ" with bit7 set on 'Q' -- 1-arg flag
+           .DW FLT_SQRT-1
+KW_SIN:    .DB "S",$C9; , <(FLT_SIN-1), >(FLT_SIN-1)         ; "SI" with bit7 set on 'I' -- 1-arg flag
+           .DW FLT_SIN-1
+KW_COS:    .DB "C",$CF; , <(FLT_COS-1), >(FLT_COS-1)         ; "CO" with bit7 set on 'O' -- 1-arg flag
+           .DW FLT_COS-1
+KW_TAN:    .DB "T",$C1; , <(FLT_TAN-1), >(FLT_TAN-1)         ; "TA" with bit7 set on 'A' -- 1-arg flag
+           .DW FLT_TAN-1
+KW_ATN:    .DB "A",$D4; , <(FLT_ATAN-1),>(FLT_ATAN-1)        ; "AT" with bit7 set on 'T' -- 1-arg flag
+           .DW FLT_ATAN-1
+KW_ASIN:   .DB "A",$D3; , <(FLT_ASIN-1),>(FLT_ASIN-1)        ; "AS" with bit7 set on 'S' -- 1-arg flag
+           .DW FLT_ASIN-1
+KW_ACOS:   .DB "A",$C3; , <(FLT_ACOS-1),>(FLT_ACOS-1)        ; "AC" with bit7 set on 'C' -- 1-arg flag
+           .DW FLT_ACOS-1
+KW_PEEK:   .DB "P",$C5; , <(FLT_PEEK-1),>(FLT_PEEK-1)        ; "PE" with bit7 set on 'E' -- 1-arg flag
+           .DW FLT_PEEK-1
+KW_USR:    .DB "U",$D3; , <(FLT_USR-1), >(FLT_USR-1)         ; "US" with bit7 set on 'S' -- 1-arg flag
+           .DW FLT_USR-1
+KW_FLOOR:  .DB "F",$CC; , <(FLT_FLOOR-1),>(FLT_FLOOR-1)     ; "FL" with bit7 set on 'L' -- 1-arg flag
+           .DW FLT_FLOOR-1
+KW_EXP:    .DB "E",$D8; , <(FLT_EXP-1), >(FLT_EXP-1)         ; "EX" with bit7 set on 'X' -- 1-arg flag
+           .DW FLT_EXP-1
+KW_LN:     .DB "L",$CE; , <(FLT_LN-1),  >(FLT_LN-1)          ; "LN" with bit7 set on 'N' -- 1-arg flag
+           .DW FLT_LN-1
+KW_PI:     .DB "PI"; ,    <(FLT_PI-1),  >(FLT_PI-1)          ; "PI" (0-arg, bit7 clear)
+           .DW FLT_PI-1
+KW_FREE:   .DB "FR"; ,    <(DO_FREE-1), >(DO_FREE-1)         ; "FREE" (0-arg, bit7 clear)
+           .DW DO_FREE-1
+KW_RND:    .DB "RN"; ,    <(FLT_RND-1), >(FLT_RND-1)         ; RND (0-arg, bit7 clear)
+           .DW FLT_RND-1
+         .DB $FF, <E2ND, >E2ND             ; sentinel: no-match → E2ND (literal, not -1)
 
 ; Special Keywords - wierd functions or supporting words
 ; Two uppercase ASCII bytes per keyword (no terminator, no length).
@@ -695,6 +734,13 @@ IRQI:    RTI
 ;        truncated past IBUF_MAX -- each keypress past the limit sounds
 ;        BELL); IP -> IBUF
 ;   Clobbers: A, X, IP
+;
+;   GETCH no longer echoes (it has exactly one caller, this routine), so
+;   GETLINE echoes explicitly per branch below -- letting it substitute
+;   BELL for the echo on a full buffer instead of printing the rejected
+;   character on top of the bell (the previous bug). PUTCH here clobbers
+;   nothing (not even flags), so unlike uBASIC6502's fix no register
+;   save/restore is needed around these calls.
 ; =============================================================================
 GETLINE_M:
          LDA #'>'
@@ -705,11 +751,12 @@ GETLINE_I:
          LDA #' '
          JSR PUTCH
 GETLINE: LDX #0
-GLL:     JSR GETCH
+GLL:     JSR GETCH             ; raw read, no echo (see header note)
          CMP #CR
          BEQ GLD
          CMP #BS
          BNE GLS
+         JSR PUTCH             ; echo the backspace byte
          TXA                   ; was CPX #0 -- saves 1 byte; A clobbered but GETCH overwrites it
          BEQ GLL
          DEX
@@ -717,12 +764,14 @@ GLL:     JSR GETCH
 GLS:     CPX #IBUF_MAX
          BCS GLFULL
          STA IBUF,X
+         JSR PUTCH             ; echo the stored character (A unaffected by the STA above)
          INX
          BRA GLL
-GLFULL:  LDA #BELL              ; buffer full: still discard the char (X
-         JSR PUTCH               ; doesn't move), but beep so the overflow
-         BRA GLL                 ; isn't silent anymore
+GLFULL:  LDA #BELL              ; buffer full: discard the char (X
+         JSR PUTCH               ; doesn't move), beep instead of echoing it
+         BRA GLL                 ; -- the character itself is never printed
 GLD:     STA IBUF,X
+         JSR PUTCH              ; echo the raw CR (mirrors the old GETCH echo)
          JSR PRNL
          LDA #<IBUF
          STA IP
@@ -1476,29 +1525,29 @@ EAT_EXPR:
          ; fall through to EXPR
 
 EXPR:    JSR EXPR_ADD
-         LDX #0
-         JSR WPEEK
-RLO:     CMP #'<'
-         BNE RLNL
+         LDX #0                ; mask = 0 (no relop seen yet)
+
+; Scan relational operator chars, building a bitmask in X. Ported from
+; uBASIC6502's EXPR: maps <,=,> to 0,1,2 via one SBC, single bounds check
+; to detect "not a relop" and stop, table lookup for the bit value --
+; smaller than a 3-way CMP chain, and this part is purely about the
+; operator TEXT, unrelated to comparing floats vs ints below.
+RL_LOOP: JSR WPEEK
+         SEC
+         SBC #'<'              ; map <,=,> to 0,1,2
+         CMP #3
+         BCS RL_DONE           ; not a relop char -- stop scanning
+         TAY
          TXA
-         ORA #1
-         BRA RLTAIL
-RLNL:    CMP #'='
-         BNE RLNE
-         TXA
-         ORA #2
-         BRA RLTAIL
-RLNE:    CMP #'>'
-         BNE RLNR
-         TXA
-         ORA #4
-RLTAIL:  TAX
-         JSR GETCI
-         LDA (IP)
-         BRA RLO
-RLNR:    TXA
-         BNE RLH
-         RTS
+         ORA REL_MASK,Y        ; apply this operator's bit
+         TAX
+         JSR GETCI              ; consume the operator char
+         BRA RL_LOOP
+
+RL_DONE: TXA
+         BNE RLH                ; mask nonzero: a relop was found
+         RTS                    ; none found: FLT_A already holds left value
+REL_MASK: .DB 1, 2, 4          ; <,=,> -> bit values used below
 
 RLH:     STX T2               ; save mask in T2 lo
          JSR PUSH_FLT_A        ; park FLT_A on hardware stack
@@ -1639,7 +1688,6 @@ E2PR:    JSR GETCI
 ; PRT16    -- print T0/T0+1 as a signed decimal integer
 ; PUTCH    -- write A to the terminal
 ; GETCH    -- block for and return one input character
-; NEG16 / NEG_T1 -- negate T0/T0+1 (NEG_T1: negate T1/T1+1 instead)
 ;
 ;   Clobbers: A (all); GETCI/WEAT also advance IP; PRT16 clobbers T0-T2
 ; =============================================================================
@@ -1700,21 +1748,11 @@ PUTCH:   STA IO_OUT
          RTS
 
 GETCH:   LDA IO_IN
-         BNE PUTCH
+         BNE GC_RTS
          JSR RND_SHUFFLE
          BRA GETCH
-
-NEG_T1:  LDX #2
-         .DB $2C
-NEG16:   LDX #0
-         LDA #0
-         SEC
-         SBC T0,X
-         STA T0,X
-         LDA #0
-         SBC T0+1,X
-         STA T0+1,X
-DIFDN:   RTS
+DIFDN:
+GC_RTS:  RTS
 
 ; =============================================================================
 ; DO_IF  --  IF <expr> THEN <stmt>  statement (exactly one consequent
@@ -1753,12 +1791,19 @@ STMT:    JSR WPEEK
 ;   Bit 7 of the keyword's 2nd stored byte selects behavior:
 ;     set   = 1-arg function: call EAT_PAREN before loading handler addr
 ;     clear = statement or 0-arg function: skip EAT_PAREN
-;   On match: handler address stored in T2, JMP (T2) tail call.
+;   On match: table stores (handler-1); pushed hi/lo and RTS'd to (same
+;   push+RTS trick as uBASIC6502's ST_TAB) -- cheaper than building a ZP
+;   pointer for JMP (indirect), and touches T2 not at all now (previously
+;   clobbered it; see note below on why that matters).
 ;   On no-match ($FF sentinel): JMP (UNI_TAB+1,X) tail call — reads the
-;   no-match target directly from the table, preserving T2 (needed by
-;   relational operators which store their mask in T2 across EXPR_ADD calls).
+;   no-match target directly from the table (stored as a literal address,
+;   NOT -1: this path is unrelated to the push/RTS trick above). This is
+;   already optimal on 65C02 (one 3-byte indexed-indirect JMP beats any
+;   push/RTS or ZP-pointer construction) and preserves T2, needed by
+;   relational operators which store their mask in T2 across EXPR_ADD calls
+;   -- left untouched.
 ;   All exits are tail calls: zero extra stack depth.
-;   Clobbers: A, X, T2 (on match only)
+;   Clobbers: A, X  (T2 no longer touched on the match path either)
 ; =============================================================================
 MATCH_DISPATCH:
 MDL:     LDA UNI_TAB,X
@@ -1769,12 +1814,12 @@ MDL:     LDA UNI_TAB,X
          PHX                   ; save table offset -- EAT_PAREN clobbers X
          JSR EAT_PAREN
          PLX
-MD_NOPAREN:
-         LDA UNI_TAB+2,X
-         STA T2
+MD_NOPAREN:                    ; table stores (handler-1) -- see header above
          LDA UNI_TAB+3,X
-         STA T2+1
-         JMP (T2)             ; tail-call handler
+         PHA
+         LDA UNI_TAB+2,X
+         PHA
+         RTS                   ; pulls lo,hi -> PC = (handler-1)+1 = handler
 MDNX:    INX
          INX
          INX
@@ -2288,7 +2333,6 @@ F_NONZERO:
          AND #$80
          STA FLT_SA
          BEQ F_POS
-
          JSR NEG16
 
 F_POS:   LDA #$90
@@ -3298,7 +3342,7 @@ FLT_ASIN: JSR FLT_A_TO_B       ; FLT_B = x
          JSR FLT_LDCONST_B    ; FLT_B = +pi/2
          LDA FLT_A+1
          BPL FA_SGN
-         SMB7 FLT_B+1            ; x<0 -> -pi/2
+         SMB#7, FLT_B+1            ; x<0 -> -pi/2
 FA_SGN:  JMP FLT_B_TO_A       ; FLT_A = asin(+-1) = (+-)pi/2; RTS
 FA_NORM: JSR GET_RIGHT        ; FLT_B = denominator, FLT_A = x (restored)
          JSR FLT_DIV          ; FLT_A = x / sqrt(1 - x^2)
@@ -3319,7 +3363,7 @@ FLT_ATAN:
          LDA FLT_A+1
          AND #$80
          STA T2                ; T2 = original sign bit of x (0 or $80)
-         RMB7 FLT_A+1            ; FLT_A = |x|
+         RMB#7, FLT_A+1            ; FLT_A = |x|
          LDX #IDX_ONE
          JSR FLT_LDCONST_B     ; FLT_B = 1.0
          JSR FLT_CMP           ; A = -1/0/+1 : |x| vs 1.0 (FLT_A preserved=|x|)
@@ -3362,7 +3406,7 @@ FA_BIG:  LDA FLT_A+1           ; FLT_A currently = |x| (preserved by FLT_CMP)
          JSR FLT_LDCONST       ; FLT_A = pi/2
          LDA T2
          BEQ FA_SUB            ; positive x: keep +pi/2
-         SMB7 FLT_A+1            ; negative x: -pi/2
+         SMB#7, FLT_A+1            ; negative x: -pi/2
 FA_SUB:  JMP FLT_SUB            ; FLT_A = (+-pi/2) - atan_core_rad(1/x)
 
 ; =============================================================================
@@ -3413,7 +3457,7 @@ FLT_SIN:
          LDA FLT_A+1
          AND #$80
          PHA                   ; stash original sign
-         RMB7 FLT_A+1            ; FLT_A = |x| (radians)
+         RMB#7, FLT_A+1            ; FLT_A = |x| (radians)
 
          JSR LD_PI_B        ; FLT_B = pi
          INC FLT_B              ; FLT_B = 2*pi (NORM_PACK always leaves
@@ -3458,7 +3502,6 @@ FS_POLY:                        ; sin(x) ~= x*P(x^2) via the shared
          EOR FLT_A+1
          STA FLT_A+1
          RTS
-
 
 ; =============================================================================
 ; FLT_CONST_PTR -- point T0 at constant X's 4 ROM bytes. All constants
