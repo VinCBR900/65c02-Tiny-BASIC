@@ -1,5 +1,5 @@
 /*
- * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.18, Jul 2026)
+ * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.19, Jul 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
@@ -40,6 +40,24 @@
  *   -D NAME=EXPR    Predefine NAME as EXPR (decimal, $hex, %binary, etc).
  *                   Earlier -D flags on the same command line are visible
  *                   to later ones, e.g. -D A=1 -D B=A+1.
+ *   --StrictKowalski  Independent of -Strict6502/-NoWarn65c02 (freely
+ *                   combinable with either). Promotes every Kowalski-
+ *                   simulator-incompatibility check to a hard error
+ *                   instead of a warning. All such checks are tagged
+ *                   "[Kowalski]" in warning/error text regardless of
+ *                   this flag. v1.19 checks:
+ *                     - RMB/SMB/BBR/BBS written in the native bit-
+ *                       suffixed form (RMB7 zp) rather than Kowalski's
+ *                       '#n' form (RMB#7, zp). Both forms are always
+ *                       accepted and assemble identically; this flag
+ *                       only controls whether the non-Kowalski spelling
+ *                       is a warning or an error.
+ *                     - ASL/LSR/ROL/ROR/INC/DEC with an explicit "A"
+ *                       operand (Kowalski parses bare A as an address,
+ *                       not the accumulator). The implied/empty-operand
+ *                       form is always fine and never flagged.
+ *                     - A lo/hi-byte prefix operator ('<' or '>')
+ *                       directly followed by '(', e.g. "<(label-1)".
  *   --dump-all      Print every assembled symbol sorted by address.  
  *   --help, -h      Print this help and exit.
  *
@@ -63,6 +81,10 @@
  *                (indirect), (zp indirect), (zp),Y, (zp,X), JMP (abs,X)
  *   65C02 bit ops: RMBn/SMBn zp   (n=0-7, single operand)
  *                  BBRn/BBSn zp,target  (n=0-7, TWO comma-separated operands)
+ *                  Both the native bit-suffixed mnemonic (RMB7 zp) and
+ *                  Kowalski's '#n' form (RMB#7, zp) are accepted, fully
+ *                  whitespace-agnostic around the '#' and digit; see
+ *                  --StrictKowalski above.
  *                relative (branch instructions)
  *   Expressions: decimal  $hex  %binary  'char'  "char"  * (current PC)
  *                <lo-byte  >hi-byte  + - * /  == !=  ( )
@@ -75,6 +97,25 @@
 
  /*
  *  VERSION HISTORY
+ *
+ * v1.19 (2026-07)
+ *   - Added --StrictKowalski, an independent CLI flag (freely combinable
+ *     with -Strict6502/-NoWarn65c02) covering assembler-Kowalski-
+ *     simulator syntax mismatches. All checks under this flag are
+ *     tagged "[Kowalski]" in warning/error text; default behaviour is
+ *     to warn, --StrictKowalski promotes to a hard error.
+ *   - Added Kowalski's '#n' form for RMB/SMB/BBR/BBS (e.g. "RMB#7, zp")
+ *     as an accepted alternative to the existing native bit-suffixed
+ *     form ("RMB7 zp"), fully whitespace-agnostic around the '#' and
+ *     digit. Both forms assemble identically; using the native form now
+ *     emits a [Kowalski] warning (error under --StrictKowalski).
+ *   - Added a [Kowalski] check for ASL/LSR/ROL/ROR/INC/DEC with an
+ *     explicit "A" operand (Kowalski parses bare A as an address, not
+ *     the accumulator). The implied/empty-operand form remains
+ *     unflagged.
+ *   - Added a [Kowalski] check for a lo/hi-byte prefix operator ('<' or
+ *     '>') directly followed by '(', e.g. "<(label-1)" -- accepted by
+ *     this assembler but not by the Kowalski simulator.
  *
  * v1.18 (2026-07)
  *   - Fixed strip_comment() silently swallowing the rest of a line
@@ -476,6 +517,45 @@ static int g_strict6502  = 0;
 static int g_nowarn_optsize = 0;
 
 /*
+ * g_strict_kowalski (v1.19):
+ *   CLI-set-once flag for --StrictKowalski, same lifetime rules as
+ *   g_nowarn65c02/g_strict6502/g_nowarn_optsize above (main()-only, never
+ *   touched by sim65c02.c's assemble(source) call site). Deliberately
+ *   independent of every other CLI flag -- no mutual-exclusion checks --
+ *   since it governs a separate concern (assembler-vs-Kowalski-simulator
+ *   syntax compatibility, not 6502-vs-65C02 portability or code-size
+ *   advisories) and is expected to grow more checks over time.
+ *     g_strict_kowalski==0 (default): every [Kowalski] condition below
+ *       is reported as a warning.
+ *     g_strict_kowalski==1 (--StrictKowalski): every [Kowalski]
+ *       condition is promoted to a hard error instead.
+ *   See kowalski_flag() immediately below for the single choke point
+ *   all such checks report through.
+ */
+static int g_strict_kowalski = 0;
+
+/*
+ * kowalski_flag (NEW, v1.19)
+ *   Single reporting choke point for every --StrictKowalski check (see
+ *   g_strict_kowalski above). Tags msg with "[Kowalski] " and routes it
+ *   to add_warning() or add_error() depending on g_strict_kowalski, so
+ *   every current and future Kowalski-compatibility check stays
+ *   consistent in both wording and strictness behavior.
+ *   In:  lineno -- source line to report against (passed straight
+ *                   through to add_warning()/add_error())
+ *        msg    -- condition description; no "[Kowalski]" prefix and no
+ *                   trailing punctuation needed, both handled here
+ *   Out: none
+ *   Clobbers: nwarnings or nerrors (via add_warning()/add_error())
+ */
+static void kowalski_flag(int lineno, const char *msg) {
+    char full[ERR_LEN];
+    snprintf(full, ERR_LEN, "[Kowalski] %s", msg);
+    if (g_strict_kowalski) add_error(lineno, full);
+    else                   add_warning(lineno, full);
+}
+
+/*
  * is_65c02only  --  return 1 if the (mnemonic, mode) combination requires
  *                  a 65C02 and is therefore illegal in cpu_mode==1 (6502).
  *
@@ -533,6 +613,88 @@ static const char *skip_ws(const char *s) {
 }
 static int is_ident_start(char c) { return isalpha((unsigned char)c) || c=='_' || c=='@'; }
 static int is_ident(char c)       { return isalnum((unsigned char)c) || c=='_' || c=='@'; }
+
+/*
+ * parse_bitop_prefix (NEW, v1.19)  --  recognize an RMB/SMB/BBR/BBS
+ *   bit-instruction mnemonic at p in EITHER accepted spelling, fully
+ *   whitespace-agnostic, and canonicalize it to the existing internal
+ *   bit-suffixed form ("rmb7","bbs3",...) that is_bbr_bbs()/OPTAB/pass 1
+ *   and pass 2 already expect -- so nothing downstream of this function
+ *   needs to know which spelling was used in the source.
+ *
+ *     native/bit-suffixed (non-Kowalski): RMB7 zp
+ *     Kowalski '#n' form:                 RMB#7, zp   (any amount of
+ *                                          whitespace around '#' and the
+ *                                          digit, and around an optional
+ *                                          separating comma, is ignored)
+ *
+ *   In:  p         -- pointer into the (comment-stripped, trimmed)
+ *                      source line at the first character of the
+ *                      candidate mnemonic (i.e. already past any
+ *                      label/whitespace)
+ *   Out: mnem_out   -- (min 5 bytes) receives the canonical lower-case
+ *                       mnemonic, e.g. "rmb7", if recognized; untouched
+ *                       otherwise
+ *        legacy_out -- set to 1 if the native bit-suffixed spelling was
+ *                       used (non-Kowalski), 0 if the Kowalski '#n' form
+ *                       was used; untouched if not recognized
+ *   Return: pointer to the first character after the consumed
+ *           mnemonic+bit-spec (and one optional trailing comma+
+ *           whitespace separator, so the caller can treat everything
+ *           from there on as plain operand text exactly as before), or
+ *           NULL if p does not begin with a recognized rmb/smb/bbr/bbs
+ *           bit-spec -- caller must then fall back to normal mnemonic
+ *           tokenizing (so ordinary unknown identifiers starting with
+ *           "rmb"/"smb"/"bbr"/"bbs" are unaffected).
+ *   Clobbers: none
+ */
+static const char *parse_bitop_prefix(const char *p, char *mnem_out, int *legacy_out) {
+    if (!isalpha((unsigned char)p[0]) || !isalpha((unsigned char)p[1]) || !isalpha((unsigned char)p[2]))
+        return NULL;
+    char fam[4];
+    fam[0] = (char)tolower((unsigned char)p[0]);
+    fam[1] = (char)tolower((unsigned char)p[1]);
+    fam[2] = (char)tolower((unsigned char)p[2]);
+    fam[3] = '\0';
+    if (strcmp(fam,"rmb") && strcmp(fam,"smb") && strcmp(fam,"bbr") && strcmp(fam,"bbs"))
+        return NULL;
+
+    const char *q = p + 3;
+
+    /* native bit-suffixed form: digit 0-7 fused directly onto the
+       mnemonic, with no further identifier characters following (guards
+       against matching the start of some unrelated longer identifier,
+       e.g. a label literally named "rmb7value"). */
+    if (*q >= '0' && *q <= '7' && !(is_ident(q[1]))) {
+        char digit = *q;
+        const char *r = q + 1;
+        r = skip_ws(r);
+        if (*r == ',') { r++; r = skip_ws(r); }
+        snprintf(mnem_out, 5, "%s%c", fam, digit);
+        *legacy_out = 1;
+        return r;
+    }
+
+    /* Kowalski '#n' form: optional whitespace, '#', optional whitespace,
+       digit 0-7, optional comma (with whitespace on either side). */
+    {
+        const char *r = skip_ws(q);
+        if (*r == '#') {
+            r = skip_ws(r + 1);
+            if (*r >= '0' && *r <= '7') {
+                char digit = *r;
+                r++;
+                r = skip_ws(r);
+                if (*r == ',') { r++; r = skip_ws(r); }
+                snprintf(mnem_out, 5, "%s%c", fam, digit);
+                *legacy_out = 0;
+                return r;
+            }
+        }
+    }
+
+    return NULL;
+}
 
 /* ── scoped symbol name resolution ──────────────────────────────────────── */
 /* scope = current global label.  @local names are stored as "GLOBAL@local". */
@@ -756,6 +918,34 @@ static int find_cmpop(const char *s, int len) {
         if (depth == 0 && s[i+1]=='=' && (s[i]=='=' || s[i]=='!')) return i;
     }
     return -1;
+}
+
+/*
+ * kowalski_lohibyte_paren (NEW, v1.19)  --  detect a lo/hi-byte prefix
+ *   operator ('<' or '>') directly followed by '(' anywhere in expr,
+ *   e.g. "<(label-1)" or "> (foo+1)". This assembler's eval_expr() (see
+ *   below) accepts this fine by simply recursing past the prefix
+ *   character, but the Kowalski simulator does not accept a parenthesized
+ *   sub-expression immediately after these prefix operators.
+ *   Purely textual/single-pass -- does not attempt to also validate the
+ *   rest of the expression; that is eval_expr()'s job as normal.
+ *   In:  expr -- operand/expression text to scan (raw, not pre-trimmed)
+ *   Out: return 1 if the shape is present anywhere at top level (outside
+ *        a quoted char/string literal), else 0
+ *   Clobbers: none
+ */
+static int kowalski_lohibyte_paren(const char *expr) {
+    int in_str = 0; char sq = 0;
+    for (const char *p = expr; *p; p++) {
+        char c = *p;
+        if (in_str) { if (c == sq) in_str = 0; continue; }
+        if (c == '"' || c == '\'') { in_str = 1; sq = c; continue; }
+        if (c == '<' || c == '>') {
+            const char *q = skip_ws(p + 1);
+            if (*q == '(') return 1;
+        }
+    }
+    return 0;
 }
 
 static int eval_expr(const char *raw, int pc, int pass2, int *err) {
@@ -1225,11 +1415,16 @@ static void strip_comment(const char *src, char *buf, int buflen, int *untermina
  * Returns 1 if line is an equate (NAME = expr), 0 otherwise.
  * v1.18: unterminated_str (out, may be NULL) is set to 1 if the line had
  * an unmatched '"' or ''' -- see strip_comment() header comment.
+ * v1.19: bitop_legacy (out, may be NULL) is set to 1 if mnem came from
+ * the native bit-suffixed RMB/SMB/BBR/BBS spelling (non-Kowalski), 0 if
+ * it came from Kowalski's '#n' spelling or mnem isn't one of these at
+ * all -- see parse_bitop_prefix() header comment.
  */
 static int parse_line(const char *raw,
                       char *label, char *mnem, char *operand,
-                      int *unterminated_str) {
+                      int *unterminated_str, int *bitop_legacy) {
     label[0] = mnem[0] = operand[0] = '\0';
+    if (bitop_legacy) *bitop_legacy = 0;
 
     char line[LINE_LEN];
     strip_comment(raw, line, LINE_LEN, unterminated_str);
@@ -1289,12 +1484,26 @@ static int parse_line(const char *raw,
     p = skip_ws(p);
     if (!*p) return 0;
     {
-        const char *ms = p;
-        if (*p == '.') p++;         /* directive */
-        while (*p && !isspace((unsigned char)*p)) p++;
-        int mlen = (int)(p - ms);
-        strncpy(mnem, ms, mlen); mnem[mlen] = '\0';
-        p = skip_ws(p);
+        /* v1.19: try the space-agnostic RMB/SMB/BBR/BBS recognizer first
+           -- it needs to see the un-tokenized text to tell "RMB#7,"
+           (mnemonic+bit-spec fused with no separating whitespace) apart
+           from an ordinary mnemonic, which the whitespace-delimited
+           tokenizer below cannot do. Falls through to normal tokenizing
+           for everything it doesn't recognize. */
+        char bmnem[8]; int blegacy = 0;
+        const char *after = parse_bitop_prefix(p, bmnem, &blegacy);
+        if (after) {
+            strncpy(mnem, bmnem, LINE_LEN-1);
+            if (bitop_legacy) *bitop_legacy = blegacy;
+            p = after;
+        } else {
+            const char *ms = p;
+            if (*p == '.') p++;         /* directive */
+            while (*p && !isspace((unsigned char)*p)) p++;
+            int mlen = (int)(p - ms);
+            strncpy(mnem, ms, mlen); mnem[mlen] = '\0';
+            p = skip_ws(p);
+        }
     }
 
     /* rest is operand */
@@ -1384,6 +1593,14 @@ typedef struct {
     int  skip;          /* v1.11: 1 if inside a false .IF/.ELSE branch --
                           * pass 1.5 and pass 2 both skip these lines
                           * entirely (see if_active() header comment) */
+    int  bitop_legacy;  /* v1.19: 1 if mnem is an RMB/SMB/BBR/BBS mnemonic
+                          * written in the native bit-suffixed (non-
+                          * Kowalski) spelling; 0 for the Kowalski '#n'
+                          * spelling or for any other mnemonic. Set once
+                          * by parse_line() in pass 1, read by pass 2's
+                          * [Kowalski] check (both passes share this same
+                          * pc_map entry -- pass 2 never re-parses the
+                          * line). See parse_bitop_prefix() header. */
 } LineInfo;
 
 static LineInfo pc_map[MAX_LINES];
@@ -1826,7 +2043,8 @@ static int assemble(const char *source) {
         int lineno = li + 1;
         char label[LINE_LEN], mnem[LINE_LEN], operand[LINE_LEN];
         int unterm = 0;
-        int is_eq = parse_line(raw_lines[li], label, mnem, operand, &unterm);
+        int bitop_legacy = 0;
+        int is_eq = parse_line(raw_lines[li], label, mnem, operand, &unterm, &bitop_legacy);
         if (unterm) {
             add_error(lineno, "Unterminated quote: unmatched ' or \" on this line "
                                "(a real comment after it may have been swallowed)");
@@ -1838,6 +2056,7 @@ static int assemble(const char *source) {
         info->pc       = pc;
         info->is_equate = is_eq;
         info->skip     = 0;
+        info->bitop_legacy = bitop_legacy;
         strncpy(info->label,   label,   LINE_LEN-1);
         strncpy(info->mnem,    mnem,    LINE_LEN-1);
         strncpy(info->operand, operand, LINE_LEN-1);
@@ -1860,6 +2079,14 @@ static int assemble(const char *source) {
             char name[LINE_LEN];
             strncpy(name, label, LINE_LEN-1);
             name[strlen(name)-1] = '\0'; /* strip trailing '=' */
+            /* v1.19: equates are only ever evaluated here (pass 2 skips
+               them entirely -- see info->is_equate handling below), so
+               this is the one and only place to run the [Kowalski]
+               lo/hi-byte-paren check against an equate's expression. */
+            if (kowalski_lohibyte_paren(operand))
+                kowalski_flag(lineno, "'<(' / '>(' is not accepted by the Kowalski "
+                                       "simulator (parenthesized sub-expression directly "
+                                       "after a lo/hi-byte prefix operator)");
             int e = 0;
             int val = eval_expr(operand, pc, 0, &e);
             sym_set(name, val);
@@ -2192,6 +2419,15 @@ static int assemble(const char *source) {
         const char *mn = info->mnem;
         const char *op = info->operand;
 
+        /* v1.19: [Kowalski] lo/hi-byte-paren check -- run once per line
+           here, ahead of the per-mnemonic dispatch below, so it uniformly
+           covers instruction operands, .byte/.word lists, .org and .res
+           expressions without needing a separate call at each site. */
+        if (op[0] && kowalski_lohibyte_paren(op))
+            kowalski_flag(lineno, "'<(' / '>(' is not accepted by the Kowalski "
+                                   "simulator (parenthesized sub-expression directly "
+                                   "after a lo/hi-byte prefix operator)");
+
         if (!strcmp(mn, ".org")) { continue; }
         if (!strcmp(mn, ".res")) { continue; }
         if (!strcmp(mn, ".byte")) {
@@ -2358,6 +2594,18 @@ static int assemble(const char *source) {
             int is_bbs = (mn[1] == 'b' && mn[2] == 's'); /* "bbs" vs "bbr" */
             int opc    = is_bbs ? (0x80 | (bit << 4) | 0x0F) : ((bit << 4) | 0x0F);
 
+            /* v1.19: [Kowalski] -- flag the native bit-suffixed spelling
+               (e.g. "BBR7 zp,target") as non-Kowalski; the '#n' spelling
+               ("BBR#7, zp,target") assembles identically and is silent.
+               See parse_bitop_prefix()/info->bitop_legacy. */
+            if (info->bitop_legacy) {
+                char kmsg[ERR_LEN];
+                snprintf(kmsg, ERR_LEN,
+                    "'%s' uses the native bit-suffixed spelling; Kowalski syntax is "
+                    "'%.3s#%d, zp,target'", mn, mn, bit);
+                kowalski_flag(lineno, kmsg);
+            }
+
             if (cpu_mode == 1) {
                 char msg[ERR_LEN];
                 snprintf(msg, ERR_LEN,
@@ -2433,6 +2681,29 @@ static int assemble(const char *source) {
 
         Operand oper = parse_operand(op, mn, pc, 1, lineno);
         Mode m = promote(mn, oper.mode);
+
+        /* v1.19: [Kowalski] -- RMB/SMB take the generic single-operand
+           path (unlike BBR/BBS above), so their legacy-spelling check
+           lives here instead. Same rationale as the BBR/BBS check. */
+        if ((!strncmp(mn, "rmb", 3) || !strncmp(mn, "smb", 3)) && info->bitop_legacy) {
+            char kmsg[ERR_LEN];
+            snprintf(kmsg, ERR_LEN,
+                "'%s' uses the native bit-suffixed spelling; Kowalski syntax is "
+                "'%.3s#%c, zp'", mn, mn, mn[3]);
+            kowalski_flag(lineno, kmsg);
+        }
+
+        /* v1.19: [Kowalski] -- explicit "A" operand on ASL/LSR/ROL/ROR/
+           INC/DEC. Kowalski parses a bare A as an address/label, not the
+           accumulator; the implied/empty-operand form (oper.mode==M_ACC
+           with no operand text) is always fine and left unflagged. */
+        if (is_acc_mnem(mn) && m == M_ACC && skip_ws(op)[0]) {
+            char kmsg[ERR_LEN];
+            snprintf(kmsg, ERR_LEN,
+                "'%s A' -- Kowalski parses 'A' as an address, not the accumulator; "
+                "use the implied form '%s' instead", mn, mn);
+            kowalski_flag(lineno, kmsg);
+        }
 
         /* v1.5: 6502 mode -- flag any 65C02-only instruction as an error */
         if (cpu_mode == 1 && is_65c02only(mn, m)) {
@@ -2705,7 +2976,7 @@ static int parse_hex_range(const char *s, int *start, int *end) {
 
 static void asm_usage(FILE *out) {
     fprintf(out,
-        "asm65c02 v1.18 - Toy 65C02/6502 two-pass assembler\n"
+        "asm65c02 v1.19 - Toy 65C02/6502 two-pass assembler\n"
         "\n"
         "Copyright Vincent Crabtree 2026, MIT License, See LICENSE file\n"
         "\n"
@@ -2734,6 +3005,21 @@ static void asm_usage(FILE *out) {
         "               be-BRA, PHX/PHY/PLX/PLY/STZ peephole suggestions, plus the\n"
         "               general CMP/CPX/CPY #0 redundancy and no-op-immediate\n"
         "               checks). These never change emitted bytes -- info only.\n"
+        "  --StrictKowalski  Independent of -Strict6502/-NoWarn65c02 (freely\n"
+        "               combinable with either) -- promotes every [Kowalski]\n"
+        "               condition below from a warning to a hard error. Default\n"
+        "               (without this flag) is to warn only. Current checks:\n"
+        "                 - RMB/SMB/BBR/BBS written bit-suffixed (RMB7 zp) rather\n"
+        "                   than Kowalski's '#n' form (RMB#7, zp). Both forms are\n"
+        "                   always accepted and assemble identically -- this flag\n"
+        "                   only affects whether the non-Kowalski spelling warns\n"
+        "                   or errors.\n"
+        "                 - ASL/LSR/ROL/ROR/INC/DEC with an explicit 'A' operand\n"
+        "                   (Kowalski parses bare A as an address, not the\n"
+        "                   accumulator). The implied/empty-operand form is\n"
+        "                   always fine and never flagged.\n"
+        "                 - A lo/hi-byte prefix operator ('<' or '>') directly\n"
+        "                   followed by '(', e.g. '<(label-1)'.\n"
         "  -D NAME      Predefine NAME as 1, as if 'NAME = 1' appeared before the\n"
         "               start of the source file -- for use with .IF NAME. May be\n"
         "               repeated.\n"
@@ -2793,6 +3079,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-NoWarn65c02")) g_nowarn65c02 = 1;
         else if (!strcmp(argv[i], "-Strict6502"))  g_strict6502  = 1;
         else if (!strcmp(argv[i], "-NoWarnOptSize")) g_nowarn_optsize = 1;
+        else if (!strcmp(argv[i], "--StrictKowalski")) g_strict_kowalski = 1;
         else if (!strcmp(argv[i], "-D")) {
             if (i+1 >= argc) { fprintf(stderr, "-D requires an argument (NAME or NAME=EXPR)\n"); return 1; }
             if (!asm_predefine(argv[++i])) {
