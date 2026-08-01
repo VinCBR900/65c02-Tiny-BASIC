@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>65C02 Tiny BASIC Online Simulator</title>
+  <style>
+    :root { color-scheme: dark; --bg:#10141f; --panel:#182033; --accent:#6ee7ff; --accent2:#a7f3d0; --text:#e5edf7; --muted:#9fb0c6; --term:#020617; --border:#2b3854; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: radial-gradient(circle at top left, #263553 0, var(--bg) 35rem); color:var(--text); }
+    header { padding:2rem clamp(1rem,4vw,4rem) 1rem; }
+    h1 { margin:0 0 .5rem; font-size:clamp(2rem,5vw,4rem); letter-spacing:-.04em; }
+    .subtitle { max-width:70rem; color:var(--muted); font-size:1.1rem; line-height:1.55; }
+    main { display:grid; grid-template-columns: minmax(18rem, 28rem) 1fr; gap:1rem; padding:1rem clamp(1rem,4vw,4rem) 3rem; }
+    .card { background:rgba(24,32,51,.9); border:1px solid var(--border); border-radius:18px; padding:1rem; box-shadow:0 20px 70px rgba(0,0,0,.25); }
+    label { display:block; margin:.8rem 0 .35rem; color:var(--muted); font-weight:700; font-size:.9rem; text-transform:uppercase; letter-spacing:.08em; }
+    select, input, textarea, button { width:100%; border-radius:12px; border:1px solid var(--border); background:#0f172a; color:var(--text); padding:.75rem .85rem; font:inherit; }
+    button { cursor:pointer; border-color:#3b82f6; background:linear-gradient(135deg,#2563eb,#0891b2); font-weight:800; margin-top:.65rem; }
+    button.secondary { background:#111827; border-color:var(--border); }
+    button:hover { filter:brightness(1.12); }
+    .row { display:grid; grid-template-columns: 1fr 1fr; gap:.6rem; }
+    #terminal { height:min(64vh, 42rem); min-height:28rem; overflow:auto; padding:1rem; background:var(--term); border-radius:18px; border:1px solid #334155; font:15px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space:pre-wrap; color:#d1fae5; }
+    .hint { color:var(--muted); font-size:.92rem; line-height:1.45; }
+    .pill { display:inline-block; color:#031014; background:var(--accent2); padding:.2rem .55rem; border-radius:999px; font-weight:800; font-size:.78rem; }
+    @media (max-width: 860px) { main { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="pill">WebAssembly 65C02</span>
+    <h1>65C02 Tiny BASIC</h1>
+    <p class="subtitle">Run the repository's 65C02 simulator in your browser. Select a ROM, type BASIC commands, and interact with the Kowalski-style virtual terminal.</p>
+  </header>
+  <main>
+    <section class="card">
+      <label for="rom">Interpreter</label>
+      <select id="rom">
+        <option value="uBASIC6502.asm">uBASIC6502.asm — 2 KB uBASIC</option>
+        <option value="mini-BASIC65c02.asm">mini-BASIC65c02.asm — 4 KB mini BASIC</option>
+      </select>
+      <button id="reset">Reset selected BASIC</button>
+      <label for="command">Command / Program line</label>
+      <input id="command" autocomplete="off" spellcheck="false" placeholder='PRINT "HELLO"'>
+      <button id="send">Send line</button>
+      <div class="row">
+        <button class="secondary" data-demo='PRINT 42'>PRINT 42</button>
+        <button class="secondary" data-demo='NEW\n10 PRINT "HELLO"\n20 GOTO 10\nRUN'>Loop demo</button>
+      </div>
+      <button class="secondary" id="clear">Clear terminal</button>
+      <p class="hint">Tip: multi-line input is accepted. Each line is sent with carriage return, matching the BASIC ROMs' terminal convention.</p>
+    </section>
+    <section class="card">
+      <div id="terminal">Loading simulator...</div>
+    </section>
+  </main>
+  <script src="sim65c02.js"></script>
+  <script>
+    const term = document.getElementById('terminal');
+    const rom = document.getElementById('rom');
+    const command = document.getElementById('command');
+    let api = null;
+    let lastOutput = '';
+
+    function append(text) {
+      if (!text) return;
+      const chunks = text.split('\f');
+      chunks.forEach((part, index) => {
+        if (index > 0) term.textContent = '';
+        term.textContent += part.replace(/\r/g, '\n');
+      });
+      term.scrollTop = term.scrollHeight;
+    }
+    function drain() {
+      const out = api.output();
+      if (out.length > lastOutput.length) append(out.slice(lastOutput.length));
+      lastOutput = out;
+    }
+    function pump() {
+      if (!api) return;
+      api.run(5000);
+      drain();
+      requestAnimationFrame(pump);
+    }
+    function reset() {
+      if (!api) return;
+      term.textContent = '';
+      lastOutput = '';
+      api.select(rom.value);
+      api.clearOutput();
+      api.run(20000);
+      drain();
+    }
+    function sendText(text) {
+      text.split(/\r?\n/).filter(Boolean).forEach(line => api.input(line));
+      api.run(30000);
+      drain();
+    }
+
+    Module.onRuntimeInitialized = () => {
+      api = {
+        select: Module.cwrap('sim65c02_select', 'number', ['string']),
+        input: Module.cwrap('sim65c02_input', null, ['string']),
+        run: Module.cwrap('sim65c02_run', 'number', ['number']),
+        output: Module.cwrap('sim65c02_output', 'string', []),
+        clearOutput: Module.cwrap('sim65c02_clear_output', null, [])
+      };
+      reset();
+      pump();
+    };
+    document.getElementById('reset').onclick = reset;
+    document.getElementById('send').onclick = () => { sendText(command.value); command.value = ''; command.focus(); };
+    document.getElementById('clear').onclick = () => { term.textContent = ''; };
+    command.addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('send').click(); });
+    document.querySelectorAll('[data-demo]').forEach(btn => btn.onclick = () => sendText(btn.dataset.demo));
+  </script>
+</body>
+</html>
