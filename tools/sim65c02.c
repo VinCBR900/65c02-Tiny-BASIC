@@ -73,7 +73,7 @@
  *          Override with --load-addr if needed.
  *
  * NOTES
- * 
+ *
  * Kowalski virtual I/O ports:
  *   $E000  write  TERMINAL_CLS    clear screen (ANSI ESC[2J + home)
  *   $E001  write  PUTCH           character output to stdout (configurable,
@@ -86,7 +86,7 @@
  *
  * GETCH/PUTCH addresses and idle-exhaustion detection (v8):
  *   GETCH ($E004 by default) and PUTCH ($E001 by default) are intercepted
- *   to emulate character IO. Override with --getch-addr and --putch-addr 
+ *   to emulate character IO. Override with --getch-addr and --putch-addr
  *   to map elsewhere, regardless of ASM or bin file.
  *
  *   Idle-exhaustion: every read of the GETCH address that finds no
@@ -103,14 +103,14 @@
  *   buffer is used exactly as before -- a non-blocking drain, 0 returned
  *   once empty. --input ALWAYS takes precedence when given.
  *
- *   A terminal's Enter key (or a text file's line ending) sends LF; 
+ *   A terminal's Enter key (or a text file's line ending) sends LF;
  *   translated to CR here to match the line-ending convention the BASIC
  *   ROMs expect..
  *
  *   Once stdin hits EOF, every later fgetc() returns EOF immediately (no
  *   re-blocking), so clicks up and fires.  Hence a redirected/piped-input
  *   with --maxcycles 0 will busy spin forever until Ctrl-C. This also
- *   applies if the script  never ends (e.g. GOTO 10 loop) 
+ *   applies if the script  never ends (e.g. GOTO 10 loop)
  */
 
  /*
@@ -118,28 +118,28 @@
  *
  * v11 — Conditional-Assembly Predefines
  *   - ADDED: -D NAME / -D NAME=EXPR command-line flags, forwarded straight
- *     into the embedded assembler typically used with .IF directive. 
+ *     into the embedded assembler typically used with .IF directive.
  *   - -D is a no-op for .bin files with a warning.
- * 
+ *
  * v10 — Opcode Completeness
- *   - FIXED: Added missing execution mapping for CMP (zp) ($D2) zero-page 
+ *   - FIXED: Added missing execution mapping for CMP (zp) ($D2) zero-page
  *     indirect addressing mode to align with other core arithmetic opcodes.
  *
  * v9 — CLI Streamlining
- *   - REMOVED: Redundant --mandelbrot and --plain flags now that full native 
+ *   - REMOVED: Redundant --mandelbrot and --plain flags now that full native
  *     stdin redirection (`sim65c02 rom.asm < script.txt`) is supported.
  *   - ADDED: Explicit documentation for stdin test-script pipelining.
  *
  * v8 — Core I/O Overhaul & Execution Engine Updates
- *   - ADDED: Opcode execution support for CMP abs,Y ($D9), CMP (zp,X) ($C1), 
+ *   - ADDED: Opcode execution support for CMP abs,Y ($D9), CMP (zp,X) ($C1),
  *     and absolute indexed X variants for LSR, ROL, ROR, and LDY ($5E/$3E/$7E/$BC).
- *   - CHANGED: Replaced fragile ROM signature polling loops with robust, 
+ *   - CHANGED: Replaced fragile ROM signature polling loops with robust,
  *     address-configurable hooks via --getch-addr and --putch-addr inside rd()/wr().
  *   - CHANGED: --maxcycles 0 now specifies unlimited execution.
- *   - ADDED: Real-time, blocking stdin fallback (with LF->CR translation) when 
+ *   - ADDED: Real-time, blocking stdin fallback (with LF->CR translation) when
  *     the --input buffer queue is exhausted or omitted.
  *   - ADDED: SIGINT (Ctrl-C) trap handler for graceful exits and telemetry dumping.
- *   - FIXED: Tied idle-exhaustion detection directly to explicit GETCH activity 
+ *   - FIXED: Tied idle-exhaustion detection directly to explicit GETCH activity
  *     rather than static PC tracking.
  *
  * v7 — Diagnostic Monitoring
@@ -149,7 +149,7 @@
  *   - ADDED: Comprehensive inline option documentation and the --help CLI flag.
  *
  * v5 — Toolchain Native Integration
- *   - CHANGED: Migrated the external Python assembler compilation pipeline 
+ *   - CHANGED: Migrated the external Python assembler compilation pipeline
  *     to a direct C `#include "asm65c02.c"` block, removing the Python runtime dependency.
  *
  * v4 — Loader Stability
@@ -158,7 +158,7 @@
  *   - CLEANUP: General codebase maintenance and repository archive archiving.
  *
  * v3 — Instrumentation Interface
- *   - ADDED: Preliminary diagnostics tracking flags: --mandelbrot, --input, 
+ *   - ADDED: Preliminary diagnostics tracking flags: --mandelbrot, --input,
  *     --maxcycles, and --stats.
  *   - ADDED: Experimental automated GETCH trapping hooks.
  *
@@ -176,6 +176,9 @@
 #include <signal.h>
 #include <stdint.h>
 #include <ctype.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#endif
 
 /* ── embedded assembler ──────────────────────────────────────────────────── */
 /* asm65c02.c is included here directly; it uses sim's mem[] array.
@@ -205,6 +208,23 @@ static uint8_t getch_consume(void) {
 /* ── terminal cursor state (for PRINT AT support) ────────────────────────── */
 static int term_col = 0;     /* current cursor column (0-based) */
 static int term_row = 0;     /* current cursor row    (0-based) */
+
+#ifdef __EMSCRIPTEN__
+#define EMSCRIPTEN_OUTBUF_MAX 65536
+static char em_outbuf[EMSCRIPTEN_OUTBUF_MAX];
+static int em_outbuf_len = 0;
+
+static void em_append_char(char c) {
+    if (em_outbuf_len < EMSCRIPTEN_OUTBUF_MAX - 1) {
+        em_outbuf[em_outbuf_len++] = c;
+        em_outbuf[em_outbuf_len] = '\0';
+    }
+}
+
+static void em_append_text(const char *s) {
+    while (*s) em_append_char(*s++);
+}
+#endif
 
 /* ── memory ─────────────────────────────────────────────────────────────── */
 uint8_t mem[65536];   /* shared with embedded asm65c02.c */
@@ -363,22 +383,34 @@ static uint8_t rd(uint16_t a) {
 static void wr(uint16_t a, uint8_t v) {
     check_watch(a, v);
     if (a == io_putch_addr) {   /* PUTCH: character output */
+#ifdef __EMSCRIPTEN__
+        em_append_char((char)v);
+#else
         putchar(v);
         fflush(stdout);
+#endif
         return;
     }
     switch (a) {
     case 0xE000:             /* TERMINAL_CLS: clear screen and home cursor */
+#ifdef __EMSCRIPTEN__
+        em_append_text("\f");
+#else
         fputs("\033[2J\033[H", stdout); fflush(stdout);
+#endif
         term_col = 0; term_row = 0;
         return;
     case 0xE005:             /* TERMINAL_X_POS: set cursor column ($E005) */
         term_col = v;
+#ifndef __EMSCRIPTEN__
         printf("\033[%d;%dH", term_row + 1, term_col + 1); fflush(stdout);
+#endif
         return;
     case 0xE006:             /* TERMINAL_Y_POS: set cursor row ($E006) */
         term_row = v;
+#ifndef __EMSCRIPTEN__
         printf("\033[%d;%dH", term_row + 1, term_col + 1); fflush(stdout);
+#endif
         return;
     case 0xE007:             /* IO_IRQ: any write triggers a maskable hardware IRQ */
         pending_irq = 1;
@@ -895,6 +927,97 @@ static int assemble_and_load(const char *asm_path) {
     }
     return 0;
 }
+
+#ifdef __EMSCRIPTEN__
+static CPU em_cpu;
+static int em_halted = 1;
+static long long em_cycles = 0;
+
+static int sim_load_for_browser(const char *asm_path) {
+    memset(mem, 0, sizeof(mem));
+    memset(&em_cpu, 0, sizeof(em_cpu));
+    inbuf_len = 0;
+    inbuf_pos = 0;
+    getch_idle = 0;
+    pending_irq = 0;
+    watch_triggered = 0;
+    em_cycles = 0;
+    em_halted = 1;
+    em_outbuf_len = 0;
+    em_outbuf[0] = '\0';
+    if (assemble_and_load(asm_path) < 0) {
+        em_append_text("Assembly failed. Check the browser console for details.\n");
+        return -1;
+    }
+    em_cpu.SP = 0xFF;
+    em_cpu.I = 1;
+    em_cpu.PC = mem[0xFFFC] | (mem[0xFFFD] << 8);
+    if (em_cpu.PC == 0) {
+        em_append_text("Reset vector is $0000 - bad ROM?\n");
+        return -1;
+    }
+    use_live_stdin = 0;
+    em_halted = 0;
+    return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int sim65c02_select(const char *asm_path) {
+    return sim_load_for_browser(asm_path);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int sim65c02_reset(void) {
+    return sim_load_for_browser("uBASIC6502.asm");
+}
+
+EMSCRIPTEN_KEEPALIVE
+void sim65c02_input(const char *line) {
+    if (!line) return;
+    size_t n = strlen(line);
+    if (inbuf_len + (int)n + 2 >= INBUF_MAX) return;
+    memcpy(inbuf + inbuf_len, line, n);
+    inbuf_len += (int)n;
+    inbuf[inbuf_len++] = '\r';
+}
+
+EMSCRIPTEN_KEEPALIVE
+int sim65c02_run(int max_steps) {
+    if (em_halted) return 1;
+    if (max_steps <= 0) max_steps = 1000;
+    for (int i = 0; i < max_steps; i++) {
+        if (getch_idle > 50000) break;
+        if (step(&em_cpu)) { em_halted = 1; break; }
+        em_cycles++;
+        if (watch_triggered) { em_halted = 1; break; }
+        if (pending_irq && !em_cpu.I) {
+            pending_irq = 0;
+            em_cpu.I = 1;
+            PUSH(&em_cpu, (uint8_t)(em_cpu.PC >> 8));
+            PUSH(&em_cpu, (uint8_t)(em_cpu.PC & 0xFF));
+            PUSH(&em_cpu, pack_flags(&em_cpu) & ~0x10);
+            em_cpu.PC = (uint16_t)mem[0xFFFE] | ((uint16_t)mem[0xFFFF] << 8);
+        }
+    }
+    return em_halted;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char *sim65c02_output(void) {
+    return em_outbuf;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void sim65c02_clear_output(void) {
+    em_outbuf_len = 0;
+    em_outbuf[0] = '\0';
+}
+
+EMSCRIPTEN_KEEPALIVE
+long long sim65c02_cycles(void) {
+    return em_cycles;
+}
+#endif
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 static void sim_usage(FILE *out) {

@@ -94,6 +94,31 @@ Both ROMs work in the [Kowalski 65C02 Simulator](https://github.com/Kelmar/kowal
 
 Load the assembled binary or paste the `.asm` source click Assemble (F7), Debug (F6) and either RUN (F5) or Animate (Ctrl-F5) if you want to watch it step through - don't forget to click and type into the yellow Terminal window. The INIT trampoline at the start of uBASIC ROM means Kowalski's nominal execute-from-first-byte behaviour works correctly, as does real hardware's reset-vector startup.
 
+
+### Online WebAssembly Simulator
+
+The repository includes a browser front end in `web/index.html` and a GitHub Actions workflow that builds `tools/sim65c02.c` with Emscripten. The web simulator preloads both BASIC sources and lets the user select either `uBASIC6502.asm` or `mini-BASIC65c02.asm` before resetting the virtual machine.
+
+Local Emscripten build, from the repository root:
+
+```bash
+mkdir -p dist
+cp web/index.html dist/index.html
+emcc tools/sim65c02.c \
+  -O2 \
+  -s MODULARIZE=0 \
+  -s EXPORTED_RUNTIME_METHODS='["cwrap"]' \
+  -s ALLOW_MEMORY_GROWTH=1 \
+  -s FORCE_FILESYSTEM=1 \
+  -s INVOKE_RUN=0 \
+  -s EXIT_RUNTIME=0 \
+  --preload-file uBASIC6502.asm \
+  --preload-file mini-BASIC65c02.asm \
+  -o dist/sim65c02.js
+```
+
+Serve `dist/` with a static web server; browsers generally will not load the generated WebAssembly package correctly from `file://` URLs.
+
 ### Proprietary Simulator
 Building and Running
 

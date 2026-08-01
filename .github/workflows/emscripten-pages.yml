@@ -1,0 +1,55 @@
+name: Build Web Simulator
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mymindstorm/setup-emsdk@v14
+      - name: Build native simulator smoke target
+        run: gcc -O2 -Wall -Wextra -o /tmp/sim65c02 tools/sim65c02.c
+      - name: Build WebAssembly simulator
+        run: |
+          mkdir -p dist
+          cp web/index.html dist/index.html
+          emcc tools/sim65c02.c \
+            -O2 \
+            -s MODULARIZE=0 \
+            -s EXPORTED_RUNTIME_METHODS='["cwrap"]' \
+            -s ALLOW_MEMORY_GROWTH=1 \
+            -s FORCE_FILESYSTEM=1 \
+            -s INVOKE_RUN=0 \
+            -s EXIT_RUNTIME=0 \
+            --preload-file uBASIC6502.asm \
+            --preload-file mini-BASIC65c02.asm \
+            -o dist/sim65c02.js
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
