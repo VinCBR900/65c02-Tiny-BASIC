@@ -1,5 +1,5 @@
 ; =============================================================================
-; JB-uBASIC6502 v1.7  --  2 KB Tiny BASIC (NMOS 6502) for John Bell 80-153 SBC
+; JB-uBASIC6502 v1.8  --  2 KB Tiny BASIC (NMOS 6502) for John Bell 80-153 SBC
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Note: Due to bitbang serial IO, either use the JB-Sim65c02 simulator for 
@@ -82,7 +82,8 @@ KOWALSKI   = 1
 ;   Line format:  <lineno_lo> <lineno_hi> <raw ASCII body> <CR>
 ;   No tokenisation; body bytes are stored exactly as typed.
 ; ---- version lineage --------------------------------------------------------
-;   V1.7 (Jul 2026)   31 bytes free.  Fixed Kowalski-incompatible syntax in UNI_TAB 
+;   V1.8 (Jul 2026)   21 bytes free - Updated all subroutine headers.
+;   V1.7 (Jul 2026)   22 bytes free.  Fixed Kowalski-incompatible syntax in UNI_TAB 
 ;                     `<(label-1), >(label-1)` rewritten as `.DW label-1` instead.
 ;                     Refactored GETLINE to Y counter, updated DELAY for ZP not Y.  
 ;   V1.6 (Jul 2026)   Fixed GETLINE buffer-overflow: GETCH echoed every character
@@ -148,7 +149,7 @@ ERR_RET  = 5                 ; RETURN without GOSUB
         .IF KOWALSKI
         JMP INIT	; 3 bytes
         NOP		; 1 byte
-T0	    = 0		; Manually overwrite trampoline
+T0	     = 0		; Manually overwrite trampoline
 T1          = 2
 	.ELSE        
 T0:         .RS 2              ; 16-bit: primary scratch word / expression result
@@ -172,6 +173,33 @@ GOSUB_LO:   .RS 32             ; base of the 8-level GOSUB return-frame stack (3
 VARS:       .RS 52             ; 52-byte variable store (A-Z, 2 bytes each)
 IBUF:       .RS IBUF_MAX+1     ; Input line buffer 
 ZPEND:		; audit
+; ---- Zero-page lifetime notes -----------------------------------------
+; T3 and T4 each serve two unrelated purposes at different times; safe only
+; because this is a single-threaded interpreter with no reentrancy between
+; the two uses of either byte. If that ever changes (e.g. an IRQ-driven
+; path that touches these), re-check these pairings.
+;   T0   : primary scratch / expression result -- live during nearly any
+;          statement or expression evaluation; the most heavily reused byte
+;   T1   : secondary scratch -- EXPR's left-operand stash, EXPR1's MUL/DIV/
+;          MOD working value, MTCHKW's raw keyword-char stash
+;   T2   : tertiary scratch -- PUTSTR/PRNL's string pointer; historically
+;          also a STMT jump target (no longer true after the RTS-trick
+;          dispatch rewrite -- MATCH_DISPATCH doesn't touch T2 at all now)
+;   T3   : (a) PNUM's x10-multiply scratch, live only during decimal
+;          parsing/printing; (b) bitbang GETCH/PUTCH's RXCHAR/TXCHAR shift
+;          register, live only during serial I/O. Never concurrent: PNUM
+;          runs during parsing, GETCH/PUTCH during I/O, not both at once.
+;   T4   : (a) DO_POKE/GET_TWO_ARGS' first-argument holder, live only
+;          within a single POKE/LIST-range statement's own execution;
+;          (b) DELAY_BIT/DELAY_HALF's countdown counter, live only during
+;          a single bit-time delay. Never concurrent: DO_POKE's body
+;          doesn't call PUTCH between setting T4 and reading it back.
+;   OP   : relational/MUL-DIV-MOD operator stash -- live only within
+;          EXPR/EXPR1's own scan-operator-then-apply window
+;   LP   : line-store scan pointer -- shared by EDITLN, GOTOL, DO_LIST,
+;          LSKIP, DELINE, PE_CMP, INSLINE; each call fully consumes LP
+;          before any nested call that might also use it
+; -------------------------------------------------------------------------
 ; Defined here so no forward reference
 GOSUB_FULL = GOSUB_LO+3    ; lowest X for which a full 4-byte push still fits 
 GOSUB_TOP  = GOSUB_LO+31   ; initial/empty GOSUB_SP value (topmost stack byte)
@@ -310,9 +338,9 @@ T_K   = 203              ; $4B + $80  ('K' -- BREAK, PEEK)
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
         .IF KOWALSKI
-STR_BANNER: .DB "uBASIC6502 v1.7"  ; startup banner, rolls into CRLF
+STR_BANNER: .DB "uBASIC6502 v1.8"  ; startup banner, rolls into CRLF
         .ELSE
-STR_BANNER: .DB "JB uBASIC v1.7"  ; startup banner, rolls into CRLF
+STR_BANNER: .DB "JB uBASIC v1.8"  ; startup banner, rolls into CRLF
         .ENDIF
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
@@ -418,11 +446,19 @@ INIT:
         ;  STR_BANNER
          LDA #<STR_BANNER
          JSR PUTSTR           ; print banner + CR+LF
+         ; delete next 3 lines if really tight on ROM
+         JSR DO_FREE          ; Free bytes      
+         JSR PRT16            ; print  
+         JSR PRNL
          
          ; fall through into MAIN
 
 ; =============================================================================
 ; MAIN  --  immediate-mode prompt / dispatch loop
+;
+;   In:  -- (entered by fall-through from INIT/DO_END, or JMP from EDITLN)
+;   Out: never returns (loops back to itself indefinitely)
+;   Clobbers: everything
 ;
 ;   Reads one line from the terminal.  Lines that start with a digit are
 ;   routed to EDITLN (program store editor); else executed via STMT.
@@ -446,7 +482,14 @@ MAIN_DIR:
          JMP MAIN
 
 ; =============================================================================
-; Check for proper variable access
+; PARSE_VAR  --  parse a single-letter variable name at IP
+;
+;   In:  IP -> variable name text (leading spaces are skipped)
+;   Out: success: C=0, A = VARS offset (0,2,4..50 for A-Z), IP advanced past
+;        the letter
+;        failure (char not A-Z): C=1, IP unchanged
+;   Clobbers: A
+; =============================================================================
 PARSE_VAR:
          JSR WPEEK_UC         ; Skips spaces, peeks char, converts to uppercase
          CMP #'A'
@@ -520,12 +563,10 @@ DO_INPUT:
 ;
 ;   In:  --
 ;   Out: IBUF filled with input, CR-terminated; IP = IBUF
-;   Clobbers: A X Y IP TEMP
+;   Clobbers: A X Y IP T3 T4  (X/T3/T4 via GETCH/PUTCH on the bitbang
+;             build; Y is GETLINE's own buffer index)
 ;
 ;   Supports backspace (BS) to delete the last character.
-;   GETCH itself no longer echoes -- GETLINE echoes explicitly per branch
-;   below, so it can substitute BELL for the echo when the buffer is full
-;   instead of printing the rejected character. 
 ;   At IBUF_MAX, further characters are rejected with a BELL (not stored,
 ;   not echoed, not advanced); backspace still deletes normally from there.
 ;   After CR is received, outputs CR+LF via PRNL before returning.
@@ -674,9 +715,9 @@ EL_INS:  JSR WPEEK             ; skip spaces + peek (no consume) first body char
 ;        CURLN = 16-bit line number to store in the 2-byte header
 ;        PE -> one past the last current program byte
 ;   Out: new line written; PE advanced by line size
-;   Clobbers: A X Y T0 T1 IP LP PE
+;   Clobbers: A Y T0 T1 IP LP PE
 ; =============================================================================
-; INSLINE: ; not actually called anywhere
+INSLINE:
          LDY #0
 IN_CNT:  LDA (IP),Y            ; find body length
          INY
@@ -836,7 +877,8 @@ PS_LAST: AND #$7F             ; strip bit 7 from last character
 ;   Syntax: POKE <expr>, <expr>
 ;   In:  IP -> address expression
 ;   Out: byte written; IP advanced past statement
-;   Clobbers: A, T3
+;   Clobbers: A X Y T0 T1 T2 T4 IP  (via GET_TWO_ARGS, which parses both
+;             expressions -- see its own header)
 ; =============================================================================
 DO_POKE:
          JSR GET_TWO_ARGS      ; T4 = address, T0 = value
@@ -901,7 +943,7 @@ DO_ERR_GS:  LDA #ERR_RET         ; RETURN without GOSUB
 ;        NOTE: IP and CURLN must be sequential in Zero Page.
 ;   Out: GOTO:  IP = body of target line; stack unwound to RUNSP; RUNGO
 ;        GOSUB: return frame pushed, then as GOTO
-;   Clobbers: A X Y T0 IP SP
+;   Clobbers: A X Y T0 IP SP CURLN  (CURLN via GOTOL on a successful lookup)
 ;
 ;   3rd char 'S' (case-insensitive) selects GOSUB; anything else -- including
 ;   the full word "GOTO" -- falls through as plain GOTO.
@@ -941,8 +983,12 @@ GO_DO:   JSR GOTOL            ; find line: C=0 found, C=1 not found
          JMP RUNGO            ; jump into run loop
 
 ; =============================================================================
-; GET_TWO_ARGS  --  shared helper: parse "expr,expr"; 
-; first -> T4, second -> T0
+; GET_TWO_ARGS  --  shared helper: parse "expr,expr"
+;
+;   In:  IP -> first expression text
+;   Out: T4 = first arg value, T0 = second arg value, IP advanced past both
+;   Clobbers: A X Y T0 T1 T2 T4 IP  (same as EXPR/EAT_EXPR, which do the
+;             actual parsing)
 ; =============================================================================
 GET_TWO_ARGS:
          JSR EXPR              ; first arg -> T0
@@ -954,6 +1000,12 @@ GET_TWO_ARGS:
 
 ; =============================================================================
 ; DO_LIST  --  LIST [n,m]  :  print program lines, optional range
+;
+;   In:  IP -> optional "n,m" range digits, or CR/end-of-statement for
+;        "list everything"
+;   Out: matching lines printed to terminal; IP advanced past the statement
+;   Clobbers: A X Y T0 T1 T2 T4 IP LP  (T4/T0/T1/T2 via GET_TWO_ARGS when a
+;             range is given; X also via PROG2LP)
 ;
 ;   Peeks each line's header via LP without consuming (matches GOTOL's
 ;   convention) so the skip-path can reuse the shared LSKIP routine; only
@@ -1021,7 +1073,7 @@ LS_SKIP: JSR LSKIP              ; LP still at header start -- matches LSKIP's co
 ;
 ;   In:  LP
 ;   Out: LP advanced by 2
-;   Clobbers: Nothing!
+;   Clobbers: LP  (the documented Out: change; no registers touched)
 ; =============================================================================
 ADD2_LP: JSR BUMP_LP
 BUMP_LP: INC LP
@@ -1587,8 +1639,7 @@ DO_ERR_NL:
 ;   E2_POS: entry for unary '+' -- consumes the '+' then falls into EXPR2.
 ;   E2_NEG: entry for unary '-' -- consumes '-(via E2_POS) then negates result.
 ;
-;   Note: E2_BAD returns T0=0 for unrecognised atoms (no error raised). -- consumes the '+' then falls into EXPR2.
-;   E2_NEG: entry for unary '-' -- evaluates atom then negates it.
+;   Note: E2_BAD returns T0=0 for unrecognised atoms (no error raised).
 ; =============================================================================
 E2_POS:  JSR GETCI            ; consume unary '+', then fall through
 EXPR2:
@@ -1670,8 +1721,6 @@ E2_NEG:  JSR E2_POS           ; consume '-', evaluate atom
 ;   In:  T0 or T1 = value to negate (selected by entry point)
 ;   Out: value negated in-place
 ;   Clobbers: A X
-;
-;   DL_DN is the nearest RTS and is shared by DO_LET and NEG16.
 ; =============================================================================
 NEG16:   LDX #0
          .DB $2C              ; BIT abs: skips next 2 bytes (the LDX #0)
@@ -1701,7 +1750,7 @@ E2_LIT:
 ;
 ;   In:  IP -> ASCII digits (leading spaces skipped automatically)
 ;   Out: T0 = parsed value; IP advanced past the last digit
-;   Clobbers: A X T0 T2 T3
+;   Clobbers: A X Y T0 T2 T3
 ;   Stops at the first non-digit without consuming it.
 ; =============================================================================
 PNUM:
@@ -1824,9 +1873,6 @@ STMT:
 ;   through at offset 0, EXPR2 enters at offset FUNC_TAB_OFF). Each section
 ;   ends with a 3-byte $FF sentinel whose next 2 bytes ARE the no-match
 ;   resume address (read directly, no loop-back -- see UNI_TAB header).
-;   NMOS-SAFE: unlike the 65C02 miniBASIC original, this avoids PHX/PLX,
-;   BRA, and indexed-indirect JMP (none exist on NMOS 6502) -- costs a few
-;   extra bytes over the 65C02 version but stays within the JB SBC's CPU.
 ;
 ;   In:  X = section offset (0 = statements, FUNC_TAB_OFF = functions)
 ;   Out: matched handler executed (tail call, RTS's to MATCH_DISPATCH's
@@ -1870,13 +1916,11 @@ DL_DN:   RTS                   ; shared bare RTS -- see DO_LET/NEG16 header note
 ;   Clobbers: A X Y T0 T1 T2 IP
 ;
 ;   Used by MATCH_DISPATCH to eat a 1-arg function's "(expr)" once, centrally,
-;   before jumping to the handler -- PEEK/USR/ABS no longer eat it themselves.
-;   Standalone (NOT placed next to WEAT -- E2_PAR already falls through into
-;   WEAT directly; inserting anything between them breaks that).
+;   before jumping to the handler
 ; =============================================================================
 EAT_PAREN: JSR EAT_EXPR
-;         JMP WEAT
-        BNE WEAT        ; always taken as basic lines dont contain NUL
+        JMP WEAT        
+
 ; =============================================================================
 ; DO_LET  --  LET <var> = <expr>  or implicit  <var> = <expr>
 ;
@@ -1951,17 +1995,17 @@ RTS_1:   RTS
 ; =============================================================================
 UCIP:    LDY #0
          LDA (IP),Y
-;         JMP UC
         BNE UC  ; always taken as BASIC lines never contain a nul
+
 ; =============================================================================
 ; WSKIP / WPEEK  --  skip spaces; return first non-space in A
 ;
 ;   In:  IP -> text (may start with spaces)
 ;   Out: A = first non-space char; IP advanced past any leading spaces
 ;        (char is NOT consumed -- IP still points to it)
-;   Clobbers: A
+;   Clobbers: A Y  (Y via GETCI when a space is skipped)
 ;
-;   Three labels for the same entry point (names document caller intent):
+;   Two labels for the same entry point (names document caller intent):
 ;     WSKIP     -- skip side-effect is desired
 ;     WPEEK     -- intent is to inspect without consuming
 ; =============================================================================
@@ -2022,7 +2066,9 @@ PRT16PRNT:
 ;
 ;   In:  A = character to output
 ;   Out: --
-;   Clobbers: --  (flags may change)
+;   Clobbers: X  (via TAX, done deliberately to refresh flags from A since
+;             STA doesn't touch them -- see DP_STR/DP_CHR's "always taken"
+;             branches, which rely on this). A and flags-from-A preserved.
 ; =============================================================================
 PUTCH:   STA IO_OUT
          TAX    ; ensure zero flag not set
@@ -2116,9 +2162,6 @@ GC_LOOP: LDA VIA_ORA         ; Sample Port A
          LDA T3              ; Return received character in A
          RTS
 	.ENDIF
-
-; Statement and function dispatch table (UNI_TAB) now lives up near the
-; string table, right after ROM START -- see its header for the layout.
 
 ROMEND: ; for auditing
 
