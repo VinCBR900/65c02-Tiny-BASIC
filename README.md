@@ -99,6 +99,8 @@ Load the assembled binary or paste the `.asm` source click Assemble (F7), Debug 
 
 The repository includes a browser front end in `web/index.html` and a GitHub Actions workflow that builds `tools/sim65c02.c` with Emscripten. The web simulator preloads both BASIC sources and lets the user select either `uBASIC6502.asm` or `mini-BASIC65c02.asm` before resetting the virtual machine.
 
+https://vincbr900.github.io/65c02-Tiny-BASIC/
+
 Local Emscripten build, from the repository root:
 
 ```bash
