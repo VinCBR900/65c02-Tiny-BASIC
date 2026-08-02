@@ -4,7 +4,7 @@
 > Specifically:
 > - I architected, reviewed, hand optimized.
 > - Claude created boilerplate code that was subsequentyl hand optimized, ran regression tests,bugfixed and helped with documentation.
-> - Gemini created code fragments that were usually wrong but inspired code gold techniques.  
+> - Gemini created code fragments that were usually wrong but inspired `code golf` techniques.  
 
 Here we have several Tiny BASIC for 6502/65c02
   * uBASIC - Targeted at original NMOS 6502, meets 1976 Tiny BASIC spec for 16 bit signed ints, fits in 2kbyte including bitbang serial IO on a VIA 6522
@@ -104,8 +104,8 @@ An expanded Tiny BASIC with 32bit Floating ppoint support (Still vars `A`-`Z`). 
   * `RUN` `LIST` `NEW` `FREE` `HELP`
  
 **Functions:** 
-  * `ABS(flt)` `FLOOR(n)` `PEEK(addr)` `USR(addr)` `RND` `SIN(deg)` `COS(deg)` `SQRT(flt)` `PI`
-  * Radian based TRIG - `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`
+  * `ABS(flt)` `FLOOR(flt)` `PEEK(addr)` `USR(addr)` `RND` `SQRT(flt)` `PI`
+  * Radian based TRIG - `SIN(flt)`/`COS(flt)`/`TAN(flt)`/`ASIN(flt)`/`ACOS(flt)`/`ATAN(flt)`
   * Transcendental `LN(flt)`/`EXP(flt)` 
 
 **Expressions:** 
