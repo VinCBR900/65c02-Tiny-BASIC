@@ -300,11 +300,18 @@
     inputQueue = [];
     setStatus(`Loading ${romSelect.value} ...`, '');
 
-    const opts = parseSimArgs(argsInput.value);
-    api.setIoAddrs(opts.getchAddr, opts.putchAddr);
-    api.setMaxcycles(opts.maxcycles);
+    let rc;
+    try {
+      const opts = parseSimArgs(argsInput.value);
+      api.setIoAddrs(opts.getchAddr, opts.putchAddr);
+      api.setMaxcycles(opts.maxcycles);
+      rc = api.select(romSelect.value);
+    } catch (error) {
+      terminal.textContent += `[Browser startup error] ${error.message}\n`;
+      finishProgram(`Startup failed for ${romSelect.value} -- see terminal.`, 'err');
+      return;
+    }
 
-    const rc = api.select(romSelect.value);
     if (rc !== 0) {
       finishProgram(`ROM load failed for ${romSelect.value} -- see terminal.`, 'err');
       return;

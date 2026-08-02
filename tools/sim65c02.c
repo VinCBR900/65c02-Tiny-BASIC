@@ -1138,13 +1138,14 @@ void sim65c02_set_io_addrs(int getch_addr, int putch_addr) {
  * Purpose: set the instruction-count cap for the browser session,
  *   equivalent to the native CLI's --maxcycles. Intended to be called
  *   before sim65c02_select().
- * In:  n -- instruction limit; 0 means unlimited (default)
+ * In:  n -- instruction limit; 0 means unlimited (default). Double is
+ *      used at the JS/WASM boundary to avoid i64 cwrap interop issues.
  * Out: none
  * Clobbers: browser_maxcycles
  */
 EMSCRIPTEN_KEEPALIVE
-void sim65c02_set_maxcycles(long long n) {
-    browser_maxcycles = n;
+void sim65c02_set_maxcycles(double n) {
+    browser_maxcycles = (n > 0) ? (long long)n : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE

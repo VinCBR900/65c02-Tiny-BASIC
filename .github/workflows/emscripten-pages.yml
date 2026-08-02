@@ -22,28 +22,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mymindstorm/setup-emsdk@v14
       - name: Build native simulator smoke target
-        run: gcc -O2 -Wall -Wextra -o /tmp/sim65c02 tools/sim65c02.c
-      - name: Build ROM assets
-        run: |
-          gcc -O2 -DASM65C02_MAIN -o /tmp/asm65c02 tools/asm65c02.c
-          mkdir -p web/assets
-          /tmp/asm65c02 uBASIC6502.asm -o web/assets/uBASIC6502.bin -r F800-FFFF -NoList
-          /tmp/asm65c02 mini-BASIC65c02.asm -o web/assets/mini-BASIC65c02.bin -r F000-FFFF -NoList
+        run: make native-smoke
       - name: Build WebAssembly simulator
-        run: |
-          mkdir -p dist
-          cp web/index.html dist/index.html
-          cp -R web/assets dist/assets
-          emcc tools/sim65c02.c \
-            -O2 \
-            -s MODULARIZE=0 \
-            -s EXPORTED_RUNTIME_METHODS='["cwrap"]' \
-            -s ALLOW_MEMORY_GROWTH=1 \
-            -s FORCE_FILESYSTEM=1 \
-            -s INVOKE_RUN=0 \
-            -s EXIT_RUNTIME=0 \
-            --preload-file web/assets@assets \
-            -o dist/sim65c02.js
+        run: make web-dist
       - name: Upload Pages artifact
         if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3
