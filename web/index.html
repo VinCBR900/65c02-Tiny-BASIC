@@ -1,117 +1,370 @@
+<!--
+  index65c02.html  —  65C02 Tiny BASIC Browser Runner  (v3, Aug 2026)
+
+  Usage:
+    Served as the repository's GitHub Pages front end for the WebAssembly
+    build of sim65c02.c (see .github/workflows/emscripten-pages.yml, which
+    copies this file to dist/index.html alongside the emcc-built
+    sim65c02.js/.wasm). Pick a ROM, optionally adjust the command-line
+    options, click Start, then type directly into the terminal -- the
+    BASIC ROM echoes typed characters itself, same as a real serial
+    terminal.
+
+  History:
+    v3 (Aug 2026) — Closer match to index2650.html: removed the demo
+      quick-buttons and added a "Command-line options" input box mirroring
+      index2650.html's --entry/--chin/--cout/-n args field (recognises
+      --getch-addr/--putch-addr/--maxcycles, applied via the new
+      sim65c02_set_io_addrs()/sim65c02_set_maxcycles() exports in
+      sim65c02.c v13 before Start assembles the ROM). --maxcycles 0
+      (unlimited) is now an explicit, real, adjustable setting rather than
+      just an absence of any cap in the browser path.
+    v2 (Aug 2026) — Rewritten to mirror index2650.html's layout/style and
+      fix two browser-session bugs in sim65c02.c v12 (terminal going dead
+      after an idle period; input silently dropped after ~4KB). Replaces
+      the old two-column layout + "Command" input box + polled-output
+      diffing with: a single-column layout, direct keyboard-into-terminal
+      typing (keydown capture, matching index2650.html), and JS as the
+      owner of the input FIFO / output sink via
+      Module.simCharAvailable/simGetcharNonblock/simPutchar/simEnqueueLine,
+      driven from requestAnimationFrame() against sim65c02_run_chunk()'s
+      RUNNING/WAITING_INPUT/DONE state (mirrors pipbug_run_chunk() in the
+      2650 front end). The ROM-select dropdown is kept (this simulator
+      hosts two interpreters; the 2650 page only has one).
+    v1 (2026) — Original two-column layout with polling em_outbuf[]
+      readout and a separate command-line input box (archived).
+-->
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>65C02 Tiny BASIC Online Simulator</title>
+  <title>65C02 Tiny BASIC Browser Runner</title>
   <style>
-    :root { color-scheme: dark; --bg:#10141f; --panel:#182033; --accent:#6ee7ff; --accent2:#a7f3d0; --text:#e5edf7; --muted:#9fb0c6; --term:#020617; --border:#2b3854; }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: radial-gradient(circle at top left, #263553 0, var(--bg) 35rem); color:var(--text); }
-    header { padding:2rem clamp(1rem,4vw,4rem) 1rem; }
-    h1 { margin:0 0 .5rem; font-size:clamp(2rem,5vw,4rem); letter-spacing:-.04em; }
-    .subtitle { max-width:70rem; color:var(--muted); font-size:1.1rem; line-height:1.55; }
-    main { display:grid; grid-template-columns: minmax(18rem, 28rem) 1fr; gap:1rem; padding:1rem clamp(1rem,4vw,4rem) 3rem; }
-    .card { background:rgba(24,32,51,.9); border:1px solid var(--border); border-radius:18px; padding:1rem; box-shadow:0 20px 70px rgba(0,0,0,.25); }
-    label { display:block; margin:.8rem 0 .35rem; color:var(--muted); font-weight:700; font-size:.9rem; text-transform:uppercase; letter-spacing:.08em; }
-    select, input, textarea, button { width:100%; border-radius:12px; border:1px solid var(--border); background:#0f172a; color:var(--text); padding:.75rem .85rem; font:inherit; }
-    button { cursor:pointer; border-color:#3b82f6; background:linear-gradient(135deg,#2563eb,#0891b2); font-weight:800; margin-top:.65rem; }
-    button.secondary { background:#111827; border-color:var(--border); }
-    button:hover { filter:brightness(1.12); }
-    .row { display:grid; grid-template-columns: 1fr 1fr; gap:.6rem; }
-    #terminal { height:min(64vh, 42rem); min-height:28rem; overflow:auto; padding:1rem; background:var(--term); border-radius:18px; border:1px solid #334155; font:15px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space:pre-wrap; color:#d1fae5; }
-    .hint { color:var(--muted); font-size:.92rem; line-height:1.45; }
-    .pill { display:inline-block; color:#031014; background:var(--accent2); padding:.2rem .55rem; border-radius:999px; font-weight:800; font-size:.78rem; }
-    @media (max-width: 860px) { main { grid-template-columns:1fr; } }
+    :root {
+      color-scheme: dark;
+      --bg: #111827;
+      --panel: #1f2937;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #60a5fa;
+      --danger: #f87171;
+      --ok: #34d399;
+      --border: #374151;
+    }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 1.5rem;
+    }
+    h1 { margin: 0 0 .25rem; }
+    p { color: var(--muted); }
+    .controls, .help {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: .75rem;
+      padding: 1rem;
+      margin: 1rem 0;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: .75rem;
+      align-items: end;
+    }
+    label { display: block; font-weight: 600; margin-bottom: .35rem; }
+    select, input, button {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid var(--border);
+      border-radius: .5rem;
+      padding: .65rem .75rem;
+      background: #0b1220;
+      color: var(--text);
+      font: inherit;
+    }
+    button {
+      cursor: pointer;
+      background: #1d4ed8;
+      border-color: #2563eb;
+      font-weight: 700;
+    }
+    button.secondary { background: #374151; border-color: #4b5563; }
+    button.stop { background: #991b1b; border-color: #b91c1c; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    #terminal {
+      box-sizing: content-box;
+      width: 80ch;
+      max-width: calc(100% - 2rem);
+      height: calc(25 * 1.35em);
+      white-space: pre;
+      overflow: auto;
+      background: #020617;
+      color: #d1fae5;
+      border: 1px solid var(--border);
+      border-radius: .75rem;
+      padding: 1rem;
+      font: 15px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      outline: none;
+    }
+    #terminal:focus { border-color: var(--accent); box-shadow: 0 0 0 2px #2563eb55; }
+    .status { color: var(--muted); margin-top: .5rem; }
+    .status.ok { color: var(--ok); }
+    .status.err { color: var(--danger); }
+    code { color: #bfdbfe; }
   </style>
 </head>
 <body>
-  <header>
-    <span class="pill">WebAssembly 65C02</span>
-    <h1>65C02 Tiny BASIC</h1>
-    <p class="subtitle">Run the repository's 65C02 simulator in your browser. Select a ROM, type BASIC commands, and interact with the Kowalski-style virtual terminal.</p>
-  </header>
-  <main>
-    <section class="card">
-      <label for="rom">Interpreter</label>
-      <select id="rom">
-        <option value="uBASIC6502.asm">uBASIC6502.asm — 2 KB uBASIC</option>
-        <option value="mini-BASIC65c02.asm">mini-BASIC65c02.asm — 4 KB mini BASIC</option>
-      </select>
-      <button id="reset">Reset selected BASIC</button>
-      <label for="command">Command / Program line</label>
-      <input id="command" autocomplete="off" spellcheck="false" placeholder='PRINT "HELLO"'>
-      <button id="send">Send line</button>
-      <div class="row">
-        <button class="secondary" data-demo='PRINT 42'>PRINT 42</button>
-        <button class="secondary" data-demo='NEW\n10 PRINT "HELLO"\n20 GOTO 10\nRUN'>Loop demo</button>
+<main>
+  <h1>Play with 65C02 Tiny BASIC in a Browser!</h1>
+  <p>Run the WebAssembly build of the repository's 65C02 simulator. Pick an interpreter, click Start, then type in the terminal below -- the BASIC ROM echoes what you type, same as a real serial terminal.</p>
+  <p>Type <code>LIST</code> to see any loaded program, <code>RUN</code> to execute it, <code>NEW</code> to clear it.</p>
+  <p>For more info, see the project's GitHub page at <a href="https://github.com/VinCBR900/65c02-Tiny-BASIC">https://github.com/VinCBR900/65c02-Tiny-BASIC</a></p>
+
+  <section class="controls">
+    <div class="row">
+      <div>
+        <label for="rom">Interpreter</label>
+        <select id="rom">
+          <option value="uBASIC6502.asm" selected>uBASIC6502.asm — 2 KB uBASIC</option>
+          <option value="mini-BASIC65c02.asm">mini-BASIC65c02.asm — 4 KB mini BASIC</option>
+        </select>
       </div>
-      <button class="secondary" id="clear">Clear terminal</button>
-      <p class="hint">Tip: multi-line input is accepted. Each line is sent with carriage return, matching the BASIC ROMs' terminal convention.</p>
-    </section>
-    <section class="card">
-      <div id="terminal">Loading simulator...</div>
-    </section>
-  </main>
-  <script src="sim65c02.js"></script>
-  <script>
-    const term = document.getElementById('terminal');
-    const rom = document.getElementById('rom');
-    const command = document.getElementById('command');
-    let api = null;
-    let lastOutput = '';
+      <div>
+        <label for="args">Command-line options</label>
+        <input id="args" value="--getch-addr 0xE004 --putch-addr 0xE001 --maxcycles 0" spellcheck="false" aria-describedby="args-help">
+      </div>
+      <div>
+        <button id="start">Start / Restart BASIC</button>
+      </div>
+      <div>
+        <button id="pause" class="stop" disabled>Pause</button>
+      </div>
+      <div>
+        <button id="clear" class="secondary">Clear Output</button>
+      </div>
+    </div>
+    <p id="args-help">Applied on Start, before assembling the ROM. Recognised flags: <code>--getch-addr 0xNNNN</code>, <code>--putch-addr 0xNNNN</code> (GETCH/PUTCH port addresses), <code>--maxcycles N</code> (instruction cap, <code>0</code> = unlimited). Unrecognised flags are ignored.</p>
+    <div id="status" class="status">Ready. Choose an interpreter and click Start.</div>
+  </section>
 
-    function append(text) {
-      if (!text) return;
-      const chunks = text.split('\f');
-      chunks.forEach((part, index) => {
-        if (index > 0) term.textContent = '';
-        term.textContent += part.replace(/\r/g, '\n');
-      });
-      term.scrollTop = term.scrollHeight;
+  <pre id="terminal" tabindex="0" aria-label="65C02 BASIC terminal output"></pre>
+
+  <section class="help">
+    <strong>GitHub Pages note:</strong>
+    This page is built and deployed by the repository's GitHub Actions workflow
+    (<code>.github/workflows/emscripten-pages.yml</code>), which compiles
+    <code>tools/sim65c02.c</code> to <code>sim65c02.js</code>/<code>.wasm</code> with
+    Emscripten and copies this file in as <code>dist/index.html</code>. It expects
+    <code>sim65c02.js</code> alongside it and the two <code>.asm</code> ROM sources
+    preloaded into the WASM filesystem at build time.
+  </section>
+</main>
+
+<script src="sim65c02.js"></script>
+<script>
+(() => {
+  const terminal = document.getElementById('terminal');
+  const status = document.getElementById('status');
+  const startButton = document.getElementById('start');
+  const pauseButton = document.getElementById('pause');
+  const clearButton = document.getElementById('clear');
+  const romSelect = document.getElementById('rom');
+  const argsInput = document.getElementById('args');
+
+  const CHUNK_INSTRUCTIONS = 5000;
+  const RUN_RUNNING = 0;
+  const RUN_WAITING_INPUT = 1;
+  const RUN_DONE = 2;
+
+  let api = null;
+  let running = false;   // a ROM is loaded and the pump loop is (or was) driving it
+  let paused = false;    // user-requested pause; state is kept, just not advanced
+  let animationFrame = null;
+  let inputQueue = [];   // JS-owned input FIFO -- read by simCharAvailable/simGetcharNonblock
+
+  function setStatus(message, kind = '') {
+    status.textContent = message;
+    status.className = `status ${kind}`.trim();
+  }
+
+  let lastOutputWasCR = false;
+  function appendChar(ch) {
+    ch &= 0xff;
+    if (ch === 0x0d) {
+      terminal.textContent += '\n';
+      lastOutputWasCR = true;
+    } else if (ch === 0x0a) {
+      if (!lastOutputWasCR) terminal.textContent += '\n';
+      lastOutputWasCR = false;
+    } else if (ch === 0x0c) {
+      terminal.textContent = '';       /* CLS */
+      lastOutputWasCR = false;
+    } else {
+      terminal.textContent += String.fromCharCode(ch);
+      lastOutputWasCR = false;
     }
-    function drain() {
-      const out = api.output();
-      if (out.length > lastOutput.length) append(out.slice(lastOutput.length));
-      lastOutput = out;
+    terminal.scrollTop = terminal.scrollHeight;
+  }
+
+  function enqueueByte(byte) {
+    inputQueue.push(byte & 0xff);
+  }
+
+  function enqueueLine(text) {
+    for (const ch of text) inputQueue.push(ch.charCodeAt(0) & 0xff);
+    inputQueue.push(0x0d);
+  }
+
+  /*
+   * Recognises --getch-addr 0xNNNN, --putch-addr 0xNNNN, --maxcycles N
+   * in the command-line-options box; ignores anything else (matches the
+   * "unrecognised flags are ignored" note in the help text below the
+   * box). Defaults mirror sim65c02.c's own defaults ($E004/$E001) and
+   * "0 = unlimited" for maxcycles.
+   */
+  function parseSimArgs(text) {
+    const tokens = text.trim().split(/\s+/).filter(Boolean);
+    const opts = { getchAddr: 0xE004, putchAddr: 0xE001, maxcycles: 0 };
+    for (let i = 0; i < tokens.length; i++) {
+      if (tokens[i] === '--getch-addr' && i + 1 < tokens.length) {
+        opts.getchAddr = Number(tokens[++i]);
+      } else if (tokens[i] === '--putch-addr' && i + 1 < tokens.length) {
+        opts.putchAddr = Number(tokens[++i]);
+      } else if (tokens[i] === '--maxcycles' && i + 1 < tokens.length) {
+        opts.maxcycles = Number(tokens[++i]);
+      }
     }
-    function pump() {
-      if (!api) return;
-      api.run(5000);
-      drain();
-      requestAnimationFrame(pump);
+    return opts;
+  }
+
+  function keyToByte(event) {
+    if (event.key === 'Enter') return 0x0d;
+    if (event.key === 'Backspace') return 0x08;
+    if (event.key === 'Tab') return 0x09;
+    if (event.key === 'Escape') return 0x1b;
+    if (event.ctrlKey && event.key.length === 1) {
+      const code = event.key.toUpperCase().charCodeAt(0);
+      if (code >= 64 && code <= 95) return code - 64;
     }
-    function reset() {
-      if (!api) return;
-      term.textContent = '';
-      lastOutput = '';
-      api.select(rom.value);
-      api.clearOutput();
-      api.run(20000);
-      drain();
-    }
-    function sendText(text) {
-      text.split(/\r?\n/).filter(Boolean).forEach(line => api.input(line));
-      api.run(30000);
-      drain();
+    if (!event.ctrlKey && !event.metaKey && event.key.length === 1)
+      return event.key.charCodeAt(0) & 0xff;
+    return null;
+  }
+
+  function driveEmulator() {
+    if (!running || paused || !api) return;
+
+    let state;
+    try {
+      state = api.runChunk(CHUNK_INSTRUCTIONS);
+    } catch (error) {
+      appendChar(0x0a);
+      terminal.textContent += `[Browser runner error] ${error.message}\n`;
+      finishProgram(error.message, 'err');
+      return;
     }
 
-    Module.onRuntimeInitialized = () => {
-      api = {
-        select: Module.cwrap('sim65c02_select', 'number', ['string']),
-        input: Module.cwrap('sim65c02_input', null, ['string']),
-        run: Module.cwrap('sim65c02_run', 'number', ['number']),
-        output: Module.cwrap('sim65c02_output', 'string', []),
-        clearOutput: Module.cwrap('sim65c02_clear_output', null, [])
-      };
-      reset();
-      pump();
+    if (state === RUN_DONE) {
+      finishProgram('Program halted (BRK / unknown opcode / watchpoint).', 'ok');
+      return;
+    }
+
+    setStatus(state === RUN_WAITING_INPUT ? 'Waiting for input...' : 'Running...', 'ok');
+    animationFrame = requestAnimationFrame(driveEmulator);
+  }
+
+  function finishProgram(message, kind) {
+    running = false;
+    paused = false;
+    if (animationFrame !== null) {
+      cancelAnimationFrame(animationFrame);
+      animationFrame = null;
+    }
+    startButton.disabled = false;
+    pauseButton.disabled = true;
+    pauseButton.textContent = 'Pause';
+    setStatus(message, kind);
+  }
+
+  function startProgram() {
+    if (!api) { setStatus('Simulator still loading, try again shortly.', 'err'); return; }
+    terminal.textContent = '';
+    lastOutputWasCR = false;
+    inputQueue = [];
+    setStatus(`Assembling ${romSelect.value} ...`, '');
+
+    const opts = parseSimArgs(argsInput.value);
+    api.setIoAddrs(opts.getchAddr, opts.putchAddr);
+    api.setMaxcycles(opts.maxcycles);
+
+    const rc = api.select(romSelect.value);
+    if (rc !== 0) {
+      finishProgram(`Assembly/load failed for ${romSelect.value} -- see terminal.`, 'err');
+      return;
+    }
+
+    running = true;
+    paused = false;
+    startButton.disabled = false;   // Start also serves as Restart while running
+    pauseButton.disabled = false;
+    pauseButton.textContent = 'Pause';
+    setStatus('Running...', 'ok');
+    terminal.focus();
+    if (animationFrame !== null) cancelAnimationFrame(animationFrame);
+    animationFrame = requestAnimationFrame(driveEmulator);
+  }
+
+  function togglePause() {
+    if (!running) return;
+    paused = !paused;
+    pauseButton.textContent = paused ? 'Resume' : 'Pause';
+    if (paused) {
+      if (animationFrame !== null) { cancelAnimationFrame(animationFrame); animationFrame = null; }
+      setStatus('Paused.', '');
+    } else {
+      setStatus('Running...', 'ok');
+      animationFrame = requestAnimationFrame(driveEmulator);
+    }
+  }
+
+  terminal.addEventListener('keydown', event => {
+    if (!running || paused) return;
+    const byte = keyToByte(event);
+    if (byte === null) return;
+    event.preventDefault();
+    enqueueByte(byte);
+  });
+
+  startButton.addEventListener('click', startProgram);
+  pauseButton.addEventListener('click', togglePause);
+  clearButton.addEventListener('click', () => { terminal.textContent = ''; terminal.focus(); });
+
+  Module.onRuntimeInitialized = () => {
+    api = {
+      select: Module.cwrap('sim65c02_select', 'number', ['string']),
+      input: Module.cwrap('sim65c02_input', null, ['string']),
+      runChunk: Module.cwrap('sim65c02_run_chunk', 'number', ['number']),
+      cycles: Module.cwrap('sim65c02_cycles', 'number', []),
+      setIoAddrs: Module.cwrap('sim65c02_set_io_addrs', null, ['number', 'number']),
+      setMaxcycles: Module.cwrap('sim65c02_set_maxcycles', null, ['number'])
     };
-    document.getElementById('reset').onclick = reset;
-    document.getElementById('send').onclick = () => { sendText(command.value); command.value = ''; command.focus(); };
-    document.getElementById('clear').onclick = () => { term.textContent = ''; };
-    command.addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('send').click(); });
-    document.querySelectorAll('[data-demo]').forEach(btn => btn.onclick = () => sendText(btn.dataset.demo));
-  </script>
+    /* JS owns the input FIFO and the output sink; sim65c02.c's browser
+       GETCH/PUTCH poll/push through these exact hook names (see the v12
+       EM_JS bridges in sim65c02.c). */
+    Module.simCharAvailable = () => inputQueue.length > 0;
+    Module.simGetcharNonblock = () => (inputQueue.length ? inputQueue.shift() : -1);
+    Module.simPutchar = ch => appendChar(ch);
+    Module.simEnqueueLine = text => enqueueLine(text);
+    setStatus('Ready. Choose an interpreter and click Start.', '');
+  };
+})();
+</script>
 </body>
 </html>
