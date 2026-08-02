@@ -16,7 +16,7 @@
       index2650.html's --entry/--chin/--cout/-n args field (recognises
       --getch-addr/--putch-addr/--maxcycles, applied via the new
       sim65c02_set_io_addrs()/sim65c02_set_maxcycles() exports in
-      sim65c02.c v13 before Start assembles the ROM). --maxcycles 0
+      sim65c02.c v13 before Start loads the ROM). --maxcycles 0
       (unlimited) is now an explicit, real, adjustable setting rather than
       just an absence of any cap in the browser path.
     v2 (Aug 2026) — Rewritten to mirror index2650.html's layout/style and
@@ -132,8 +132,8 @@
       <div>
         <label for="rom">Interpreter</label>
         <select id="rom">
-          <option value="uBASIC6502.asm" selected>uBASIC6502.asm — 2 KB uBASIC</option>
-          <option value="mini-BASIC65c02.asm">mini-BASIC65c02.asm — 4 KB mini BASIC</option>
+          <option value="assets/uBASIC6502.bin" selected>uBASIC6502.asm — 2 KB uBASIC</option>
+          <option value="assets/mini-BASIC65c02.bin">mini-BASIC65c02.asm — 4 KB mini BASIC</option>
         </select>
       </div>
       <div>
@@ -150,7 +150,7 @@
         <button id="clear" class="secondary">Clear Output</button>
       </div>
     </div>
-    <p id="args-help">Applied on Start, before assembling the ROM. Recognised flags: <code>--getch-addr 0xNNNN</code>, <code>--putch-addr 0xNNNN</code> (GETCH/PUTCH port addresses), <code>--maxcycles N</code> (instruction cap, <code>0</code> = unlimited). Unrecognised flags are ignored.</p>
+    <p id="args-help">Applied on Start, before loading the ROM. Recognised flags: <code>--getch-addr 0xNNNN</code>, <code>--putch-addr 0xNNNN</code> (GETCH/PUTCH port addresses), <code>--maxcycles N</code> (instruction cap, <code>0</code> = unlimited). Unrecognised flags are ignored.</p>
     <div id="status" class="status">Ready. Choose an interpreter and click Start.</div>
   </section>
 
@@ -162,7 +162,7 @@
     (<code>.github/workflows/emscripten-pages.yml</code>), which compiles
     <code>tools/sim65c02.c</code> to <code>sim65c02.js</code>/<code>.wasm</code> with
     Emscripten and copies this file in as <code>dist/index.html</code>. It expects
-    <code>sim65c02.js</code> alongside it and the two <code>.asm</code> ROM sources
+    <code>sim65c02.js</code> alongside it and the prebuilt <code>assets/*.bin</code> ROM images
     preloaded into the WASM filesystem at build time.
   </section>
 </main>
@@ -298,7 +298,7 @@
     terminal.textContent = '';
     lastOutputWasCR = false;
     inputQueue = [];
-    setStatus(`Assembling ${romSelect.value} ...`, '');
+    setStatus(`Loading ${romSelect.value} ...`, '');
 
     const opts = parseSimArgs(argsInput.value);
     api.setIoAddrs(opts.getchAddr, opts.putchAddr);
@@ -306,7 +306,7 @@
 
     const rc = api.select(romSelect.value);
     if (rc !== 0) {
-      finishProgram(`Assembly/load failed for ${romSelect.value} -- see terminal.`, 'err');
+      finishProgram(`ROM load failed for ${romSelect.value} -- see terminal.`, 'err');
       return;
     }
 

@@ -1062,7 +1062,8 @@ static long long em_cycles = 0;
  *   sim65c02_reset(). Sets browser_io_active so rd()/wr() route GETCH/
  *   PUTCH through the JS bridges from this point on.
  * In:  asm_path -- path (within the emscripten MEMFS preload) of the .asm
- *      source to assemble, e.g. "uBASIC6502.asm"
+ *      source to assemble or binary image to load, e.g. "uBASIC6502.asm"
+ *      or "assets/uBASIC6502.bin"
  * Out: 0 on success, -1 on assembly failure or a bad ($0000) reset vector
  *      (diagnostic text is pushed to the browser terminal in that case)
  * Clobbers: mem[], em_cpu, em_halted, em_cycles, pending_irq,
@@ -1079,9 +1080,20 @@ static int sim_load_for_browser(const char *asm_path) {
     browser_io_active = 1;
     browser_getch_idle_run = 0;
     browser_getch_missed_this_step = 0;
-    if (assemble_and_load(asm_path) < 0) {
-        sim_browser_put_text("Assembly failed. Check the browser console for details.\n");
-        return -1;
+    {
+        size_t len = asm_path ? strlen(asm_path) : 0;
+        int is_asm = (len >= 4 && !strcmp(asm_path + len - 4, ".asm"));
+        if (is_asm) {
+            if (assemble_and_load(asm_path) < 0) {
+                sim_browser_put_text("Assembly failed. Check the browser console for details.\n");
+                return -1;
+            }
+        } else {
+            if (load_bin(asm_path) < 0) {
+                sim_browser_put_text("ROM binary load failed. Check the browser console for details.\n");
+                return -1;
+            }
+        }
     }
     em_cpu.SP = 0xFF;
     em_cpu.I = 1;
