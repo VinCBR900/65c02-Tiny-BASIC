@@ -69,7 +69,7 @@
 ;   from a full buffer.
 ;
 ; TAB(n) and CHR$(n) are only valid on a PRINT line. Both accept expressions but
-;   TAB(n) prints n spaces, not jumps to column n. TAB(n) for n<=0 skipped.
+;   TAB prints n spaces, not jumps to column n. TAB(n) for n<=0 prints nothing
 ;   TAB(n) for n>255 wraps mod 256.
 ;
 ; FLOOR(flt) rounds towards zero eg floor(3.5) is 3, floor (-3.5) is -3, NOT -4.
@@ -85,23 +85,34 @@
 ; CHANGE HISTORY
 ;
 ; v3.6 (2026-07) - 35 bytes free
-;   - FIXED: NEG16 duplicated, deleted.  
-;   - FIXED: Kowalski syntax - RMB7/SMB7 changed to RMB#7,/SMB#7 format.
-;    `.DB <(label-1), >(label-1)` not supported by Kowalski's assembler so
-;     changed to `.DW label-1`. 
-;   - OPT: Refactor EXPR's relational-operator mask scan ported from uBASIC6502's
-;     equivalent for size;
+;   - FIXED: RMB7/SMB7 (native bit-suffixed spelling) -> RMB#7,/SMB#7,
+;     (Kowalski spelling) at the 4 sites that used it -- both forms
+;     assemble identically here, zero byte cost, but only the Kowalski
+;     form is guaranteed to assemble in the actual Kowalski toolchain.
+;   - OPT: EXPR's relational-operator mask scan ported from uBASIC6502's
+;     equivalent -- replaced a 3-way CMP #'<'/CMP #'='/CMP #'>' chain with
+;     a single SBC #'<' + bounds check (CMP #3) + table lookup (REL_MASK,Y)
+;     to map the operator char straight to its bit value. 
+;
 ; v3.5 (2026-07) - 4 bytes free
 ;   - FIXED: GETLINE buffer-overflow feedback
 ;   - OPT: MATCH_DISPATCH's MD_NOPAREN (matched-entry path) now uses the
-;     push-hi/push-lo/RTS UNI_TAB/FUNC_TAB non-sentinel entries store 
-;     (handler-1) rather than handler as 65c02 auto increments. 
+;     push-hi/push-lo/RTS
+;     UNI_TAB/FUNC_TAB non-sentinel entries now store (handler-1) rather
+;     than handler. 
 ;
 ; v3.4 (2026-07) - 10 bytes free
 ;   - RESTORED: X^Y power operator, this time with correct BODMAS/PEMDAS
 ;     precedence - binds tighter than * / %, right-associative 
 ;   - DEDUPED: E1_RHS -- shared "park left, consume operator, parse right
-;     via EXPR1P, GET_RIGHT to combine" glue.
+;     via EXPR1P, GET_RIGHT to combine" glue, previously duplicated between
+;     EXPR1's E1MD (*/ %) and EXPR1P's own recursive ^ case (found via
+;     asmdup.py). +5 bytes. Must be entered via JSR+RTS, never a tail-call
+;     JMP into GET_RIGHT -- GET_RIGHT/PUSH_FLT_A/POP_FLT_A rely on stealing
+;     a genuine JSR return address for their park/restore trick; a JMP
+;     doesn't provide one, and an earlier attempt at this exact extraction
+;     used JMP and silently corrupted FLT_MUL's first real call, confirmed
+;     via full regression before landing the corrected version.
 ;
 ; v3.3 (2026-07) - 42 bytes free
 ;   - ADDED: "Hypnotic Eye" showcase section (lines 262-289) -- a logarithmic
@@ -314,7 +325,10 @@ ERR_NF   = 8                 ; NEXT without FOR
 ;T1:       .RS 2              ; 16-bit: secondary scratch word / MTCHKW byte scratch
 T0        = 0                 ; Kludge to overwite Kowalski trampoline   
 T1        = 2
-T2:       .RS 2              ; 16-bit: tertiary scratch word / STMT jump target
+T2:       .RS 2              ; 16-bit: tertiary scratch word; also holds the
+                             ;  relational-operator mask across EXPR_ADD calls
+                             ;  (no longer a STMT jump target -- MATCH_DISPATCH's
+                             ;  push/RTS dispatch doesn't touch T2 at all now)
 IP:       .RS 2              ; 16-bit: interpreter/parse pointer
 CURLN:    .RS 2              ; 16-bit: currently-executing line number
 PE:       .RS 2              ; 16-bit: program end (one past last byte)
@@ -370,6 +384,25 @@ IBUF:     .RS 41             ; Line input line buffer ()
 GOSUB_TOP  = GOSUB_LO+31    ; empty-stack value for GOSUB_SP (topmost byte)
 GOSUB_FULL = GOSUB_LO+3     ; lowest GOSUB_SP for which a full push still fits
 ZPEND:  ; audit
+; ---- Zero-page lifetime notes (summary; full detail is in each byte's own
+; comment above) -- safe only because this is a single-threaded interpreter
+; with no reentrancy between a byte's different uses.
+;   T0   : primary scratch / expression result -- live during nearly any
+;          statement or expression evaluation; the most heavily reused byte
+;   T1   : secondary scratch -- MTCHKW's raw keyword-char stash,
+;          GET_TWO_ARGS' first-argument holder
+;   T2   : tertiary scratch, AND the relational-operator mask across
+;          EXPR_ADD calls (see EXPR/MATCH_DISPATCH headers) -- not a STMT
+;          jump target any more (see above)
+;   LSLO/LSHI : dedicated bytes, NOT T0-T2, because PRT16 (called inside
+;          DO_LIST's own printing loop) clobbers T0-T2 -- see their comment
+;   LN_M : dedicated, NOT shared with HORNER_EVAL's scratch -- a past bug
+;          (FP_TMP) came from exactly that collision; see their comment
+;   HORNER_N : kept off X deliberately, since FLT_MUL/FLT_ADD (called from
+;          inside HORNER_EVAL's own loop) both clobber X
+;   PFA_RL/PFA_RH : PUSH_FLT_A/POP_FLT_A's own return-address trampoline,
+;          live only across that specific park/restore pair
+; -------------------------------------------------------------------------
 
         .ORG $200
 ; ---- FOR/NEXT (loop VARIABLE, LIMIT and STEP are all real floats; "FOR X =
@@ -734,13 +767,6 @@ IRQI:    RTI
 ;        truncated past IBUF_MAX -- each keypress past the limit sounds
 ;        BELL); IP -> IBUF
 ;   Clobbers: A, X, IP
-;
-;   GETCH no longer echoes (it has exactly one caller, this routine), so
-;   GETLINE echoes explicitly per branch below -- letting it substitute
-;   BELL for the echo on a full buffer instead of printing the rejected
-;   character on top of the bell (the previous bug). PUTCH here clobbers
-;   nothing (not even flags), so unlike uBASIC6502's fix no register
-;   save/restore is needed around these calls.
 ; =============================================================================
 GETLINE_M:
          LDA #'>'
@@ -814,7 +840,7 @@ PNML:    LDA T2                ; CMP #10 above guarantees carry clear here
          BRA PNL
 
 ; =============================================================================
-; T2DEC  --  decrement the 16-bit counter at T0/T1 (used by DELINE/INSLINE's
+; T2DEC  --  decrement the 16-bit counter at T2 (used by DELINE/INSLINE's
 ;            byte-shift loops)
 ;
 ;   In:  T2/T2+1 = current count (must be nonzero)
@@ -932,7 +958,7 @@ ELIS2:   ; drop through
 ;        CURLN = 16-bit line number to store in the 2-byte header
 ;        PE -> one past the last current program byte
 ;   Out: new line written; PE advanced by line size
-;   Clobbers: A, X, Y, T0, T1, IP, LP, PE
+;   Clobbers: A, Y, T0, T1, IP, LP, PE
 ; =============================================================================
 INSLINE: LDY #0
 IN_CNT:  LDA (IP),Y            ; find body length
@@ -1025,7 +1051,7 @@ PCX_NE:   RTS
 ;
 ;   ADD2_LP calls BUMP_LP once, then falls
 ;   straight through into BUMP_LP's own body for a second increment
-;   In: LP   Out: LP+2 (ADD2_LP) or LP+1 (BUMP_LP)   Clobbers: nothing
+;   In: LP   Out: LP+2 (ADD2_LP) or LP+1 (BUMP_LP)   Clobbers: LP
 ; =============================================================================
 ADD2_LP: JSR BUMP_LP    ; do not split from BUMP_LP
 BUMP_LP: INC LP
@@ -1046,7 +1072,7 @@ TCL_NE:  RTS
 ; LSKIP -- advance LP past the current line (shared by EDITLN, GOTOL)
 ;   In: LP -> start of a line's 2-byte header
 ;   Out: LP -> start of the next line (past this line's CR terminator)
-;   Clobbers: A, Y, LP
+;   Clobbers: A, LP
 LSKIP:   JSR ADD2_LP
 LSK_LP:  LDA (LP)
          JSR BUMP_LP
@@ -1069,7 +1095,7 @@ SV_LP:   LDA FLT_A,Y
 
 ; CPY_V2A -- copy 4 bytes from VARS,X into FLT_A (shared by E2VR, DONEXT)
 ;   In: X = byte offset into VARS   Out: FLT_A = VARS[X..X+3], X advanced by 4
-;   Clobbers: A, Y
+;   Clobbers: A, X, Y
 CPY_V2A: LDY #0
 CVA_LP:  LDA VARS,X
          STA FLT_A,Y
@@ -1107,7 +1133,9 @@ RS_SK:   RTS
 ; =============================================================================
 ; DO_FREE  --  FREE Memory function - returns free bytes
 ;   In:  PE = current program end
-;   Clobbers: A, T0
+;   Out: FLT_A = float(free bytes)  (tail-calls FLT_FROM_INT)
+;   Clobbers: A, X, T0, FLT_A, FLT_ER, FLT_SA  (X/FLT_ER/FLT_SA via the
+;             FLT_FROM_INT tail call)
 ; =============================================================================
 DO_FREE: SEC
          LDA #<RAM_TOP
@@ -1189,7 +1217,7 @@ DPA:        JSR WPEEK
 ; =============================================================================
 ; CHK3RD -- A = 3rd char of the current line (upper-cased), for disambiguating
 ;   keyword collisions eg GOTO/GOSUB, REM/RETURN, NEW/NEXT
-;   In: LY (Y=2 expected by convention, but LDY is done inside here so
+;   In: LP (Y=2 expected by convention, but LDY is done inside here so
 ;       callers don't need to set it themselves)
 ;   Clobbers: A, Y
 ; =============================================================================
@@ -1633,8 +1661,6 @@ E1ML:    JSR FLT_MUL
 E1DV:    JSR FLT_DIV
          BRA E1L
 
-
-
 ; =============================================================================
 ; EXPR2  --  atom level: parenthesised expr, unary +/-, CHR$/PEEK/USR/SIN/COS
 ;            function call, numeric literal, or A-Z variable
@@ -1685,11 +1711,17 @@ E2PR:    JSR GETCI
 ; WPEEK    -- alias for WSKIP: skip whitespace, return (not consume) next char
 ; UC       -- uppercase A (if lowercase letter)
 ; WPEEK_UC -- WSKIP then UC
-; PRT16    -- print T0/T0+1 as a signed decimal integer
-; PUTCH    -- write A to the terminal
-; GETCH    -- block for and return one input character
+; =============================================================================
+; EAT_PAREN  --  consume "(expr)" for a 1-arg function (used by
+;                 MATCH_DISPATCH); falls through into WEAT to eat the ')'
+; WEAT       --  skip spaces then consume one char; falls through into GETCI
+; GETCI      --  fetch the char at IP and advance IP (16-bit)
 ;
-;   Clobbers: A (all); GETCI/WEAT also advance IP; PRT16 clobbers T0-T2
+;   In:  EAT_PAREN: IP -> '('.  WEAT/GETCI: IP -> char to consume/fetch.
+;   Out: EAT_PAREN: FLT_A = parsed argument; IP advanced past ')'.
+;        WEAT/GETCI: A = the consumed/fetched char; IP advanced by 1.
+;   Clobbers: EAT_PAREN -- A, X, Y, FLT_A, FLT_B, T0-T2, IP (via EAT_EXPR);
+;             WEAT/GETCI alone -- A, IP
 ; =============================================================================
 EAT_PAREN: JSR EAT_EXPR
 WEAT:    JSR WSKIP
@@ -1721,6 +1753,16 @@ WPEEK:   LDA (IP)
          BRA WSKIP
 WPD:     RTS
 
+; =============================================================================
+; PRT16  --  print T0/T0+1 as a signed decimal integer
+;
+;   In:  T0/T0+1 = signed 16-bit value
+;   Out: decimal digits printed to terminal; T0 destroyed
+;   Clobbers: A, Y, T0
+;
+;   Recursive (via P16G) so digits print highest-first without a digit
+;   buffer. Falls through into PUTCH to print the final (lowest) digit.
+; =============================================================================
 PRT16:   BIT T0+1
          BPL P16G
          LDA #'-'
@@ -1744,9 +1786,26 @@ P16S:    DEY
          JSR P16G
 P16P:    PLA
          ORA #'0'
+; =============================================================================
+; PUTCH  --  write one character to the Kowalski terminal
+;
+;   In:  A = character to output
+;   Out: --
+;   Clobbers: --  (not even flags -- STA doesn't touch them)
+; =============================================================================
 PUTCH:   STA IO_OUT
          RTS
 
+; =============================================================================
+; GETCH  --  read one character from the Kowalski terminal (blocking)
+;
+;   In:  --
+;   Out: A = character read
+;   Clobbers: A
+;
+;   No echo (GETLINE, its only caller, echoes explicitly -- see its header).
+;   Shuffles the RND seed while spinning, for a little extra entropy.
+; =============================================================================
 GETCH:   LDA IO_IN
          BNE GC_RTS
          JSR RND_SHUFFLE
@@ -2009,13 +2068,6 @@ RESEED_RND:
 ;        that opened this loop, or falls through to the statement after
 ;        NEXT once the limit is crossed
 ;   Clobbers: A, X, Y, T0, T1, T2, LP, FLT_A, FLT_B, FLT_SA, FLT_SB, FLT_ER, FLT_DB
-;
-;   Both bound and step are now full floats. After VAR += STEP, FLT_CMP
-;   compares VAR to LIMIT (-1/0/+1). Which outcomes mean "keep looping"
-;   depends on STEP's sign, stashed on the hardware stack before FLT_ADD/
-;   FLT_CMP get a chance to clobber FLT_B: for a positive STEP, loop unless
-;   VAR>LIMIT; for a negative STEP, loop unless VAR<LIMIT. Landing exactly
-;   on LIMIT (CMP==0) always loops once more (inclusive bound) 
 ; =============================================================================
 DO_NEXT:
          JSR WPEEK_UC           ; consume optional variable name (ignored)
@@ -2085,7 +2137,9 @@ CFFL:    LDA (LP),Y
          RTS
 
 ; =============================================================================
-; FLT_PEEK -- FLT_A = float(PEEK(FLT_A)).  In: FLT_A=address.  Clobbers: A,X,Y,T0.
+; FLT_PEEK -- FLT_A = float(PEEK(FLT_A)).  In: FLT_A=address.
+;   Clobbers: A, X, T0, FLT_A, FLT_DE, FLT_ER, FLT_SA  (FLT_DE via
+;             FLT_TO_INT; FLT_ER/FLT_SA via the FLT_FROM_INT tail call)
 FLT_PEEK:
          JSR FLT_TO_INT
          LDA (T0)
@@ -2097,7 +2151,9 @@ FLT_PEEK:
 ; FLT_USR -- call machine code at FLT_A (as an address); FLT_A = its
 ;   result (via USR_CALL).  
 ;   Out: FLT_A = float(A) zero-extended to 16 bits
-;   Clobbers: A,X,Y,T0 + whatever the called routine clobbers.
+;   Clobbers: A, X, T0, FLT_A, FLT_DE, FLT_ER, FLT_SA (as FLT_PEEK, via the
+;             same FLT_TO_INT/FLT_FROM_INT pair), + whatever USR_CALL's
+;             target machine code clobbers.
 FLT_USR:
          JSR FLT_TO_INT
          JSR USR_CALL   
@@ -2119,13 +2175,6 @@ USR_CALL: JMP (T0)
 ;        no match: carry set, IP restored to its value on entry, X
 ;                unchanged, N/Z undefined (check carry first, always)
 ;   Clobbers: A, Y, T1
-;
-;   After the 2-char prefix matches, any run of trailing letters at IP is
-;   swallowed (so "PR" matches the full word "PRINT", but also anything
-;   else starting "PR" -- lenient by design, see v1.3 changelog). A
-;   trailing '$' right after the letters (as in CHR$) is swallowed too:
-;   the letter-skip loop computes (char-'A'), and '$'-'A' mod 256 = $E3
-;   is checked for specially once a non-letter ends the loop.
 ; =============================================================================
 MTCHKW:  LDA IP
          STA LP
