@@ -26,8 +26,8 @@ Courtesy of [Sehugg and Mango 1](https://github.com/sehugg/mango_one), You can o
 This interpreter has also been ported to the John Bell 80-153 single board computer.  A modified `sim65c02` simulator (`JB-sim65c02`) is provided for this version.
 
 **Statements:** 
-  * `END` `GOSUB`/`RETURN`  `GOTO`  `IF`/`THEN`  `INPUT`  `LET`  `POKE`  `PRINT [TAB(n)] [;] CHR$(n)`  `REM`  `RUN`  
-  * `LIST [start,end]` `NEW` 
+  * `END` `GOSUB`/`RETURN`  `GOTO`  `IF`/`THEN`  `INPUT`  `LET`  `POKE`  `PRINT [TAB(n)] [;] CHR$(n)`  `REM`    
+  * `LIST [start,end]` `NEW` `RUN`
 
 **Expressions:** 
   * `+` `-` `*` `/` `%`(mod) `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)`
@@ -103,7 +103,7 @@ An expanded Tiny BASIC with 32bit Floating ppoint support (Still vars `A`-`Z`). 
 
 **Statements:** 
   * `PRINT [TAB(n)] [;] CHR$(n)` `IF`/`THEN`/`ELSE` `GOTO` `GOSUB` `RETURN` `FOR`/`TO`/`STEP`/`NEXT` `LET` `INPUT` `REM` `END` `POKE` 
-  * `RUN` `LIST` `NEW` `FREE` `HELP`
+  * `LIST [start,end]` `NEW` `RUN`
  
 **Functions:** 
   * `ABS(flt)` `FLOOR(flt)` `PEEK(addr)` `USR(addr)` `RND` `SQRT(flt)` `PI`
@@ -185,18 +185,6 @@ Example of batch testing
 
 ---
 
-#### Note on Running from real ROM (no pre-loaded program)
-
-The pre-loaded program relies on `INIT` setting `PE` to point past the program bytes. To start with an empty program instead, change two lines in `INIT`:
-```asm
-; In INIT, change:
-        LDA #<SHOWCASE_END     →     JSR DO_NEW
-        LDA #>SHOWCASE_END     →     Delete
-```
-This sets `PE = PROG = $0200` so the interpreter starts fresh. Both ASM files include this note as a comment near the label.
-
-Program the `.bin` file to an EPROM so that the chip's address 0 maps to $F800 (uBASIC) or $F000 (4K BASIC). The reset vector at $FFFC/$FFFD within the image points to `INIT`, so the interpreter starts on power-up.
-
 #### Terminal I/O
 
 For real Hardware you will need to modify the I/O Addresses for Serial I/O, specified below.  Although 4kBASIC has plenty of ROM space available, uBASIC is a bit tight but probably enough for simple writes to ACIA or bitbang serial.  `FREE` is an obvious candidate to delete to make space if needed, ask Claude.
@@ -208,7 +196,7 @@ For real Hardware you will need to modify the I/O Addresses for Serial I/O, spec
 
 ### Things to watch out for
 
-- **ROM size.** All variants dotn have much free space. Always check after a change. Claude will help you find space savings if you're over budget.
+- **ROM size.** All variants dont have much free space. Always check after a change. Claude will help you find space savings if you're over budget.
 - **Page constraints.** The uBASIC string table must stay entirely on page $F8 (all strings accessed via a shared hi-byte). Claude can get confused if the page boundary is exceeded - it will find it eventually but after a lot of thrashing, so tell it to watch out when adding new strings to uBASIC.
 - **Zero-page register clobbers.** The In/Out/Clobbers comments on each function document which of T0/T1/T2/LP/IP/OP are live. Claude will respect these if you share the relevant headers.
 - **Fall-through chains.** Several functions share a single RTS by falling through into the next function. These are clearly marked in the source. Inserting code between them without understanding the fall-through will break things — tell Claude to watch out for them.
