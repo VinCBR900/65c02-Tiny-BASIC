@@ -1,28 +1,42 @@
 # 6502 Tiny BASICs
 
+> AI Disclosure: This code was developed with the assistance of AI (Claude by Anthropic, and Gemini by Google). The architecture, code, tests, and documentation were produced collaboratively between a human developer and an AI assistant. All code has been reviewed by the author.
+> Specifically:
+> - I architected, reviewed, hand optimized.
+> - Claude created boilerplate code that was subsequentyl hand optimized, ran regression tests,bugfixed and helped with documentation.
+> - Gemini created code fragments that were usually wrong but inspired code gold techniques.  
+
+Here we have several Tiny BASIC for 6502/65c02
+  * uBASIC - Targeted at original NMOS 6502, meets 1976 Tiny BASIC spec for 16 bit signed ints, fits in 2kbyte including bitbang serial IO on a VIA 6522
+  * 4k BASIC - Targeted at 65c02 this is an Extended 16bit signed in Tiny BASIC with `FOR`/`NEXT`, functions and Bitwise operators.  Fits in a 4kbyte EPROM
+  * mini-BASIC - Targeted at 65c02, 4 byte floating point with radian based TRIG: `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`, and Transcendental `LN`/`EXP`   
+
+You can see the development progression - first came uBASIC, then extended 4k BASIC with some trig support, then mini-BASIC with 4byte floats and proper trig.
+
 ### uBASIC6502 — fits in a 2716 EPROM (<2 KByte)
 
 **<2048 bytes assembled. ROM at $F800–$FFFF**
 
-A minimal but complete integer BASIC. No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution. This costs RAM and speed but keeps the interpreter very small. Courtesy of [Sehugg and Mango 1](https://github.com/sehugg/mango_one), You can open this project in [8 Bit Workshop](http://8bitworkshop.com/v3.12.1/?redir.html?platform=verilog&githubURL=https%3A%2F%2Fgithub.com%2FVinCBR900%2Fmango_one&file=mango1.v) and try it Out! Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing `ESC` aborts running program. 
+A minimal but complete integer BASIC. No tokeniser - BASIC program lines are stored as raw ASCII and re-parsed on every execution. This costs RAM and speed but keeps the interpreter very small. 
 
-This interpreter has also been ported to the John Bell 80-153 single board computer.  A modified sim65c02 simulator (JB-sim65c02) is provided for this version.
+Courtesy of [Sehugg and Mango 1](https://github.com/sehugg/mango_one), You can open this project in [8 Bit Workshop](http://8bitworkshop.com/v3.12.1/?redir.html?platform=verilog&githubURL=https%3A%2F%2Fgithub.com%2FVinCBR900%2Fmango_one&file=mango1.v) and try it Out! Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing `ESC` aborts running program. 
+
+This interpreter has also been ported to the John Bell 80-153 single board computer.  A modified `sim65c02` simulator (`JB-sim65c02`) is provided for this version.
 
 **Statements:** 
   * `END` `GOSUB`/`RETURN`  `GOTO`  `IF`/`THEN`  `INPUT`  `LET`  `POKE`  `PRINT [TAB(n)] [;] CHR$(n)`  `REM`  `RUN`  
-  * `LIST` `NEW` 
+  * `LIST [start,end]` `NEW` 
 
 **Expressions:** 
-  * `+` `-` `*` `/` `%`(mod) `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)`  variables `A`–`Z`
+  * `+` `-` `*` `/` `%`(mod) `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)`
+  * Variables `A`–`Z` signed 16-bit integers, −32768 to 32767
   * Functions: `ABS(val)`   `FREE`   `PEEK(addr)`  `RND`   `USR(addr)`  
-
-**Numbers:** signed 16-bit integers, −32768 to 32767
 
 **Notes**
 - Uses **2 character matching** - with 3rd char match for `GOSUB`/`GOTO` and `RETURN`/`REM`.  Matches anything after e.g. PROCEED matches PRINT.  Therefore  spaces are important e.g. `PRINT TAB(5);"hello"` works, whereas `PRINTTAB(5);"HELLO"` does not.
 - **`GOTO`/`GOSUB` accepts expressions** — `GOTO X`, `GOSUB BASE+N`, `GOTO 10*I` all work
-- **`RND`** — 16-bit Galois LFSR pseudo-random number, returns 1–32767; seeded at startup; useful as `RND MOD 6 + 1` for a die roll
-- **`:` Not Supported** - Multi-statement operator `:` is not supported and input buffer is 32 characters only.
+- **`RND`** — 16-bit Galois LFSR pseudo-random number, returns 1–32767; seeded at startup; useful as `RND % 6 + 1` for a die roll
+- **`:` Not Supported** - Multi-statement operator `:` is not supported and input buffer is 40 characters only.
 
 **Errors** (printed as `?N [IN line]`):
 
@@ -34,19 +48,27 @@ This interpreter has also been ported to the John Bell 80-153 single board compu
 | ?3 OM | Out of memory |
 | ?4 UK | Bad variable assignment |
 
+---
+
 ### 4K BASIC — fits in a 2732 EPROM (<4 KByte)
 
 **<4096 bytes assembled. ROM at $F000–$FFFF**
 
-A significantly more capable integer BASIC. Keywords are tokenised on entry and numbers converted to 16-bit binary, so the interpreter does not re-parse ASCII on execution — several times faster than uBASIC and easier on RAM. 
+A more capable integer BASIC. Keywords are tokenised on entry and numbers converted to 16-bit binary, so the interpreter does not re-parse ASCII on execution — several times faster than uBASIC and easier on RAM.
+
+Has bitwise operators and also CORDIC `SIN`/`COS` in degrees*1000.
 
 **Statements:** 
   * `PRINT [TAB(n)] [;] CHR$(n)` `IF`/`THEN`/`ELSE` `GOTO` `GOSUB` `RETURN` `FOR`/`TO`/`STEP`/`NEXT` `LET` `INPUT` `REM` `END` `POKE` `DATA` `READ` `RESTORE` 
-  * `RUN` `LIST` `NEW` `FREE` `HELP`
+  * `RUN` `LIST [start,end]` `NEW` `FREE` `HELP`
  
 **Functions:** `ABS(n)` `SGN(n)` `ASC("c")` `PEEK(addr)` `USR(addr)` `RND` `SIN(deg)`  `COS(deg)`
 
-**Expressions:** `AND` `OR` `XOR` `NOT` `MOD` `+` `-` `*` `/` `%`(mod) `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)` variables `A`–`Z`
+**Expressions:** 
+  * `MOD` `+` `-` `*` `/` `%`(mod)
+  * `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)`
+  * variables `A`–`Z` signed 16-bit integers, −32768 to 32767
+  * Bitwise - `AND` `OR` `XOR` `NOT` 
 
 **Numbers:** signed 16-bit integers, −32768 to 32767. Relational operators return −1 (true) or 0 (false). `AND`/`OR`/`XOR`/`NOT` are bitwise.
 
@@ -71,15 +93,44 @@ A significantly more capable integer BASIC. Keywords are tokenised on entry and 
 
 ---
 
-## Files
+### mini-BASIC65c02 — fits in a 2732 EPROM (<4 KByte)
 
-| File | Description |
-|------|-------------|
-| `uBASIC6502.asm` | NMOS-6502 uBASIC  with 2-byte keyword-prefix matcher |
-| `4kBASIC.asm` | 4K BASIC source (~3100 lines, heavily commented) |
-| `asm65c02.c` | In tools folder, Two-pass 6502/65C02 assembler — builds standalone |
-| `sim65c02.c` | In tools folder, 65C02/6502 simulator with Kowalski I/O — includes asm65c02.c directly |
-| `JB-sim65c02.c` | In tools folder, 65C02/6502 simulator with John Bell 80-153 Bitbang emulation — includes asm65c02.c directly |
+**<4096 bytes assembled. ROM at $F000–$FFFF**
+
+An expanded Tiny BASIC with 32bit Floating ppoint support (Still vars `A`-`Z`). No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution for ROM size. 
+
+**Statements:** 
+  * `PRINT [TAB(n)] [;] CHR$(n)` `IF`/`THEN`/`ELSE` `GOTO` `GOSUB` `RETURN` `FOR`/`TO`/`STEP`/`NEXT` `LET` `INPUT` `REM` `END` `POKE` 
+  * `RUN` `LIST` `NEW` `FREE` `HELP`
+ 
+**Functions:** 
+  * `ABS(flt)` `FLOOR(n)` `PEEK(addr)` `USR(addr)` `RND` `SIN(deg)` `COS(deg)` `SQRT(flt)` `PI`
+  * Radian based TRIG - `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`
+  * Transcendental `LN(flt)`/`EXP(flt)` 
+
+**Expressions:** 
+  * `+` `-` `*` `/` `%`(mod) `^`(power, +ve base only)
+  * `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)` - Relational operators return −1 (true) or 0 (false)
+  * variables `A`–`Z` 32 bit MBF4 float, ~6-7 significant decimal digits
+
+**Notes**
+- **`GOTO`/`GOSUB` accepts expressions** — `GOTO X`, `GOSUB BASE+N`, `GOTO 10*I` all work
+- **`MOD` keyword** — `10 MOD 3` is now an alternative to `10 % 3` (both give `1`)
+- **`RND`** — 16-bit Galois LFSR pseudo-random number, returns 0-1; seeded at startup
+- **`:` Not Supported** - Multi-statement operator `:` is not supported and input buffer is 40 characters only.
+ 
+**Errors** (printed as `XX ERR [IN line]`):
+
+| Code | Meaning |
+|------|---------|
+| SN | Syntax / bad expression |
+| UL | Undefined line number |
+| OV | Division or modulo by zero |
+| OM | Out of memory |
+| NR | Nesting error (GOSUB/FOR overflow, or RETURN/NEXT without opener) |
+| ST | Zero STEP in FOR loop |
+| UK | Unknown statement |
+| OD | Out of DATA (READ with no remaining values) |
 
 ---
 
@@ -93,33 +144,6 @@ Both ROMs work in the [Kowalski 65C02 Simulator](https://github.com/Kelmar/kowal
 - Ensure `uBASIC6502.asm` has the `KOWaLSKI=1` defined at teh top of the file 
 
 Load the assembled binary or paste the `.asm` source click Assemble (F7), Debug (F6) and either RUN (F5) or Animate (Ctrl-F5) if you want to watch it step through - don't forget to click and type into the yellow Terminal window. The INIT trampoline at the start of uBASIC ROM means Kowalski's nominal execute-from-first-byte behaviour works correctly, as does real hardware's reset-vector startup.
-
-
-### Online WebAssembly Simulator
-
-The repository includes a browser front end in `web/index.html` and a GitHub Actions workflow that builds `tools/sim65c02.c` with Emscripten. The web simulator preloads both BASIC sources and lets the user select either `uBASIC6502.asm` or `mini-BASIC65c02.asm` before resetting the virtual machine.
-
-https://vincbr900.github.io/65c02-Tiny-BASIC/
-
-Local Emscripten build, from the repository root:
-
-```bash
-mkdir -p dist
-cp web/index.html dist/index.html
-emcc tools/sim65c02.c \
-  -O2 \
-  -s MODULARIZE=0 \
-  -s EXPORTED_RUNTIME_METHODS='["cwrap"]' \
-  -s ALLOW_MEMORY_GROWTH=1 \
-  -s FORCE_FILESYSTEM=1 \
-  -s INVOKE_RUN=0 \
-  -s EXIT_RUNTIME=0 \
-  --preload-file uBASIC6502.asm \
-  --preload-file mini-BASIC65c02.asm \
-  -o dist/sim65c02.js
-```
-
-Serve `dist/` with a static web server; browsers generally will not load the generated WebAssembly package correctly from `file://` URLs.
 
 ### Proprietary Simulator
 Building and Running
@@ -188,32 +212,6 @@ For real Hardware you will need to modify the I/O Addresses for Serial I/O, spec
 - **Fall-through chains.** Several functions share a single RTS by falling through into the next function. These are clearly marked in the source. Inserting code between them without understanding the fall-through will break things — tell Claude to watch out for them.
 
 ---
-
-## Technical Notes
-
-#### Why no tokeniser in uBASIC?
-
-A tokeniser saves RAM (shorter stored programs) and speeds execution (no re-parsing). But the tokeniser itself costs ROM. In a 2 KB budget every byte counts, and storing programs as raw ASCII with a simple parse-on-execute design kept the interpreter under 2048 bytes while still being genuinely useful. 4K BASIC has the ROM headroom to tokenise and is significantly faster as a result.
-
-#### The `%` operator and `MOD` keyword
-
-Both interpreters support `%` as integer modulo: `10 % 3` gives `1`. 4K BASIC v11 also accepts the word `MOD`: `10 MOD 3` gives the same result. The sign follows the dividend (C convention), so `-7 % 4` gives `-3`. Division and modulo by zero both raise error OV.
-
-#### `RND` 
-
-`RND` returns a pseudo-random integer in the range 1–32767. It uses a 16-bit Galois LFSR (linear feedback shift register) with taps at $B400, seeded to $ACE1 at startup. The seed is not resettable from BASIC — every run produces the same sequence, which is useful for reproducible tests. A common idiom for a six-sided die roll is:
-
-```basic
-10 PRINT RND MOD 6 + 1
-```
-
-#### USR(addr)
-
-`USR(addr)` calls machine code at the given address. The routine should end with `RTS` and write any return value to T0 for the return value, allowing hardware-specific extensions without modifying the interpreter source.
-
-#### The pre-loaded showcase program
-
-All ROMs include a pre-loaded feature showcase program for Kowalski simulator. Type `RUN` to execute it, `NEW` to clear it, or `LIST` to read the source. The showcase is designed to exercise as much of each interpreter's instruction set as possible in a single self-contained program.
 
 ### Notes
   * Originally I started with a 65c02 2kbyte tiny BASIC, which after got working ported to NMOS 6502.  The 65c02 version had more features due to better code density, but eventually I Realized I should just refactor NMOS 6502 and get as many features in that, rather than working on two 2kbyte versions.  So the original 65c02 version `uBASIC.asm` is in the `Archive` folder.
