@@ -1,10 +1,12 @@
 # 6502 Tiny BASICs
 
 > AI Disclosure: This code was developed with the assistance of AI (Claude by Anthropic, and Gemini by Google). The architecture, code, tests, and documentation were produced collaboratively between a human developer and an AI assistant. All code has been reviewed by the author.
-> Specifically:
+>Specifically:
 > - I architected, reviewed, hand optimized.
 > - Claude created boilerplate code that was subsequentyl hand optimized, ran regression tests,bugfixed and helped with documentation.
 > - Gemini created code fragments that were usually wrong but inspired `code golf` techniques.  
+>
+> To be frank, without these agents this work would not have been possible.
 
 Here we have several Tiny BASIC for 6502/65c02
   * uBASIC - Targeted at original NMOS 6502, meets 1976 Tiny BASIC spec for 16 bit signed ints, fits in 2kbyte including bitbang serial IO on a VIA 6522
