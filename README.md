@@ -1,6 +1,6 @@
 # 6502 Tiny BASICs
 
-> AI Disclosure: This code was developed with the assistance of AI (Claude by Anthropic, and Gemini by Google). The architecture, code, tests, and documentation were produced collaboratively between a human developer and an AI assistant. All code has been reviewed by the author.
+> **AI Disclosure**: This code was developed with the assistance of AI (Claude by Anthropic, and Gemini by Google). The architecture, code, tests, and documentation were produced collaboratively between a human developer and an AI assistant. All code has been reviewed by the author.
 >Specifically:
 > - I architected, reviewed, hand optimized.
 > - Claude created boilerplate code that was subsequentyl hand optimized, ran regression tests,bugfixed and helped with documentation.
