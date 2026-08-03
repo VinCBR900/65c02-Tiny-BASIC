@@ -1,5 +1,6 @@
 /*
- * sim65c02.c  —  Toy 65C02 simulator  (v11, Jul 2026)
+ * sim65c02.c  —  Toy 65C02 simulator  (v14, Aug 2026)
+ *
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
@@ -13,6 +14,13 @@
  *   gcc -O2 -o sim65c02 sim65c02.c
  *
  * The assembler (asm65c02.c) is #included directly — no Python required.
+ *
+ * Browser (Emscripten) build variant (v14):
+ *   Define SIM_BROWSER_BINONLY to compile out the embedded assembler
+ *   entirely (assemble_and_load() and the asm65c02.c #include). Only
+ *   .bin ROM loading remains available. See Makefile's web-dist target.
+ *   Native builds (this CLI, native-smoke) do NOT define this and keep
+ *   full .asm support.
  *
  * Usage:
  *   sim65c02 <file.asm | file.bin> [options]
@@ -73,7 +81,7 @@
  *          Override with --load-addr if needed.
  *
  * NOTES
- * 
+ *
  * Kowalski virtual I/O ports:
  *   $E000  write  TERMINAL_CLS    clear screen (ANSI ESC[2J + home)
  *   $E001  write  PUTCH           character output to stdout (configurable,
@@ -86,7 +94,7 @@
  *
  * GETCH/PUTCH addresses and idle-exhaustion detection (v8):
  *   GETCH ($E004 by default) and PUTCH ($E001 by default) are intercepted
- *   to emulate character IO. Override with --getch-addr and --putch-addr 
+ *   to emulate character IO. Override with --getch-addr and --putch-addr
  *   to map elsewhere, regardless of ASM or bin file.
  *
  *   Idle-exhaustion: every read of the GETCH address that finds no
@@ -103,43 +111,92 @@
  *   buffer is used exactly as before -- a non-blocking drain, 0 returned
  *   once empty. --input ALWAYS takes precedence when given.
  *
- *   A terminal's Enter key (or a text file's line ending) sends LF; 
+ *   A terminal's Enter key (or a text file's line ending) sends LF;
  *   translated to CR here to match the line-ending convention the BASIC
  *   ROMs expect..
  *
  *   Once stdin hits EOF, every later fgetc() returns EOF immediately (no
  *   re-blocking), so clicks up and fires.  Hence a redirected/piped-input
  *   with --maxcycles 0 will busy spin forever until Ctrl-C. This also
- *   applies if the script  never ends (e.g. GOTO 10 loop) 
+ *   applies if the script  never ends (e.g. GOTO 10 loop)
  */
 
  /*
  * VERSION HISTORY (Newest First)
  *
+ * v14 — Browser Build: Binary-Only (No Embedded Assembler)
+ *   - ADDED: SIM_BROWSER_BINONLY build-time flag. When defined, compiles
+ *     out the embedded assembler (#include "asm65c02.c" and
+ *     assemble_and_load()) entirely, since the browser front end only
+ *     ever loads pre-assembled .bin ROM assets now (see Makefile's
+ *     web-dist and index.html's ROM dropdown).
+ *   - FIXED: The assembler's fixed-size per-line tables (pc_map[],
+ *     listing[], line_tag[][], mem_written[65536], syms[], etc.) added
+ *     ~37MB of static data to the wasm build regardless of whether
+ *     assemble() was ever called, exceeding wasm-ld's default 16MB
+ *     initial memory and failing the link outright. Compiling the
+ *     assembler out removes that footprint at the source. Makefile's
+ *     web-dist target passes -DSIM_BROWSER_BINONLY.
+ *   - CHANGED: sim_load_for_browser()'s .asm-path branch now returns a
+ *     clear "no embedded assembler in this build" terminal message
+ *     under SIM_BROWSER_BINONLY instead of calling the (now absent)
+ *     assemble_and_load().
+ *
+ * v13 — Browser Command-Line Options
+ *   - ADDED: browser_maxcycles, honoured by sim65c02_run_chunk() as an
+ *     instruction-count cap (0 = unlimited), mirroring the native CLI's
+ *     --maxcycles semantics. Previously the browser path had NO cap at
+ *     all -- effectively always "--maxcycles 0" but with nothing actually
+ *     enforcing or exposing that.
+ *   - ADDED: sim65c02_set_maxcycles()/sim65c02_set_io_addrs() so the HTML
+ *     front end's new "Command-line options" box (mirroring
+ *     index2650.html's --entry/--chin/--cout/-n args field) can apply
+ *     --maxcycles/--getch-addr/--putch-addr before Start, without going
+ *     through main()'s argv parsing (browser build never calls main()).
+ *
+ * v12 — Browser I/O Rewrite (Web GETCH/PUTCH)
+ *   - FIXED: browser terminal going permanently unresponsive after a short
+ *     idle period (old getch_idle>50000 break in sim65c02_run() never
+ *     reset once triggered).
+ *   - FIXED: sim65c02_input() silently dropping input after ~4KB of a web
+ *     session (inbuf_len capacity check never accounted for consumed
+ *     bytes).
+ *   - CHANGED: browser GETCH/PUTCH now go through EM_JS bridges to a
+ *     JS-owned FIFO/output sink (Module.simCharAvailable/
+ *     simGetcharNonblock/simPutchar/simEnqueueLine), modelled on
+ *     2650-Tiny-BASIC's pipbug_wrap.c, instead of the old inbuf[]/
+ *     em_outbuf[] polling buffers. Native CLI (--input/--maxcycles/live
+ *     stdin) is unaffected.
+ *   - REPLACED: sim65c02_run(int max_steps) -> sim65c02_run_chunk(int
+ *     instruction_budget), returning an explicit SIM_RUN_RUNNING/
+ *     WAITING_INPUT/DONE state per call instead of an idle-inferred bool.
+ *   - REMOVED: sim65c02_output()/sim65c02_clear_output() (no longer
+ *     needed -- output is pushed to JS directly as it's produced).
+ *
  * v11 — Conditional-Assembly Predefines
  *   - ADDED: -D NAME / -D NAME=EXPR command-line flags, forwarded straight
- *     into the embedded assembler typically used with .IF directive. 
+ *     into the embedded assembler typically used with .IF directive.
  *   - -D is a no-op for .bin files with a warning.
- * 
+ *
  * v10 — Opcode Completeness
- *   - FIXED: Added missing execution mapping for CMP (zp) ($D2) zero-page 
+ *   - FIXED: Added missing execution mapping for CMP (zp) ($D2) zero-page
  *     indirect addressing mode to align with other core arithmetic opcodes.
  *
  * v9 — CLI Streamlining
- *   - REMOVED: Redundant --mandelbrot and --plain flags now that full native 
+ *   - REMOVED: Redundant --mandelbrot and --plain flags now that full native
  *     stdin redirection (`sim65c02 rom.asm < script.txt`) is supported.
  *   - ADDED: Explicit documentation for stdin test-script pipelining.
  *
  * v8 — Core I/O Overhaul & Execution Engine Updates
- *   - ADDED: Opcode execution support for CMP abs,Y ($D9), CMP (zp,X) ($C1), 
+ *   - ADDED: Opcode execution support for CMP abs,Y ($D9), CMP (zp,X) ($C1),
  *     and absolute indexed X variants for LSR, ROL, ROR, and LDY ($5E/$3E/$7E/$BC).
- *   - CHANGED: Replaced fragile ROM signature polling loops with robust, 
+ *   - CHANGED: Replaced fragile ROM signature polling loops with robust,
  *     address-configurable hooks via --getch-addr and --putch-addr inside rd()/wr().
  *   - CHANGED: --maxcycles 0 now specifies unlimited execution.
- *   - ADDED: Real-time, blocking stdin fallback (with LF->CR translation) when 
+ *   - ADDED: Real-time, blocking stdin fallback (with LF->CR translation) when
  *     the --input buffer queue is exhausted or omitted.
  *   - ADDED: SIGINT (Ctrl-C) trap handler for graceful exits and telemetry dumping.
- *   - FIXED: Tied idle-exhaustion detection directly to explicit GETCH activity 
+ *   - FIXED: Tied idle-exhaustion detection directly to explicit GETCH activity
  *     rather than static PC tracking.
  *
  * v7 — Diagnostic Monitoring
@@ -149,7 +206,7 @@
  *   - ADDED: Comprehensive inline option documentation and the --help CLI flag.
  *
  * v5 — Toolchain Native Integration
- *   - CHANGED: Migrated the external Python assembler compilation pipeline 
+ *   - CHANGED: Migrated the external Python assembler compilation pipeline
  *     to a direct C `#include "asm65c02.c"` block, removing the Python runtime dependency.
  *
  * v4 — Loader Stability
@@ -158,7 +215,7 @@
  *   - CLEANUP: General codebase maintenance and repository archive archiving.
  *
  * v3 — Instrumentation Interface
- *   - ADDED: Preliminary diagnostics tracking flags: --mandelbrot, --input, 
+ *   - ADDED: Preliminary diagnostics tracking flags: --mandelbrot, --input,
  *     --maxcycles, and --stats.
  *   - ADDED: Experimental automated GETCH trapping hooks.
  *
@@ -176,12 +233,28 @@
 #include <signal.h>
 #include <stdint.h>
 #include <ctype.h>
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#endif
 
 /* ── embedded assembler ──────────────────────────────────────────────────── */
 /* asm65c02.c is included here directly; it uses sim's mem[] array.
    Do NOT define ASM65C02_MAIN — we only want the assembler internals,
-   not its standalone main(). */
+   not its standalone main().
+
+   SIM_BROWSER_BINONLY (v14): when defined, the assembler is compiled out
+   entirely. It's only ever needed for .asm input, and the browser build
+   only ever loads pre-assembled .bin ROM assets (see Makefile's web-dist
+   target and index.html's dropdown) -- but asm65c02.c's fixed-size
+   per-line tables (pc_map[MAX_LINES], listing[MAX_LINES],
+   line_tag[MAX_LINES][LINE_LEN], mem_written[65536], syms[MAX_SYMS],
+   etc.) add ~37MB of static data regardless of whether assemble() is
+   ever called, which blew past wasm-ld's default 16MB initial memory
+   and failed the link outright. Native builds (the CLI tool and
+   native-smoke) do not define this and keep full .asm support. */
+#ifndef SIM_BROWSER_BINONLY
 #include "asm65c02.c"
+#endif
 
 /* ── input queue ─────────────────────────────────────────────────────────── */
 #define INBUF_MAX 4096
@@ -205,6 +278,101 @@ static uint8_t getch_consume(void) {
 /* ── terminal cursor state (for PRINT AT support) ────────────────────────── */
 static int term_col = 0;     /* current cursor column (0-based) */
 static int term_row = 0;     /* current cursor row    (0-based) */
+
+/*
+ * browser_io_active (v12)
+ *   True only between a successful sim_load_for_browser() call and the
+ *   next one; false at all other times, including throughout the native
+ *   CLI build (where the symbol/branches referencing it don't even exist
+ *   -- see #ifdef __EMSCRIPTEN__ below) and in an emscripten build if
+ *   main()'s CLI path were ever driven via callMain() instead of
+ *   sim65c02_select(). Gates rd()/wr()'s browser-only GETCH/PUTCH
+ *   handling so the native inbuf[]/getch_idle/use_live_stdin path is
+ *   completely untouched when this is 0.
+ */
+#ifdef __EMSCRIPTEN__
+static int browser_io_active = 0;
+
+/* sim65c02_run_chunk() return states -- mirrors pipbug_run_chunk()'s
+   PIPBUG_RUN_* contract in pipbug_wrap.c so both web front ends agree. */
+#define SIM_RUN_RUNNING        0
+#define SIM_RUN_WAITING_INPUT  1
+#define SIM_RUN_DONE           2
+
+/*
+ * browser_getch_missed_this_step / browser_getch_idle_run (v12)
+ *   Chunk-local idle tracking for sim65c02_run_chunk(), replacing the old
+ *   global getch_idle>50000 permanent-break. browser_getch_missed_this_step
+ *   is set by rd() when a browser-mode GETCH poll finds nothing queued and
+ *   cleared before every step(); run_chunk uses a run of consecutive misses
+ *   to decide when to yield WAITING_INPUT back to JS early instead of
+ *   burning the whole instruction budget on a busy-poll ROM loop. Neither
+ *   variable can ever cause a permanent wedge: every chunk call re-polls
+ *   the live JS FIFO via sim_browser_char_available() from scratch.
+ */
+static int browser_getch_missed_this_step = 0;
+static int browser_getch_idle_run = 0;
+#define BROWSER_IDLE_YIELD 200
+
+/*
+ * browser_maxcycles (v13)
+ *   Instruction-count cap for the browser session, checked by
+ *   sim65c02_run_chunk(). 0 means unlimited (the default -- matches the
+ *   native CLI's --maxcycles 0 meaning). Set via sim65c02_set_maxcycles(),
+ *   normally called from the HTML front end's command-line-options box
+ *   just before sim65c02_select() -- sim_load_for_browser() deliberately
+ *   does NOT reset this (or io_getch_addr/io_putch_addr), since callers
+ *   are expected to call the setters first each time; the HTML front end
+ *   always does, applying either the parsed --maxcycles value or its own
+ *   0/unlimited default.
+ */
+static long long browser_maxcycles = 0;
+
+/*
+ * EM_JS bridges (v12)
+ *   Purpose: browser GETCH/PUTCH I/O, modelled directly on
+ *   pipbug_wrap.c's pipbugCharAvailable/pipbugGetcharNonblock/pipbugPutchar.
+ *   JS owns the input FIFO and the terminal output sink; these are thin,
+ *   allocation-free polls/pushes across the WASM boundary. Each degrades
+ *   gracefully (no-op / -1 / not-available) if the host page hasn't wired
+ *   up the corresponding Module.sim* hook.
+ */
+EM_JS(int, sim_browser_char_available, (void), {
+    if (typeof Module !== 'undefined' && Module.simCharAvailable)
+        return Module.simCharAvailable() ? 1 : 0;
+    return 0;
+});
+
+EM_JS(int, sim_browser_getchar_nonblock, (void), {
+    if (typeof Module !== 'undefined' && Module.simGetcharNonblock)
+        return Module.simGetcharNonblock();
+    return -1;
+});
+
+EM_JS(void, sim_browser_putchar, (int ch), {
+    if (typeof Module !== 'undefined' && Module.simPutchar)
+        Module.simPutchar(ch & 0xff);
+});
+
+EM_JS(void, sim_browser_enqueue_line, (const char *line), {
+    if (typeof Module !== 'undefined' && Module.simEnqueueLine)
+        Module.simEnqueueLine(UTF8ToString(line));
+});
+
+/*
+ * Purpose: push a NUL-terminated C string to the browser terminal one
+ *   character at a time via sim_browser_putchar(). Used for the small
+ *   number of diagnostic strings sim_load_for_browser() emits (assembly
+ *   failure, bad reset vector) -- replaces the old em_append_text() into
+ *   the polling em_outbuf[] buffer.
+ * In:  s -- NUL-terminated string
+ * Out: none
+ * Clobbers: none (forwards to sim_browser_putchar())
+ */
+static void sim_browser_put_text(const char *s) {
+    while (*s) sim_browser_putchar((unsigned char)*s++);
+}
+#endif
 
 /* ── memory ─────────────────────────────────────────────────────────────── */
 uint8_t mem[65536];   /* shared with embedded asm65c02.c */
@@ -342,6 +510,21 @@ static long long getch_idle = 0;
  */
 static uint8_t rd(uint16_t a) {
     if (a == io_getch_addr) {
+#ifdef __EMSCRIPTEN__
+        if (browser_io_active) {
+            if (!sim_browser_char_available()) {
+                browser_getch_missed_this_step = 1;
+                return 0;
+            }
+            int c = sim_browser_getchar_nonblock();
+            if (c < 0) {
+                browser_getch_missed_this_step = 1;
+                return 0;
+            }
+            if (c == '\n') c = '\r';  /* terminal Enter -> BASIC CR convention */
+            return (uint8_t)c;
+        }
+#endif
         if (use_live_stdin) {
             int c = fgetc(stdin);
             if (c == EOF) { getch_idle++; return 0; }
@@ -363,22 +546,32 @@ static uint8_t rd(uint16_t a) {
 static void wr(uint16_t a, uint8_t v) {
     check_watch(a, v);
     if (a == io_putch_addr) {   /* PUTCH: character output */
+#ifdef __EMSCRIPTEN__
+        if (browser_io_active) { sim_browser_putchar((int)v); return; }
+#endif
         putchar(v);
         fflush(stdout);
         return;
     }
     switch (a) {
     case 0xE000:             /* TERMINAL_CLS: clear screen and home cursor */
+#ifdef __EMSCRIPTEN__
+        if (browser_io_active) { sim_browser_putchar('\f'); term_col = 0; term_row = 0; return; }
+#endif
         fputs("\033[2J\033[H", stdout); fflush(stdout);
         term_col = 0; term_row = 0;
         return;
     case 0xE005:             /* TERMINAL_X_POS: set cursor column ($E005) */
         term_col = v;
+#ifndef __EMSCRIPTEN__
         printf("\033[%d;%dH", term_row + 1, term_col + 1); fflush(stdout);
+#endif
         return;
     case 0xE006:             /* TERMINAL_Y_POS: set cursor row ($E006) */
         term_row = v;
+#ifndef __EMSCRIPTEN__
         printf("\033[%d;%dH", term_row + 1, term_col + 1); fflush(stdout);
+#endif
         return;
     case 0xE007:             /* IO_IRQ: any write triggers a maskable hardware IRQ */
         pending_irq = 1;
@@ -875,6 +1068,7 @@ static int load_bin(const char *path) {
 }
 
 /* ── assemble & load ─────────────────────────────────────────────────────── */
+#ifndef SIM_BROWSER_BINONLY
 static int assemble_and_load(const char *asm_path) {
     /* Read source file */
     FILE *f = fopen(asm_path, "r");
@@ -895,11 +1089,208 @@ static int assemble_and_load(const char *asm_path) {
     }
     return 0;
 }
+#endif
+
+#ifdef __EMSCRIPTEN__
+static CPU em_cpu;
+static int em_halted = 1;
+static long long em_cycles = 0;
+
+/*
+ * Purpose: (re)assemble the given source and reset the browser CPU/machine
+ *   state ready to run. Common body behind sim65c02_select()/
+ *   sim65c02_reset(). Sets browser_io_active so rd()/wr() route GETCH/
+ *   PUTCH through the JS bridges from this point on.
+ * In:  asm_path -- path (within the emscripten MEMFS preload) of the .asm
+ *      source to assemble or binary image to load, e.g. "uBASIC6502.asm"
+ *      or "assets/uBASIC6502.bin"
+ * Out: 0 on success, -1 on assembly failure or a bad ($0000) reset vector
+ *      (diagnostic text is pushed to the browser terminal in that case)
+ * Clobbers: mem[], em_cpu, em_halted, em_cycles, pending_irq,
+ *   watch_triggered, browser_io_active, browser_getch_idle_run,
+ *   browser_getch_missed_this_step, use_live_stdin (forced 0)
+ */
+static int sim_load_for_browser(const char *asm_path) {
+    memset(mem, 0, sizeof(mem));
+    memset(&em_cpu, 0, sizeof(em_cpu));
+    pending_irq = 0;
+    watch_triggered = 0;
+    em_cycles = 0;
+    em_halted = 1;
+    browser_io_active = 1;
+    browser_getch_idle_run = 0;
+    browser_getch_missed_this_step = 0;
+    {
+        size_t len = asm_path ? strlen(asm_path) : 0;
+        int is_asm = (len >= 4 && !strcmp(asm_path + len - 4, ".asm"));
+        if (is_asm) {
+#ifdef SIM_BROWSER_BINONLY
+            sim_browser_put_text("This build has no embedded assembler -- .bin ROMs only.\n");
+            return -1;
+#else
+            if (assemble_and_load(asm_path) < 0) {
+                sim_browser_put_text("Assembly failed. Check the browser console for details.\n");
+                return -1;
+            }
+#endif
+        } else {
+            if (load_bin(asm_path) < 0) {
+                sim_browser_put_text("ROM binary load failed. Check the browser console for details.\n");
+                return -1;
+            }
+        }
+    }
+    em_cpu.SP = 0xFF;
+    em_cpu.I = 1;
+    em_cpu.PC = mem[0xFFFC] | (mem[0xFFFD] << 8);
+    if (em_cpu.PC == 0) {
+        sim_browser_put_text("Reset vector is $0000 - bad ROM?\n");
+        return -1;
+    }
+    use_live_stdin = 0;
+    em_halted = 0;
+    return 0;
+}
+
+/*
+ * Purpose: (re)load and start the named BASIC ROM for a fresh browser
+ *   session -- the exported entry point the ROM-select dropdown/Start
+ *   button call.
+ * In:  asm_path -- ROM source path, e.g. "uBASIC6502.asm" or
+ *      "mini-BASIC65c02.asm"
+ * Out: 0 on success, -1 on failure (see sim_load_for_browser())
+ * Clobbers: see sim_load_for_browser()
+ */
+/*
+ * Purpose: override the GETCH/PUTCH port addresses for the next/current
+ *   browser session, equivalent to the native CLI's --getch-addr/
+ *   --putch-addr. Intended to be called before sim65c02_select() (order
+ *   doesn't strictly matter since rd()/wr() just read the current value,
+ *   but calling first avoids a window where the wrong addresses are live
+ *   for a freshly-loaded ROM's first few reads).
+ * In:  getch_addr, putch_addr -- 16-bit port addresses (values outside
+ *      0x0000-0xFFFF are truncated by the uint16_t cast)
+ * Out: none
+ * Clobbers: io_getch_addr, io_putch_addr
+ */
+EMSCRIPTEN_KEEPALIVE
+void sim65c02_set_io_addrs(int getch_addr, int putch_addr) {
+    io_getch_addr = (uint16_t)getch_addr;
+    io_putch_addr = (uint16_t)putch_addr;
+}
+
+/*
+ * Purpose: set the instruction-count cap for the browser session,
+ *   equivalent to the native CLI's --maxcycles. Intended to be called
+ *   before sim65c02_select().
+ * In:  n -- instruction limit; 0 means unlimited (default). Double is
+ *      used at the JS/WASM boundary to avoid i64 cwrap interop issues.
+ * Out: none
+ * Clobbers: browser_maxcycles
+ */
+EMSCRIPTEN_KEEPALIVE
+void sim65c02_set_maxcycles(double n) {
+    browser_maxcycles = (n > 0) ? (long long)n : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int sim65c02_select(const char *asm_path) {
+    return sim_load_for_browser(asm_path);
+}
+
+/*
+ * Purpose: restart the default ROM (uBASIC6502.asm). Kept for callers that
+ *   want a no-argument reset; the HTML UI normally uses sim65c02_select()
+ *   with the dropdown's current value instead.
+ * In:  none
+ * Out: 0 on success, -1 on failure
+ * Clobbers: see sim_load_for_browser()
+ */
+EMSCRIPTEN_KEEPALIVE
+int sim65c02_reset(void) {
+    return sim_load_for_browser("uBASIC6502.asm");
+}
+
+/*
+ * Purpose: queue a line of typed/pasted input, terminated with a CR, for
+ *   the running BASIC ROM to read via GETCH. Forwards straight to the
+ *   JS-owned FIFO (sim_browser_enqueue_line()) rather than a bounded
+ *   C-side buffer, so there is no capacity limit to silently hit on long
+ *   sessions (see v12 changelog above).
+ * In:  line -- NUL-terminated text, no trailing CR/LF expected
+ * Out: none
+ * Clobbers: none (forwards to JS)
+ */
+EMSCRIPTEN_KEEPALIVE
+void sim65c02_input(const char *line) {
+    if (!line) return;
+    sim_browser_enqueue_line(line);
+}
+
+/*
+ * Purpose: run a bounded chunk of the browser CPU loop, called from JS's
+ *   requestAnimationFrame() so the WASM module never owns the browser
+ *   thread indefinitely. Mirrors pipbug_run_chunk()'s state-machine
+ *   contract so the two web front ends (2650, 65C02) behave the same way.
+ * In:  instruction_budget -- max instructions to execute this call
+ *      (<=0 defaults to 1000)
+ * Out: SIM_RUN_DONE if already halted/just halted (BRK, unknown opcode,
+ *      or watchpoint); SIM_RUN_WAITING_INPUT if the ROM's GETCH poll has
+ *      been spinning on empty input for BROWSER_IDLE_YIELD consecutive
+ *      instructions (yields early so the tab stays responsive -- NOT a
+ *      terminal state, the very next call re-polls the live JS FIFO);
+ *      SIM_RUN_RUNNING if the budget was used up with more work to do.
+ * Clobbers: em_cpu, em_cycles, em_halted, pending_irq, watch_triggered,
+ *   browser_getch_missed_this_step, browser_getch_idle_run
+ */
+EMSCRIPTEN_KEEPALIVE
+int sim65c02_run_chunk(int instruction_budget) {
+    if (em_halted) return SIM_RUN_DONE;
+    if (instruction_budget <= 0) instruction_budget = 1000;
+    for (int i = 0; i < instruction_budget; i++) {
+        if (browser_maxcycles != 0 && em_cycles >= browser_maxcycles) {
+            em_halted = 1;
+            return SIM_RUN_DONE;
+        }
+        browser_getch_missed_this_step = 0;
+        if (step(&em_cpu)) { em_halted = 1; return SIM_RUN_DONE; }
+        em_cycles++;
+        if (watch_triggered) { em_halted = 1; return SIM_RUN_DONE; }
+        if (pending_irq && !em_cpu.I) {
+            pending_irq = 0;
+            em_cpu.I = 1;
+            PUSH(&em_cpu, (uint8_t)(em_cpu.PC >> 8));
+            PUSH(&em_cpu, (uint8_t)(em_cpu.PC & 0xFF));
+            PUSH(&em_cpu, pack_flags(&em_cpu) & ~0x10);
+            em_cpu.PC = (uint16_t)mem[0xFFFE] | ((uint16_t)mem[0xFFFF] << 8);
+        }
+        if (browser_getch_missed_this_step) {
+            if (++browser_getch_idle_run >= BROWSER_IDLE_YIELD)
+                return SIM_RUN_WAITING_INPUT;
+        } else {
+            browser_getch_idle_run = 0;
+        }
+    }
+    return SIM_RUN_RUNNING;
+}
+
+/*
+ * Purpose: report total instructions executed in the current browser
+ *   session, for an optional status readout.
+ * In:  none
+ * Out: cumulative instruction count since the last sim_load_for_browser()
+ * Clobbers: none
+ */
+EMSCRIPTEN_KEEPALIVE
+long long sim65c02_cycles(void) {
+    return em_cycles;
+}
+#endif
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 static void sim_usage(FILE *out) {
     fprintf(out,
-        "sim65c02 v11 — 65C02 simulator for uBASIC\n"
+        "sim65c02 v14 — 65C02 simulator for uBASIC\n"
         "\n"
         "Usage:\n"
         "  sim65c02 <file.asm | file.bin> [options]\n"
@@ -962,6 +1353,11 @@ static void sim_usage(FILE *out) {
     );
 }
 
+/* main() is the native CLI entry point only -- never invoked in the
+   browser build (INVOKE_RUN=0), and its .asm handling needs the
+   embedded assembler (asm_predefine(), n_cli_predefines,
+   assemble_and_load()), which SIM_BROWSER_BINONLY compiles out. */
+#ifndef SIM_BROWSER_BINONLY
 int main(int argc, char **argv) {
     /* --help (or -h) anywhere in args */
     for (int i = 1; i < argc; i++) {
@@ -1122,3 +1518,4 @@ int main(int argc, char **argv) {
     }
     return 0;
 }
+#endif /* !SIM_BROWSER_BINONLY */
