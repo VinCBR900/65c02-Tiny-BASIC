@@ -1,5 +1,5 @@
 <!--
-  index65c02.html  —  65C02 Tiny BASIC Browser Runner  (v3, Aug 2026)
+  index65c02.html  —  65C02 Tiny BASIC Browser Runner  (v4, Aug 2026)
 
   Usage:
     Served as the repository's GitHub Pages front end for the WebAssembly
@@ -11,6 +11,15 @@
     terminal.
 
   History:
+    v4 (Aug 2026) — Added 4kBASIC.asm as a third dropdown option
+      (assets/4kBASIC.bin), alongside uBASIC6502 and mini-BASIC65c02.
+      Requires the corresponding Makefile fix (4kBASIC.bin was never
+      added to WEB_ROMS/web-assets, so it was never built as a web
+      asset even though sim65c02.c could already load it) and
+      sim65c02.c v14 (SIM_BROWSER_BINONLY -- the wasm build no longer
+      carries the embedded assembler, so it only ever loads .bin
+      assets like this one; unrelated to this page's own changes but
+      required for the build this page ships with to link at all).
     v3 (Aug 2026) — Closer match to index2650.html: removed the demo
       quick-buttons and added a "Command-line options" input box mirroring
       index2650.html's --entry/--chin/--cout/-n args field (recognises
@@ -134,6 +143,7 @@
         <select id="rom">
           <option value="assets/uBASIC6502.bin" selected>uBASIC6502.asm — 2 KB uBASIC</option>
           <option value="assets/mini-BASIC65c02.bin">mini-BASIC65c02.asm — 4 KB mini BASIC</option>
+          <option value="assets/4kBASIC.bin">4kBASIC.asm — 4 KB BASIC</option>
         </select>
       </div>
       <div>
