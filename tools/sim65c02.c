@@ -1,5 +1,5 @@
 /*
- * sim65c02.c  —  Toy 65C02 simulator  (v14, Aug 2026)
+ * sim65c02.c  —  Toy 65C02 simulator  (v15, Aug 2026)
  *
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
@@ -123,6 +123,14 @@
 
  /*
  * VERSION HISTORY (Newest First)
+ *
+ * v15 — Browser Config Banner
+ *   - ADDED: sim_load_for_browser() now prints a config summary into the
+ *     browser terminal right after a successful ROM load, before the ROM's
+ *     own startup banner runs -- mirrors the 2650 web front end's
+ *     pipbug_wrap config summary (loaded bytes/range, GETCH/PUTCH ports,
+ *     entry point, maxcycles). load_bin() now records last_load_base/
+ *     last_load_size for this.
  *
  * v14 — Browser Build: Binary-Only (No Embedded Assembler)
  *   - ADDED: SIM_BROWSER_BINONLY build-time flag. When defined, compiles
@@ -1036,6 +1044,7 @@ static int step(CPU *cpu) {
 
 /* ── load binary ─────────────────────────────────────────────────────────── */
 static uint32_t bin_load_addr = 0xFFFFFFFF; /* sentinel = auto */
+static uint32_t last_load_base = 0, last_load_size = 0; /* v15: for browser config banner */
 
 static int load_bin(const char *path) {
     FILE *f = fopen(path,"rb");
@@ -1063,6 +1072,8 @@ static int load_bin(const char *path) {
         (void)n;
         fprintf(stderr,"[SIM] Loaded %ld bytes at $%04X\n", sz, (unsigned)base);
     }
+    last_load_base = base;
+    last_load_size = (uint32_t)sz;
     fclose(f);
     return 0;
 }
@@ -1146,6 +1157,29 @@ static int sim_load_for_browser(const char *asm_path) {
     if (em_cpu.PC == 0) {
         sim_browser_put_text("Reset vector is $0000 - bad ROM?\n");
         return -1;
+    }
+    {
+        /* v15: config banner, shown before the ROM's own startup banner --
+           mirrors the 2650 web front end's pipbug_wrap config summary. */
+        char mcbuf[32];
+        if (browser_maxcycles > 0) snprintf(mcbuf, sizeof mcbuf, "%lld", browser_maxcycles);
+        else                       snprintf(mcbuf, sizeof mcbuf, "unlimited");
+        char buf[320];
+        if (last_load_size > 0) {
+            snprintf(buf, sizeof buf,
+                "Loaded %u bytes from '%s' ($%04X-$%04X)\n"
+                "sim65c02.c v15 (browser)\n"
+                "Config: GETCH=$%04X  PUTCH=$%04X  entry=$%04X  maxcycles=%s\n\n",
+                (unsigned)last_load_size, asm_path,
+                (unsigned)last_load_base, (unsigned)(last_load_base + last_load_size - 1),
+                io_getch_addr, io_putch_addr, em_cpu.PC, mcbuf);
+        } else {
+            snprintf(buf, sizeof buf,
+                "sim65c02.c v15 (browser)\n"
+                "Config: GETCH=$%04X  PUTCH=$%04X  entry=$%04X  maxcycles=%s\n\n",
+                io_getch_addr, io_putch_addr, em_cpu.PC, mcbuf);
+        }
+        sim_browser_put_text(buf);
     }
     use_live_stdin = 0;
     em_halted = 0;
@@ -1290,7 +1324,7 @@ long long sim65c02_cycles(void) {
 /* ── main ────────────────────────────────────────────────────────────────── */
 static void sim_usage(FILE *out) {
     fprintf(out,
-        "sim65c02 v14 — 65C02 simulator for uBASIC\n"
+        "sim65c02 v15 — 65C02 simulator for uBASIC\n"
         "\n"
         "Usage:\n"
         "  sim65c02 <file.asm | file.bin> [options]\n"
