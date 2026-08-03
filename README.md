@@ -10,16 +10,16 @@
 
 Here we have several Tiny BASIC for 6502/65c02
   * uBASIC - Targeted at original NMOS 6502, meets 1976 Tiny BASIC spec for 16 bit signed ints, fits in 2kbyte including bitbang serial IO on a VIA 6522
-  * 4k BASIC - Targeted at 65c02 this is an Extended 16bit signed in Tiny BASIC with `FOR`/`NEXT`, functions and Bitwise operators.  Fits in a 4kbyte EPROM
+  * 4k BASIC - Targeted at 65c02, this is an Extended 16bit signed in Tiny BASIC with `FOR`/`NEXT`, CORDIC `SIN`/`COS` degree functions and Bitwise operators.  Fits in a 4kbyte EPROM.
   * mini-BASIC - Targeted at 65c02, 4 byte floating point with radian based TRIG: `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`, and Transcendental `LN`/`EXP`   
 
-You can see the development progression - first came uBASIC, then extended 4k BASIC with some trig support, then mini-BASIC with 4byte floats and proper trig.
+You can see the development progression - first came uBASIC, then extended 4k BASIC with some trig support, then mini-BASIC with 4byte floats, full trig, and transcendental.
 
 ### uBASIC6502 — fits in a 2716 EPROM (<2 KByte)
 
 **<2048 bytes assembled. ROM at $F800–$FFFF**
 
-A minimal but complete integer BASIC. No tokeniser - BASIC program lines are stored as raw ASCII and re-parsed on every execution. This costs RAM and speed but keeps the interpreter very small. 
+A minimal but complete integer Tiny BASIC. No tokeniser - BASIC program lines are stored as raw ASCII and re-parsed on every execution. This costs RAM and speed but keeps the interpreter very small. 
 
 Courtesy of [Sehugg and Mango 1](https://github.com/sehugg/mango_one), You can open this project in [8 Bit Workshop](http://8bitworkshop.com/v3.12.1/?redir.html?platform=verilog&githubURL=https%3A%2F%2Fgithub.com%2FVinCBR900%2Fmango_one&file=mango1.v) and try it Out! Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing `ESC` aborts running program. 
 
@@ -35,7 +35,7 @@ This interpreter has also been ported to the John Bell 80-153 single board compu
   * Functions: `ABS(val)`   `FREE`   `PEEK(addr)`  `RND`   `USR(addr)`  
 
 **Notes**
-- Uses **2 character matching** - with 3rd char match for `GOSUB`/`GOTO` and `RETURN`/`REM`.  Matches anything after e.g. PROCEED matches PRINT.  Therefore  spaces are important e.g. `PRINT TAB(5);"hello"` works, whereas `PRINTTAB(5);"HELLO"` does not.
+- Uses **2 character matching** - with 3rd char match for `GOSUB`/`GOTO` and `RETURN`/`REM`.  Matches anything after e.g. PROCEED matches PRINT.  Therefore  spaces are important e.g. `PRINT TAB(5);"hello"` prints 5 spaces then `Hello` and works, whereas `PRINTTAB(5);"HELLO"` prints `5Hello` and does not.
 - **`GOTO`/`GOSUB` accepts expressions** — `GOTO X`, `GOSUB BASE+N`, `GOTO 10*I` all work
 - **`RND`** — 16-bit Galois LFSR pseudo-random number, returns 1–32767; seeded at startup; useful as `RND % 6 + 1` for a die roll
 - **`:` Not Supported** - Multi-statement operator `:` is not supported and input buffer is 40 characters only.
@@ -143,9 +143,9 @@ An expanded Tiny BASIC with 32bit Floating ppoint support (Still vars `A`-`Z`). 
 Both ROMs work in the [Kowalski 65C02 Simulator](https://github.com/Kelmar/kowalski). Set:
 - CPU mode: Set **65C02** if using 4k versions
 - Terminal emulation addresses: **E000–E006**
-- Ensure `uBASIC6502.asm` has the `KOWaLSKI=1` defined at teh top of the file 
+- Ensure `uBASIC6502.asm` has `KOWALSKI=1` defined at the top of the file to disable bitbang serial
 
-Load the assembled binary or paste the `.asm` source click Assemble (F7), Debug (F6) and either RUN (F5) or Animate (Ctrl-F5) if you want to watch it step through - don't forget to click and type into the yellow Terminal window. The INIT trampoline at the start of uBASIC ROM means Kowalski's nominal execute-from-first-byte behaviour works correctly, as does real hardware's reset-vector startup.
+Load the assembled binary or paste the `.asm` source, click Assemble (F7), Debug (F6) and either RUN (F5) or Animate (Ctrl-F5) if you want to watch it step through - don't forget to click and type into the yellow Terminal window. The INIT trampoline at the start of uBASIC ROM means Kowalski's nominal execute-from-first-byte behaviour works correctly, as does real hardware's reset-vector startup.
 
 ### Proprietary Simulator
 Building and Running
@@ -187,7 +187,7 @@ Example of batch testing
 
 #### Terminal I/O
 
-For real Hardware you will need to modify the I/O Addresses for Serial I/O, specified below.  Although 4kBASIC has plenty of ROM space available, uBASIC is a bit tight but probably enough for simple writes to ACIA or bitbang serial.  `FREE` is an obvious candidate to delete to make space if needed, ask Claude.
+For real Hardware you will need to modify the I/O Addresses for Serial I/O, specified below. 
 
 | Address | Kowalski Virtual Terminal Function  |
 |---------|----------|
@@ -196,10 +196,10 @@ For real Hardware you will need to modify the I/O Addresses for Serial I/O, spec
 
 ### Things to watch out for
 
-- **ROM size.** All variants dont have much free space. Always check after a change. Claude will help you find space savings if you're over budget.
-- **Page constraints.** The uBASIC string table must stay entirely on page $F8 (all strings accessed via a shared hi-byte). Claude can get confused if the page boundary is exceeded - it will find it eventually but after a lot of thrashing, so tell it to watch out when adding new strings to uBASIC.
-- **Zero-page register clobbers.** The In/Out/Clobbers comments on each function document which of T0/T1/T2/LP/IP/OP are live. Claude will respect these if you share the relevant headers.
-- **Fall-through chains.** Several functions share a single RTS by falling through into the next function. These are clearly marked in the source. Inserting code between them without understanding the fall-through will break things — tell Claude to watch out for them.
+- **ROM size.** All variants don't have much free space. Always check after a change. Claude will help you find space savings if you're over budget.
+- **Page constraints.** The string table must stay entirely on page $F8 (all strings accessed via a shared hi-byte). Claude can get confused if the page boundary is exceeded - it will find it eventually but after a lot of thrashing, so tell it to watch out when adding new strings.
+- **Zero-page register clobbers.** The In/Out/Clobbers comments on each function document which of T0/T1/T2/LP/IP/OP are live. 
+- **Fall-through chains.** Several functions share a single RTS by falling through into the next function. These are clearly marked in the source. Inserting code between them without understanding the fall-through will break things.
 
 ---
 
