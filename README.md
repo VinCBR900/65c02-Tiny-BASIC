@@ -16,6 +16,9 @@ Here we have several Tiny BASIC for 6502/65c02
 You can see the development progression - first came uBASIC, then extended 4k BASIC with some trig support, then mini-BASIC with 4byte floats, full trig, and transcendental.
 Support the project
 
+You can play with these online at the link below - all three versions include a showcase BASIC demo - type `RUN` to execute, and `LIST` to view.   
+https://vincbr900.github.io/65c02-Tiny-BASIC/
+
 > If you've found these Tiny BASIC interpreters useful for learning, retrocomputing, or your own projects, you can buy me a coffee.  Donations are entirely optional but greatly appreciated.
 > [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/vpcrabtreeZ)
 
@@ -24,8 +27,6 @@ Support the project
 **<2048 bytes assembled. ROM at $F800–$FFFF**
 
 A minimal but complete integer Tiny BASIC. No tokeniser - BASIC program lines are stored as raw ASCII and re-parsed on every execution. This costs RAM and speed but keeps the interpreter very small. 
-
-Courtesy of [Sehugg and Mango 1](https://github.com/sehugg/mango_one), You can open this project in [8 Bit Workshop](http://8bitworkshop.com/v3.12.1/?redir.html?platform=verilog&githubURL=https%3A%2F%2Fgithub.com%2FVinCBR900%2Fmango_one&file=mango1.v) and try it Out! Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing `ESC` aborts running program. 
 
 This interpreter has also been ported to the John Bell 80-153 single board computer.  A modified `sim65c02` simulator (`JB-sim65c02`) is provided for this version.
 
@@ -142,16 +143,21 @@ An expanded Tiny BASIC with 32bit Floating ppoint support (Still vars `A`-`Z`). 
 
 ## Building and Running
 
+### Proprietary Online Simulator
+
+You can play with these online at the link below - all three versions include a showcase BASIC demo - type `RUN` to execute, and `LIST` to view.   
+https://vincbr900.github.io/65c02-Tiny-BASIC/
+
 ### Kowalski Simulator
 
-Both ROMs work in the [Kowalski 65C02 Simulator](https://github.com/Kelmar/kowalski). Set:
+All ROMs work in the [Kowalski 65C02 Simulator](https://github.com/Kelmar/kowalski). Set:
 - CPU mode: Set **65C02** if using 4k versions
 - Terminal emulation addresses: **E000–E006**
 - Ensure `uBASIC6502.asm` has `KOWALSKI=1` defined at the top of the file to disable bitbang serial
 
 Load the assembled binary or paste the `.asm` source, click Assemble (F7), Debug (F6) and either RUN (F5) or Animate (Ctrl-F5) if you want to watch it step through - don't forget to click and type into the yellow Terminal window. The INIT trampoline at the start of uBASIC ROM means Kowalski's nominal execute-from-first-byte behaviour works correctly, as does real hardware's reset-vector startup.
 
-### Proprietary Simulator
+### Proprietary Offline Simulator
 Building and Running
 
 `sim65c02.c` may be used for batch testing by piping file in from STDIN, or may be started with max-cycles set to 0 and will take inpuit form STDIN, with output going to STDOUT and errors to STDERR.  
