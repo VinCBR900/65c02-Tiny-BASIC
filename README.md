@@ -9,9 +9,9 @@
 > To be frank, without these agents this work would not have been possible.
 
 Here we have several Tiny BASIC for 6502/65c02
-  * uBASIC - Targeted at original NMOS 6502, meets 1976 Tiny BASIC spec for 16 bit signed ints, fits in 2kbyte including bitbang serial IO on a VIA 6522
-  * 4k BASIC - Targeted at 65c02, this is an Extended 16bit signed in Tiny BASIC with `FOR`/`NEXT`, CORDIC `SIN`/`COS` degree functions and Bitwise operators.  Fits in a 4kbyte EPROM.
-  * mini-BASIC - Targeted at 65c02, 4 byte floating point with radian based TRIG: `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`, and Transcendental `LN`/`EXP`   
+  * **uBASIC** - Targeted at original NMOS 6502, meets 1976 Tiny BASIC spec for 16 bit signed ints, fits in 2kbyte including bitbang serial IO on a VIA 6522
+  * **4kBASIC** - Targeted at 65c02, this is an Extended 16bit signed in Tiny BASIC with `FOR`/`NEXT`, CORDIC `SIN`/`COS` degree functions and Bitwise operators.  Fits in a 4kbyte EPROM.
+  * **mini-BASIC** - Targeted at 65c02, 4 byte floating point with radian based TRIG: `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`, and Transcendental `LN`/`EXP`   
 
 You can see the development progression - first came uBASIC, then extended 4k BASIC with some trig support, then mini-BASIC with 4byte floats, full trig, and transcendental.
 Support the project
