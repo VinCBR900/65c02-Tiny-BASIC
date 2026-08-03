@@ -691,7 +691,7 @@ EL_FL:   JSR PE_CMP            ; is LP == PE? (reached end of store)
 	 BNE EL_INS		; always taken
 	
 EL_SKIP: JSR LSKIP             ; advance LP to next line (shared w/ GOTOL)
-         JMP EL_FL
+         BEQ EL_FL              ; LSKIP's only exit is via CMP #CR -- Z=1 guaranteed
 
 EL_FND:  LDA LP                ; save the deletion point -- DELINE returns
          PHA
@@ -1060,13 +1060,13 @@ LS_BODY: LDY #0
          CMP #CR
          BEQ LS_EOL
          JSR PUTCH
-         JMP LS_BODY
+         BNE LS_BODY             ; PUTCH always leaves Z=0 (see DP_STR): unconditional
 
 LS_EOL:  JSR PRNL
-         JMP LS_LN
+         BNE LS_LN               ; PRNL tail-calls PUTCH -- same Z=0 guarantee
 
 LS_SKIP: JSR LSKIP              ; LP still at header start -- matches LSKIP's contract
-         JMP LS_LN
+         BEQ LS_LN               ; LSKIP's only exit is via CMP #CR -- Z=1 guaranteed
 
 ; =============================================================================
 ; ADD2_LP  --  LP += 2 (shared by INSLINE and DO_LIST, skip a 2-byte header)
@@ -1306,7 +1306,7 @@ GT_SC:   JSR PE_CMP            ; test LP == PE (end of store)
          CMP T0+1             ; compare line-number hi
          BEQ GT_OK
 GT_NX:   JSR LSKIP             ; advance LP to next line (shared w/ EDITLN)
-         JMP GT_SC
+         BEQ GT_SC              ; LSKIP's only exit is via CMP #CR -- Z=1 guaranteed
 
 GT_OK:   LDA T0               ; T0 already == the matched line number
          STA CURLN
