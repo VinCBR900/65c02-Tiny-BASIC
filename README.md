@@ -14,7 +14,6 @@ Here we have several Tiny BASIC for 6502/65c02
   * **mini-BASIC - TRIG** - Targeted at 65c02, 4 byte floating point with radian based TRIG: `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`, and Transcendental `LN`/`EXP`   
 
 You can see the development progression - first came uBASIC, then extended 4k BASIC with some trig support, then mini-BASIC with 4byte floats, full trig, and transcendental.
-Support the project
 
 You can play with these online at the link below - all three versions include a showcase BASIC demo - type `RUN` to execute, and `LIST` to view.   
 https://vincbr900.github.io/65c02-Tiny-BASIC/
