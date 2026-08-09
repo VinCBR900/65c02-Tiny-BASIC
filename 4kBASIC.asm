@@ -98,20 +98,21 @@
 ;
 ; v15.22 (Aug 2026) - 73 bytes free (confirmed by build)
 ;   - EXPR_POW (EP_mul, EP_sign): two inline 16-bit copies into T0 (from CX,
-;     from CY) converted to TO_T0 helper 
+;     from CY) converted to the shared TO_T0 helper.
 ;   - Showcase (RAM at $0200, not part of the $F000 ROM budget above): line
 ;     880 (Spiral Vortex) changed from X*X+Y*Y to X^2+Y^2 to exercise the
-;     `^` operator
+;     `^` operator.
 ;   - Showcase lines 660/680 (Mandelbrot escape test) were tried as
 ;     A^2/B^2 but REVERTED back to A*A/B*B: the escape-time algorithm
 ;     relies on A/B growing past +-181 (sqrt(32767)) once a point starts
 ;     diverging, which `^`'s explicit 16-bit overflow guard correctly
 ;     rejects (OV ERR IN 680) where `*`'s silent mod-65536 wraparound
-;     did not. The demo depends on `*`'s wraparound behaviour here
+;     did not. The demo depends on `*`'s wraparound behaviour here.
 ;
 ; v15.21 (Aug 2026) - 67 bytes free
-;   - Cleaned up file header to match house style
-;   - Added Power operator `^` with guards 
+;   - Cleaned up file header to match house style.
+;   - Added guards to the `^` power operator: negative exponent and
+;     signed 16-bit overflow now both raise OV ERR (see Known Limitations).
 ;
 ; v15.20 (Aug 2026) - 261 bytes free
 ;   - NEW: $HHHH hex literal syntax (1-4 hex digits), usable anywhere a
@@ -158,7 +159,6 @@
 ;     handling stores T0+1's raw byte directly (bit 7 = sign) instead of
 ;     an explicit 0/1 flag.
 ;
-;
 ; v15.15 (Aug 2026) - 395 bytes free (SIZE PASS 4 + REM bug fix)
 ;   - CORDIC_KERN restructured: unified the separate +1/-1 branches into
 ;     one conditional-negate-then-add shape, removing 3 now-unused helpers.
@@ -169,13 +169,13 @@
 ;     any line containing REM. Fixed by mirroring DATA's already-correct
 ;     token-first pattern.
 ;
-; v15.14 (Aug 2026) - 321 bytes free 
-;   - Refactored for size: KW_TABLE/STMT_JT/
-;     DO_ERROR relocated, several routines renamed, expression-atom tokens
-;     renumbered, removed commands (CLS/HELP/ON/INKEY/SGN) replaced with
-;     STMT_JT placeholder entries. Verified via full regression suite.
+; v15.14 (Aug 2026) - 321 bytes free
+;   - Refactored for size: KW_TABLE/STMT_JT/DO_ERROR relocated, several
+;     routines renamed, expression-atom tokens renumbered, removed
+;     commands (CLS/HELP/ON/INKEY/SGN) replaced with STMT_JT placeholder
+;     entries. Verified via full regression suite.
 ;
-; v15.10 - v15.13 (Aug 2026) - 194 -> 209 bytes free 
+; v15.10 - v15.13 (Aug 2026) - 194 -> 209 bytes free
 ;   - Extracted shared 16-bit helpers (TO_T0, T0_TO_CURLN, STORE_VAR,
 ;     ADDT0_TO, GETVARC, CMP16, TOKSKIP_LP/TOKSKIP_IP) for ZP copy/add/
 ;     store/compare/scan idioms repeated across the file.
@@ -537,7 +537,7 @@ SHOWCASE_END = *               ; v15.20: extended with Integer Spiral Vortex dem
 ; STRING TABLE (all strings on same page)
 ; =============================================================================
 STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string/kw addresses
-STR_BANNER: .DB "4K BASIC v15.21"       ; same length as v15.16/v15.20
+STR_BANNER: .DB "4K BASIC v15.22"       ; same length as v15.16/v15.20/v15.21
 STR_CRLF:   .DB $0D,$8A             ; CR, LF|$80 = $8A
 STR_BYTES:  .DB " BYTES FREE",$0D,$8A  ; last LF has high-bit
 STR_ERROR:  .DB " ER",$D2           ; 'R'|$80 = $D2
@@ -879,6 +879,12 @@ RD_ap_ok:
         RTS
 
 ; =============================================================================
+; IPADD2 ? skip a 2-byte payload at IP (e.g. a TOK_NUM's lo/hi bytes), then
+;   fall through into GETCI for the byte now at IP
+;   In:  IP   points at the first of the 2 bytes to skip
+;   Out: A    byte now at (IP), i.e. two bytes past the original IP;  IP+=2
+;   Clobbers: None.
+;
 ; GETCI ? read byte at IP and advance IP by one
 ;   In:  IP   token stream pointer
 ;   Out: A    byte that was at (IP);  IP  incremented
@@ -1029,7 +1035,7 @@ TKPH_dn:
 ;   Out: C=0   matched: token byte emitted via TKEMIT, T0 advanced past keyword
 ;        C=1   no match: T0 unchanged, nothing emitted
 ;        TKTOK keyword scan index (scratch; caller must not rely on value)
-;   Clobbers: A Y T2 LP OP
+;   Clobbers: A X Y T2 LP OP
 ;   Note: CURLN is temporarily used to save/restore T0 during comparison;
 ;         the value is not meaningful until TOKENIZE assigns it via TKPNUM.
 ;         OP ($BB) is used as a single-byte temp in TRY_cmp loop -- safe because
@@ -1178,7 +1184,7 @@ EL_ins: JSR WPEEK            ; check for empty body (just CR/sentinel)
 ;        CURLN line number for the 2-byte header
 ;   Out: new line written at LP with 2-byte header prepended
 ;        PE   advanced by inserted byte count
-;   Clobbers: A Y T0 T1
+;   Clobbers: A X Y T0 T1
 ;   Ported from uBASIC6502b (v15.5): the NMOS original counted the shift
 ;   distance into a scratch register and called a shared decrement-and-test
 ;   helper (T2DEC) once per byte copied. Replaced with a direct pointer
@@ -1604,7 +1610,7 @@ DO_REM: RTS
 
 ; =============================================================================
 ; DO_RUN ? RUN: start program from first line
-;   Clobbers: A X
+;   Clobbers: A X Y
 ; =============================================================================
 DO_RUN:
         STZ IP
@@ -2100,9 +2106,7 @@ DO_POKE:
 ; =============================================================================
 ; DO_RESTORE ? RESTORE: reset DATA pointer (0 = rescan from PROG on next READ)
 ;   READ/RESTORE consume the raw bytes via DATA_PTR.  (Same pattern as DO_REM.)
-;   Clobbers: None.
-; =============================================================================
-;   Clobbers: A
+;   Clobbers: None.  (STZ does not touch A/X/Y)
 ; =============================================================================
 DO_RESTORE:
         STZ DATA_PTR         ; 65C02 STZ zp
@@ -2158,7 +2162,7 @@ RD_sn:  LDA #ERR_SN
 ;   DATA_PTR invariant: see DO_READ header above.
 ;   Out: C=0  T0 = 16-bit signed value; DATA_PTR updated
 ;        C=1  out of data; DATA_PTR set to PE
-;   Clobbers: A Y
+;   Clobbers: A X Y
 ; =============================================================================
 RD_next_val:
         ; -- if DATA_PTR==0 (reset): start scanning from PROG ----------------
@@ -2254,7 +2258,7 @@ RD_readnum:
 ;   In:  T0   target line number (16-bit)
 ;   Out: C=0  found: IP points at first token after the 2-byte header
 ;        C=1  not found (caller should raise ERR_UL)
-;   Clobbers: A Y IP
+;   Clobbers: A X Y IP
 ; =============================================================================
 GOTOL:
         STZ IP
@@ -2478,6 +2482,7 @@ EA_rts: RTS
 
 ; =============================================================================
 ; EXPR_ADD ? Tier 2: addition, subtraction  (also relational dispatch above)
+;   Clobbers: A X Y T0 T1 T2  (and anything EXPR1/NEG16 clobber)
 ; =============================================================================
 EXPR_ADD:
         JSR EXPR1
@@ -2509,6 +2514,8 @@ EA_sum:
 
 ; =============================================================================
 ; EXPR1 ? Tier 3: multiply / divide  (merged sign-handling kernel)
+;   Clobbers: A X Y OP T0 T1 T2  (and anything EXPR_POW/MUL16_u/DIV_KERN/
+;   NEG16/NEG_T1/TO_T0 clobber)
 ; =============================================================================
 EXPR1:
         JSR EXPR_POW
@@ -3077,7 +3084,7 @@ CK_P3:  LDX #(CZ-T0)
 ;   Quadrant flags (bit0=negate CX/cos, bit1=negate CY/sin) are the Gray
 ;   code Y EOR (Y>>1): Y=0->00, Y=1->01, Y=2->11, Y=3->10. A final EOR #2
 ;   flips the CY flag alone for negative input (sin is odd, cos is even).
-;   Clobbers: A X T0 T1 T2 CX CY CZ CX_SAV CIDX ATEMP
+;   Clobbers: A X Y T0 T1 T2 CX CY CZ CX_SAV CIDX ATEMP
 ; =============================================================================
 E2_cos:
         LDA #$80            ; $80 = COS engine
@@ -3258,13 +3265,9 @@ EA_body:
         TSB AMODE           ; 65C02 TSB: sets bit 7 if input was negative
         JSR NEG16           ; T0 = |v|
 EA_nonneg:
-; =============================================================================
-; CLAMP1000 -- clamp unsigned 16-bit T0 to a maximum of 1000
-;   In:  T0 (caller guarantees T0 >= 0, i.e. bit7 of T0+1 clear)
-;   Out: T0 = min(T0, 1000)
-;   Clobbers: A
-; =============================================================================
-;CLAMP1000:
+        ; -- clamp unsigned T0 to a max of 1000 (was a standalone CLAMP1000
+        ;    routine; inlined here since E2_asin/E2_acos is its only caller --
+        ;    see the E2_asin header above for the full clobber list) --------
         LDA #<1000
         CMP T0
         LDA #>1000
@@ -3428,7 +3431,9 @@ GETVARC:
 ;   Out: Z flag set iff A==B (16-bit); same early-exit-on-low-byte-mismatch
 ;        semantics as the inline LDA/CMP/BNE/LDA/CMP it replaces, so the
 ;        caller's existing BEQ/BNE after the JSR works unchanged.
-;   Clobbers: A
+;   Clobbers: A Y  (Y is incremented by 1 on the low-byte-equal path, so it
+;   no longer holds the caller's "B" address after the call -- reload it
+;   before reusing Y as a pointer)
 ;   Uses ZP0 (permanent $0000 zp pointer) so Y can address B directly via
 ;   (ZP0),Y -- STA/CMP don't support zp,Y, this is the equivalent trick.
 CMP16:
@@ -3460,6 +3465,7 @@ CMP_T0_LP_ne:
 
 ; =============================================================================
 ; EXPR2_tvar ? variable or unrecognised atom (BRA from dispatch above)
+;   Clobbers: A X T0
 ; =============================================================================
 EXPR2_tvar:
         JSR PARSE_VAR        ; harmless redundant WPEEK_UC re-peek (IP unmoved so far)
