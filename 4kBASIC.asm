@@ -78,11 +78,6 @@
 ;   past the limit sounds BELL and is discarded outright -- not stored, not
 ;   echoed, buffer position does not advance.
 ;
-; RUN corrupts the stored bytes of program line 1 as a side effect of
-;   execution (open bug; reproduces on a pristine build, unrelated to any
-;   single change). LIST *after* RUN can show a garbled first line; LIST
-;   run *before* RUN is unaffected.
-;
 ; Error codes  (printed as  XX ERR [IN line]):
 ;   SN  syntax / bad expression
 ;   UL  undefined line number
