@@ -1,5 +1,5 @@
 ; =============================================================================
-; 4K Integer BASIC v15.21 for the 65C02
+; 4K Integer BASIC v15.22 for the 65C02
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -96,6 +96,19 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ;
+; v15.22 (Aug 2026) - 73 bytes free (confirmed by build)
+;   - EXPR_POW (EP_mul, EP_sign): two inline 16-bit copies into T0 (from CX,
+;     from CY) converted to TO_T0 helper 
+;   - Showcase (RAM at $0200, not part of the $F000 ROM budget above): line
+;     880 (Spiral Vortex) changed from X*X+Y*Y to X^2+Y^2 to exercise the
+;     `^` operator
+;   - Showcase lines 660/680 (Mandelbrot escape test) were tried as
+;     A^2/B^2 but REVERTED back to A*A/B*B: the escape-time algorithm
+;     relies on A/B growing past +-181 (sqrt(32767)) once a point starts
+;     diverging, which `^`'s explicit 16-bit overflow guard correctly
+;     rejects (OV ERR IN 680) where `*`'s silent mod-65536 wraparound
+;     did not. The demo depends on `*`'s wraparound behaviour here
+;
 ; v15.21 (Aug 2026) - 67 bytes free
 ;   - Cleaned up file header to match house style
 ;   - Added Power operator `^` with guards 
@@ -114,8 +127,6 @@
 ;     standalone subroutine, shared by */,%,MOD and SC_GO.
 ;   - FIXED: NOT truncated the rest of its statement ("PRINT NOT 0;X" dropped X).
 ;   - FIXED: generic (expr) grouping returned wrong results ("PRINT (1+2)*3" -> 0).
-;   - Showcase regenerated against the new token numbering and extended
-;     with an Integer Spiral Vortex demo (SIN/COS/ASIN/ACOS/ABS/TAB/CHR$).
 ;
 ; v15.19 (Aug 2026)
 ;   - NEW: ASIN(v)/ACOS(v) -- binary-search bisection over SC_GO, no new
@@ -137,9 +148,6 @@
 ;     Centralized the "consume token, eat (expr)" step into the
 ;     dispatcher itself instead of each handler's own call.
 ;   - CHR$ scoped to PRINT-only (removed from general EXPR2 dispatch), -4 bytes.
-;   - NOTED (not fixed): RUN corrupts the stored bytes of program line 1
-;     as a side effect of execution -- reproduces on a pristine build,
-;     unrelated to this change (see Known Limitations).
 ;
 ; v15.16 (Aug 2026) - 453 bytes free
 ;   - E2_sin/E2_cos angle-fold/negate/scale pipeline reviewed and rewritten
@@ -161,13 +169,13 @@
 ;     any line containing REM. Fixed by mirroring DATA's already-correct
 ;     token-first pattern.
 ;
-; v15.14 (Aug 2026) - 321 bytes free (hand-optimized base adopted)
-;   - Adopted a hand-optimized upload as the new base: KW_TABLE/STMT_JT/
+; v15.14 (Aug 2026) - 321 bytes free 
+;   - Refactored for size: KW_TABLE/STMT_JT/
 ;     DO_ERROR relocated, several routines renamed, expression-atom tokens
 ;     renumbered, removed commands (CLS/HELP/ON/INKEY/SGN) replaced with
 ;     STMT_JT placeholder entries. Verified via full regression suite.
 ;
-; v15.10 - v15.13 (Aug 2026) - 194 -> 209 bytes free (SIZE PASSES 2-3 + bug fixes)
+; v15.10 - v15.13 (Aug 2026) - 194 -> 209 bytes free 
 ;   - Extracted shared 16-bit helpers (TO_T0, T0_TO_CURLN, STORE_VAR,
 ;     ADDT0_TO, GETVARC, CMP16, TOKSKIP_LP/TOKSKIP_IP) for ZP copy/add/
 ;     store/compare/scan idioms repeated across the file.
@@ -405,9 +413,6 @@ ALO:     .RS 1               ;  8-bit: bisection low bound (degrees)
 AHI:     .RS 1               ;  8-bit: bisection high bound (degrees)
 AMID:    .RS 1               ;  8-bit: current midpoint candidate (degrees)
 AMODE:   .RS 1               ;  8-bit: bit0 0=ASIN/1=ACOS; bit7 orig sign of v (ASIN only)
-ACNT:    .RS 1               ;  8-bit: bisection iteration counter (NOT the X register --
-                              ;  SC_GO clobbers X every call, so the loop counter has to
-                              ;  live in memory, not in X, across JSR SC_GO)
 
 ; ZP0 - permanent $0000 pointer for (zp),Y indirect-indexed addressing.
 ; Zeroed once by INIT's cold-boot DO_NEW clear (X=$FF entry covers all of
@@ -418,8 +423,8 @@ ACNT:    .RS 1               ;  8-bit: bisection iteration counter (NOT the X re
 ZP0:     .RS 2
 
 ; Buffers/BASIC VARS
-TBUF:    .RS 32               ; 32 bytes: tokenised buffer  
 VARS:    .RS 52               ; 52 bytes: A-Z variables     
+TBUF:    .RS IBUF_MAX+1       ; Tokenised buffer  
 IBUF:    .RS IBUF_MAX+1       ; Raw input buffer  
 
 
@@ -494,7 +499,7 @@ ZPEND    = *                    ; audit
         .DB $52, $03, $89, $53, $43, $41, $4C, $45, $20, $59, $20, $42, $59, $20, $32, $20, $46, $4F, $52, $20, $41, $53, $43, $49, $49, $20, $43, $48, $41, $52, $41, $43, $54, $45, $52, $20, $41, $53, $50, $45, $43, $54, $20, $52, $41, $54, $49, $4F, $0D  ; 850 REM SCALE Y BY 2 FOR ASCII CHARACTER ASPECT RATIO
         .DB $5C, $03, $9E, $59, $3D, $28, $52, $2D, $FF, $0D, $00, $29, $2A, $FF, $02, $00, $0D  ; 860 LET Y=(R-13)*2
         .DB $66, $03, $89, $27, $44, $27, $20, $49, $53, $20, $53, $51, $55, $41, $52, $45, $44, $20, $44, $49, $53, $54, $41, $4E, $43, $45, $2E, $20, $41, $56, $4F, $49, $44, $53, $20, $4E, $45, $45, $44, $49, $4E, $47, $20, $53, $51, $52, $54, $21, $0D  ; 870 REM 'D' IS SQUARED DISTANCE. AVOIDS NEEDING SQRT!
-        .DB $70, $03, $9E, $44, $3D, $58, $2A, $58, $2B, $59, $2A, $59, $0D  ; 880 LET D=X*X+Y*Y
+        .DB $70, $03, $9E, $44, $3D, $58, $5E, $FF, $02, $00, $2B, $59, $5E, $FF, $02, $00, $0D  ; 880 LET D=X^2+Y^2
         .DB $7A, $03, $81, $44, $3E, $FF, $84, $03, $9F, $82, $FF, $60, $04, $0D  ; 890 IF D>900 THEN GOTO 1120 (v15.20 fix: skip the L=C+1 update too, else TAB(C-L) is always 0 -- see changelog)
         .DB $84, $03, $89, $53, $43, $41, $4C, $45, $20, $54, $4F, $20, $2D, $31, $30, $30, $30, $20, $54, $4F, $20, $2B, $31, $30, $30, $30, $20, $52, $41, $4E, $47, $45, $20, $46, $4F, $52, $20, $49, $4E, $56, $45, $52, $53, $45, $20, $54, $52, $49, $47, $0D  ; 900 REM SCALE TO -1000 TO +1000 RANGE FOR INVERSE TRIG
         .DB $8E, $03, $89, $33, $30, $2A, $31, $30, $30, $30, $3D, $33, $30, $30, $30, $30, $20, $57, $48, $49, $43, $48, $20, $53, $41, $46, $45, $4C, $59, $20, $46, $49, $54, $53, $20, $49, $4E, $20, $31, $36, $2D, $42, $49, $54, $20, $53, $49, $47, $4E, $45, $44, $20, $49, $4E, $54, $0D  ; 910 REM 30*1000=30000 WHICH SAFELY FITS IN 16-BIT SIGNED INT
@@ -2796,10 +2801,8 @@ EP_loop:
         LDA CX_SAV
         CMP CY
         BCC EP_ovfl
-EP_mul: LDA CX                   ; CY *= CX  (safe: checked above)
-        STA T0
-        LDA CX+1
-        STA T0+1
+EP_mul: LDX #(CX-T0)             ; CY *= CX  (safe: checked above)
+        JSR TO_T0
         LDA CY
         STA T1
         LDA CY+1
@@ -2819,10 +2822,8 @@ EP_dlo: DEC                      ; 65C02 DEC A -- A still holds CZ's old low byt
         BNE EP_loop
 
 EP_sign:
-        LDA CY
-        STA T0
-        LDA CY+1
-        STA T0+1
+        LDX #(CY-T0)
+        JSR TO_T0
 
         BIT ATEMP                ; base was negative and exponent was odd?
         BPL EP_done
