@@ -188,7 +188,7 @@
   const romSelect = document.getElementById('rom');
   const argsInput = document.getElementById('args');
 
-  const CHUNK_INSTRUCTIONS = 5000;
+  const CHUNK_INSTRUCTIONS = 10000; // how many instructiosn to process per cycle - this is teh emulation speed limit
   const RUN_RUNNING = 0;
   const RUN_WAITING_INPUT = 1;
   const RUN_DONE = 2;
