@@ -71,7 +71,7 @@ Has bitwise operators and also CORDIC `SIN`/`COS` in degrees*1000.
 **Functions:** `ABS(n)` `SGN(n)` `ASC("c")` `PEEK(addr)` `USR(addr)` `RND` `SIN(deg)`  `COS(deg)`
 
 **Expressions:** 
-  * `MOD` `+` `-` `*` `/` `%`(mod)
+  * `MOD` `+` `-` `*` `/` `%`(mod) `^` (power)
   * `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)`
   * variables `A`–`Z` signed 16-bit integers, −32768 to 32767
   * Bitwise - `AND` `OR` `XOR` `NOT` 
@@ -79,9 +79,10 @@ Has bitwise operators and also CORDIC `SIN`/`COS` in degrees*1000.
 **Numbers:** signed 16-bit integers, −32768 to 32767. Relational operators return −1 (true) or 0 (false). `AND`/`OR`/`XOR`/`NOT` are bitwise.
 
 **Notes**
-- **`GOTO`/`GOSUB` accepts expressions** — `GOTO X`, `GOSUB BASE+N`, `GOTO 10*I` all work
-- **`MOD` keyword** — `10 MOD 3` is now an alternative to `10 % 3` (both give `1`)
-- **`RND`** — 16-bit Galois LFSR pseudo-random number, returns 1–32767; seeded at startup; useful as `RND MOD 6 + 1` for a die roll
+- **`^` Power** - base can be negative, exponent must be positive
+- **`GOTO`/`GOSUB` accepts expressions** - `GOTO X`, `GOSUB BASE+N`, `GOTO 10*I` all work
+- **`MOD` keyword** - `10 MOD 3` is now an alternative to `10 % 3` (both give `1`)
+- **`RND`** - 16-bit Galois LFSR pseudo-random number, returns 1–32767; seeded at startup; useful as `RND MOD 6 + 1` for a die roll
 - **`:` multi-statement** Is Line based - don't have `FOR`/`NEXT`, `FOR`/`FOR`, `GOSUB`/`GOSUB` or `GOSUB`/`RETURN` on same line - its still a Tiny BASIC, after all.
 
 **Errors** (printed as `XX ERR [IN line]`):
@@ -115,11 +116,12 @@ An expanded Tiny BASIC with 32bit Floating ppoint support (Still vars `A`-`Z`). 
   * Transcendental `LN(flt)`/`EXP(flt)` 
 
 **Expressions:** 
-  * `+` `-` `*` `/` `%`(mod) `^`(power, +ve base only)
+  * `+` `-` `*` `/` `%`(mod) `^` (power)
   * `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)` - Relational operators return −1 (true) or 0 (false)
   * variables `A`–`Z` 32 bit MBF4 float, ~6-7 significant decimal digits
 
 **Notes**
+- **`^` Power** - Base must be >= 0, Exponent can be negative (uses Ln) 
 - **`GOTO`/`GOSUB` accepts expressions** — `GOTO X`, `GOSUB BASE+N`, `GOTO 10*I` all work
 - **`MOD` keyword** — `10 MOD 3` is now an alternative to `10 % 3` (both give `1`)
 - **`RND`** — 16-bit Galois LFSR pseudo-random number, returns 0-1; seeded at startup
