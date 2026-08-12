@@ -1,5 +1,5 @@
 /*
- * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.19, Jul 2026)
+ * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.20, Aug 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
@@ -35,6 +35,13 @@
  *                   be-BRA, PHX/PHY/PLX/PLY/STZ peephole suggestions, plus the
  *                   general CMP/CPX/CPY #0 redundancy and no-op-immediate
  *                   checks). These never change emitted bytes -- info only.
+ *   -NoWarnConstRedef  Suppress the warning when a constant (NAME = EXPR) is
+ *                   redefined with a different value later in the file. A
+ *                   duplicate ':'-terminated LABEL is always a hard error
+ *                   regardless of this flag, as is a name used as both a
+ *                   label and a constant -- see sym_define()'s header
+ *                   comment for the full policy. Same-value redefinition
+ *                   never warns, flag or not.
  *   -D NAME         Predefine NAME as 1 for use with .IF NAME, as if
  *                   "NAME = 1" appeared before the source file. Repeatable.
  *   -D NAME=EXPR    Predefine NAME as EXPR (decimal, $hex, %binary, etc).
@@ -97,6 +104,22 @@
 
  /*
  *  VERSION HISTORY
+ * v1.20 (2026-08)
+ *   - Added duplicate/redefinition checking for labels and constants, via a
+ *     new sym_define() choke point that every label/equate/-D commit now
+ *     goes through instead of the old unchecked sym_set(). Symbol table
+ *     gained per-entry def_line/is_label tracking to support this.
+ *   - A duplicate ':'-terminated LABEL is always a hard error, as is a name
+ *     used as both a label and a constant -- Kowalski source has no way to
+ *     mark either as intentional, so both are treated as mistakes.
+ *   - A constant (NAME = EXPR) redefined with a different value later in the
+ *     file now warns (Kowalski syntax has no separate "may vary" directive,
+ *     so this is allowed but flagged); redefinition with the SAME value
+ *     never warns. Added -NoWarnConstRedef to suppress the warning case.
+ *   - -D NAME[=EXPR] predefines are now treated as though defined at line 0
+ *     for redefinition purposes, so a same-named equate on line 1 of the
+ *     source correctly triggers the same warning/silent-if-equal handling
+ *     as any other redefinition.
  *
  * v1.19 (2026-07)
  *   - Added --StrictKowalski, an independent CLI flag (freely combinable
@@ -126,8 +149,7 @@
  *     accepted to end-of-operand instead of raising an error.
  *   - Fixed .opt/.setcpu silently ignoring an unrecognized or malformed
  *     CPU-mode argument (missing closing quote, misspelled mode) instead
- *     of erroring -- cpu_mode was previously left unchanged with no
- *     diagnostic.
+ *     of erroring
  *   - Fixed find_binop()/find_cmpop() treating an operator-like character
  *     inside a 'x' char literal (e.g. the '+' in '+' , or the ',' in ',')
  *     as a real operator/separator; added mark_quoted() helper.
@@ -362,8 +384,25 @@ static int is_bbr_bbs(const char *mn) {
     return (mn[3] >= '0' && mn[3] <= '7');
 }
 
+/* v1.20: declared ahead of the symbol table below because sym_define()
+ * (below) reads it. Same lifetime/pattern as g_nowarn65c02/g_strict6502
+ * (see their header comment further down): CLI-set-once, never touched
+ * again after argument parsing. */
+static int g_nowarn_constredef = 0;
+
+/* v1.20: forward declarations -- sym_define() below reports duplicates
+ * through these, but their definitions (and the errors[]/warnings[]
+ * arrays behind them) live further down in the file, after the error/
+ * warning-list section comment. */
+static void add_error(int lineno, const char *msg);
+static void add_warning(int lineno, const char *msg);
+
 /* ── symbol table ────────────────────────────────────────────────────────── */
-typedef struct { char name[SYM_NAME_LEN]; int value; int used; } Symbol;
+/* v1.20: added def_line/is_label so sym_define() (below) can tell a
+ * genuine second definition apart from the same declaration being
+ * recomputed on a later pass, and tell a label from a constant. Plain
+ * sym_set() itself remains ignorant of both -- see sym_define(). */
+typedef struct { char name[SYM_NAME_LEN]; int value; int used; int def_line; int is_label; } Symbol;
 static Symbol   syms[MAX_SYMS];
 static int      nsyms = 0;
 
@@ -372,6 +411,21 @@ static int sym_find(const char *name) {
         if (!strcmp(syms[i].name, name)) return i;
     return -1;
 }
+/*
+ * sym_set (unchecked)
+ *   In:  name, value
+ *   Out: (none)
+ *   Clobbers: syms[]/nsyms
+ *
+ *   Low-level "just set it" primitive: inserts or overwrites `name`
+ *   with no duplicate/redefinition checking at all, and does not
+ *   touch def_line/is_label. Only two callers remain after v1.20:
+ *   asm_predefine()'s scratch pre-parse table (deliberately transient
+ *   -- see its header comment) and sym_define() itself, below. Every
+ *   other symbol commit in the assembler (labels, equates, and the
+ *   real per-assemble() -D injection) goes through sym_define()
+ *   instead so that duplicates are actually caught.
+ */
 static void sym_set(const char *name, int value) {
     int i = sym_find(name);
     if (i >= 0) { syms[i].value = value; return; }
@@ -379,8 +433,117 @@ static void sym_set(const char *name, int value) {
         strncpy(syms[nsyms].name, name, SYM_NAME_LEN-1);
         syms[nsyms].value = value;
         syms[nsyms].used = 0;
+        syms[nsyms].def_line = 0;
+        syms[nsyms].is_label = 0;
         nsyms++;
     }
+}
+/*
+ * sym_define (v1.20)
+ *   In:  name     -- symbol name, already de-scoped/stripped of its
+ *                     trailing ':' (label) or '=' (equate) marker
+ *        value    -- value to store
+ *        lineno   -- source line defining THIS occurrence. CLI -D
+ *                     predefines pass 0, i.e. "before line 1 of the
+ *                     file", matching -D's documented "as if NAME =
+ *                     EXPR appeared before the source file" semantics.
+ *        is_label -- 1 for a ':'-terminated label, 0 for a NAME=expr
+ *                     constant/equate.
+ *   Out: (none) -- reports duplicates via add_error()/add_warning().
+ *   Clobbers: syms[]/nsyms, nerrors/nwarnings (via add_error/add_warning)
+ *
+ *   Central choke point every label/equate/-D predefine commits
+ *   through. Kowalski source syntax has only one equate form (no
+ *   separate "this may vary" directive alongside a "this is fixed"
+ *   one -- see the v1.20 changelog entry), so constants and labels
+ *   are policed differently:
+ *
+ *     - New name: inserted via sym_set(), def_line/is_label stamped.
+ *     - Same name, same def_line as the stored entry: this is a later
+ *       pass (pass 1.5 re-resolving an equate, or pass 1.75 re-setting
+ *       a label after a .ORG delta) recomputing the SAME source
+ *       declaration, not a second definition -- value is updated
+ *       silently.
+ *     - Same name, different def_line, and either occurrence is a
+ *       label: always a hard error. A label is an address and must
+ *       have exactly one definition point; a label/constant name
+ *       collision is almost never intentional either way round. The
+ *       first definition's value is kept (not overwritten) so the
+ *       rest of assembly proceeds against a single, well-defined
+ *       value rather than silently drifting to whichever came last.
+ *     - Same name, different def_line, both constants: allowed (that
+ *       is the whole point of letting a value vary section to
+ *       section), but flagged -- silently if the value is unchanged
+ *       (e.g. a doubly-.INCLUDEd header, or -D matching line 1's own
+ *       value), otherwise a warning, unless -NoWarnConstRedef is on
+ *       the command line. Either way the new value replaces the old
+ *       one and def_line advances, so a third redefinition compares
+ *       against the second, not the first.
+ */
+static void sym_define(const char *name, int value, int lineno, int is_label) {
+    int i = sym_find(name);
+    if (i < 0) {
+        sym_set(name, value);
+        i = sym_find(name);
+        if (i >= 0) { syms[i].def_line = lineno; syms[i].is_label = is_label; }
+        return;
+    }
+    if (syms[i].def_line == lineno) {
+        syms[i].value = value;
+        return;
+    }
+    if (syms[i].is_label || is_label) {
+        char msg[ERR_LEN];
+        if (syms[i].is_label && is_label)
+            snprintf(msg, ERR_LEN, "Duplicate label '%s' (already defined at line %d)",
+                     name, syms[i].def_line);
+        else
+            snprintf(msg, ERR_LEN, "'%s' used as both a label and a constant "
+                                    "(already defined at line %d)", name, syms[i].def_line);
+        add_error(lineno, msg);
+        return;   /* first definition kept -- do not overwrite */
+    }
+    /* both constants */
+    if (syms[i].value != value && !g_nowarn_constredef) {
+        char msg[ERR_LEN];
+        snprintf(msg, ERR_LEN, "Constant '%s' redefined (was %d at line %d, now %d)",
+                 name, syms[i].value, syms[i].def_line, value);
+        add_warning(lineno, msg);
+    }
+    syms[i].value = value;
+    syms[i].def_line = lineno;
+}
+/*
+ * sym_update_value (v1.20)
+ *   In:  name, value
+ *   Out: (none)
+ *   Clobbers: syms[i].value for the matching entry, if any
+ *
+ *   Unchecked value refresh for symbols already committed via
+ *   sym_define() earlier in THIS SAME assemble() call. Duplicate/
+ *   redefinition detection only ever runs once, during pass 1's
+ *   single left-to-right walk over the source (see sym_define()) --
+ *   that is the one pass that visits each declaration line exactly
+ *   once, in file order, so it is the only pass where "have I seen
+ *   this name at a different line before" is a meaningful question.
+ *
+ *   Passes 1.5 (equate re-resolve, all equates now that every label
+ *   is known) and 1.75 (label re-set after an .ORG delta) replay
+ *   EVERY equate/label declaration line again, in the same file
+ *   order, purely to refresh values now that forward references can
+ *   be evaluated. Routing that replay back through sym_define() would
+ *   re-diagnose the exact same redefinitions pass 1 already reported
+ *   -- worse, it would misreport them, since by the time pass 1.5/1.75
+ *   run, syms[].def_line reflects only the LAST definition pass 1 saw,
+ *   so replaying earlier lines in file order looks like a fresh
+ *   redefinition against that stale def_line. sym_update_value() just
+ *   refreshes .value for the name's existing entry (created in pass 1;
+ *   if genuinely missing -- should not happen -- it is a silent no-op)
+ *   and leaves def_line/is_label, and diagnostics, untouched.
+ */
+static void sym_update_value(const char *name, int value) {
+    int i = sym_find(name);
+    if (i >= 0) syms[i].value = value;
 }
 static int sym_get(const char *name, int *out) {
     int i = sym_find(name);
@@ -2007,9 +2170,13 @@ static int assemble(const char *source) {
      * wiped above by nsyms=0, so this has to happen every assemble()
      * call, not just once at CLI-parse time. See cli_predefines[]'s
      * header comment for why this happens here (before pass 1) rather
-     * than as prepended source text. */
+     * than as prepended source text.
+     * v1.20: goes through sym_define() with lineno=0 -- a -D predefine
+     * is documented as "as if NAME = EXPR appeared before the source
+     * file", i.e. line 0, so a same-named equate on line 1 correctly
+     * reads as a redefinition (warn, or silent if the value matches). */
     for (int i = 0; i < n_cli_predefines; i++)
-        sym_set(cli_predefines[i].name, cli_predefines[i].value);
+        sym_define(cli_predefines[i].name, cli_predefines[i].value, 0, 0);
     g_scope[0] = '\0';
     cpu_mode = 0;   /* default: 65C02 mode */
     asm_stats.first_opcode_pc = -1;
@@ -2089,7 +2256,7 @@ static int assemble(const char *source) {
                                        "after a lo/hi-byte prefix operator)");
             int e = 0;
             int val = eval_expr(operand, pc, 0, &e);
-            sym_set(name, val);
+            sym_define(name, val, lineno, 0);
             continue;
         }
 
@@ -2110,7 +2277,7 @@ static int assemble(const char *source) {
                5-digit addresses like $10054 that disagreed with every
                other part of the assembler. */
             check_pc_overflow(pc, lineno);
-            sym_set(full, pc & 0xFFFF);
+            sym_define(full, pc & 0xFFFF, lineno, 1);
         }
 
         if (!mnem[0]) continue;
@@ -2220,7 +2387,7 @@ static int assemble(const char *source) {
         name[strlen(name)-1] = '\0';
         int e = 0;
         int val = eval_expr(info->operand, info->pc, 1, &e);
-        if (!e) sym_set(name, val);
+        if (!e) sym_update_value(name, val);
     }
 
     /* ── PASS 1.75: re-walk pc_map now equates are fully resolved ──────────
@@ -2270,7 +2437,7 @@ static int assemble(const char *source) {
                             strncpy(g_scope, fi_info->label[0]=='@' ? g_scope : fi_info->label,
                                     SYM_NAME_LEN-1);
                             scoped_name(full, fi_info->label);
-                            sym_set(full, fi_info->pc & 0xFFFF);
+                            sym_update_value(full, fi_info->pc & 0xFFFF);
                         }
                     }
                 }
@@ -2976,7 +3143,7 @@ static int parse_hex_range(const char *s, int *start, int *end) {
 
 static void asm_usage(FILE *out) {
     fprintf(out,
-        "asm65c02 v1.19 - Toy 65C02/6502 two-pass assembler\n"
+        "asm65c02 v1.20 - Toy 65C02/6502 two-pass assembler\n"
         "\n"
         "Copyright Vincent Crabtree 2026, MIT License, See LICENSE file\n"
         "\n"
@@ -3005,6 +3172,13 @@ static void asm_usage(FILE *out) {
         "               be-BRA, PHX/PHY/PLX/PLY/STZ peephole suggestions, plus the\n"
         "               general CMP/CPX/CPY #0 redundancy and no-op-immediate\n"
         "               checks). These never change emitted bytes -- info only.\n"
+        "  -NoWarnConstRedef  Suppress the warning issued when a constant (NAME =\n"
+        "               EXPR) is redefined with a different value later in the\n"
+        "               file. A duplicate ':'-terminated LABEL is always a hard\n"
+        "               error regardless of this flag, as is a name used as both\n"
+        "               a label and a constant. Redefining a constant with the\n"
+        "               SAME value (e.g. a doubly-.INCLUDEd header, or a -D that\n"
+        "               matches the source's own value) never warns, flag or not.\n"
         "  --StrictKowalski  Independent of -Strict6502/-NoWarn65c02 (freely\n"
         "               combinable with either) -- promotes every [Kowalski]\n"
         "               condition below from a warning to a hard error. Default\n"
@@ -3079,6 +3253,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-NoWarn65c02")) g_nowarn65c02 = 1;
         else if (!strcmp(argv[i], "-Strict6502"))  g_strict6502  = 1;
         else if (!strcmp(argv[i], "-NoWarnOptSize")) g_nowarn_optsize = 1;
+        else if (!strcmp(argv[i], "-NoWarnConstRedef")) g_nowarn_constredef = 1;
         else if (!strcmp(argv[i], "--StrictKowalski")) g_strict_kowalski = 1;
         else if (!strcmp(argv[i], "-D")) {
             if (i+1 >= argc) { fprintf(stderr, "-D requires an argument (NAME or NAME=EXPR)\n"); return 1; }
