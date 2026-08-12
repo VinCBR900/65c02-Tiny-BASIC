@@ -980,9 +980,6 @@ TKPN_lp:
         INC CURLN+1
         BRA TKPN_lp
 
-TKPN_dn: 
-        RTS
-
 ; =============================================================================
 ; TKPHEX ? parse hex digit run at T0 into CURLN (16-bit unsigned) (v15.20)
 ;   In:  T0   points just past the '$' (caller already consumed it)
