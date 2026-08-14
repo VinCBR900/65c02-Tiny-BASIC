@@ -1,5 +1,5 @@
 ; =============================================================================
-; JB-uBASIC6502 v1.8  --  2 KB Tiny BASIC (NMOS 6502) for John Bell 80-153 SBC
+; JB-uBASIC6502 v1.9  --  2 KB Tiny BASIC (NMOS 6502) for John Bell 80-153 SBC
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Note: Due to bitbang serial IO, either use the JB-Sim65c02 simulator for 
@@ -29,8 +29,8 @@ KOWALSKI   = 1
 ;   + - * / %   = < > <= >= <>   unary -
 ;   ABS(val)   FREE   PEEK(addr)   RND   USR(addr)   A-Z variables
 ;
-; Numbers      : signed 16-bit  (-32768 .. 32767)
-; String print : "literals", `;`, TAB(n) and CHR$(char); no string variables
+; Numbers : signed 16-bit  (-32768 .. 32767)
+; Print   : "literals", `;`, TAB(n), HEX$(val), CHR$(char); no string vars
 ;
 ; KNOWN LIMITATIONS
 ;
@@ -43,8 +43,7 @@ KOWALSKI   = 1
 ;   raises "?4 bad variable name".
 ;
 ; No `:` multi-statement separator, no FOR/NEXT, no arrays/DIM, no string
-;   variables -- see the Statements/Expressions lists above for the full
-;   accepted set.
+;   variables -- see the above list above for the full set.
 ;
 ; Numbers are signed 16-bit only (-32768..32767); arithmetic overflow
 ;   wraps silently (e.g. 32767+1 = -32768) -- it does not raise an error.
@@ -52,18 +51,18 @@ KOWALSKI   = 1
 ; Division and modulo by zero both raise "?2"; modulo follows the sign of
 ;   the dividend (truncating, C-style), not floored: (0-7)%3 = -1.
 ;
-; GOSUB nesting is limited to 8 levels; a 9th nested call raises "?3 out
+; GOTO/GOSUB accepts expressions 
+;   GOSUB nesting is limited to 8 levels; a 9th nested call raises "?3 out
 ;   of memory" rather than corrupting the return-frame stack.
-;
-; GOTO/GOSUB to an undefined line number raises "?1".
+;   GOTO/GOSUB to an undefined line number raises "?1".
 ;
 ; Input buffer is 40 usable chars + CR terminator. Each keypress past the
 ;   limit sounds BELL ($07) and is discarded -- not stored, not
-;   echoed, index does not advance. Backspace still deletes normally from
-;   a full buffer.
+;   echoed, index does not advance. Backspace deletes normally when buffer full
 ;
-; TAB(n) and CHR$(n) are valid only in PRINT line 
+; TAB(n), CHR$(n), HEX$(val) are valid only in PRINT line 
 ;   TAB(n) prints n=1..127 spaces, not jump to col n. Negative/Zero n ignored.
+;   HEX$(expr) prints $hex, leading zero suppressed due to size constraints.
 ;
 ; Error codes (printed as "?N"):
 ;   ?0  syntax / bad expression
@@ -81,9 +80,11 @@ KOWALSKI   = 1
 ;   Base $0180 to ceiling RAM_TOP ($0400 for 1 KB SRAM).
 ;   Line format:  <lineno_lo> <lineno_hi> <raw ASCII body> <CR>
 ;   No tokenisation; body bytes are stored exactly as typed.
+;
 ; ---- version lineage --------------------------------------------------------
-;   V1.8 (Jul 2026)   21 bytes free - Updated all subroutine headers.
-;   V1.7 (Jul 2026)   22 bytes free.  Fixed Kowalski-incompatible syntax in UNI_TAB 
+;   V1.9 (Aug 2026)   10 bytes free. Refactor Getch/Putch, Added HEX$(val) to PRINT.
+;   V1.8 (Jul 2026)   21 bytes free. Updated all subroutine headers.
+;   V1.7 (Jul 2026)   22 bytes free. Fixed Kowalski-incompatible syntax in UNI_TAB 
 ;                     `<(label-1), >(label-1)` rewritten as `.DW label-1` instead.
 ;                     Refactored GETLINE to Y counter, updated DELAY for ZP not Y.  
 ;   V1.6 (Jul 2026)   Fixed GETLINE buffer-overflow: GETCH echoed every character
@@ -98,7 +99,7 @@ KOWALSKI   = 1
 ;   V1.2 (Jul 2026)   29 bytes free before vectors. Ported GOSUB/RETURN, RND 
 ;                     from uBASIC6502 1.9. Refactor PNUM/DELINE/INSLINE/EDITLN
 ;                     for size/correctness. GOTOL updates CURLN bugfix.Refactor
-;                     DO_NEW. Clean-up partial ':' multi-statement support. 
+;                     DO_NEW. Remove partial ':' multi-statement support. 
 ;   V1.1 (Jun 2026)   Refactored for size, added FREE and TAB.
 ;   v1.0 (Jun 2026)   Initial Port from uBASIC6502 1.4
 ;
@@ -226,8 +227,8 @@ GOSUB_TOP  = GOSUB_LO+31   ; initial/empty GOSUB_SP value (topmost stack byte)
 ;   v1.1:  Mandelbrot column scan adjusted from -128..16 to -120..4
 ; =============================================================================
 
-         .DB $0A,$00,"REM uBASIC v1.4 - SHOWCASE",CR        ; 10 REM uBASIC - SHOWCASE
-         .DB $14,$00,"PRINT ",$22,"-- uBASIC v1.4 SHOWCASE --",$22,CR ; 20 PRINT "-- uBASIC SHOWCASE --"
+         .DB $0A,$00,"REM uBASIC SHOWCASE",CR        ; 10 REM uBASIC - SHOWCASE
+         .DB $14,$00,"PRINT ",$22,"-- uBASIC SHOWCASE --",$22,CR ; 20 PRINT "-- uBASIC SHOWCASE --"
          .DB $1E,$00,"PRINT ",$22,"--- PRINT / CHR$ ---",$22,CR ; 30 PRINT "--- PRINT / CHR$ ---"
          .DB $28,$00,"PRINT CHR$(65)",$3B,"CHR$(66)",$3B,"CHR$(67)",CR ; 40 PRINT CHR$(65);CHR$(66);CHR$(67)
          .DB $32,$00,"PRINT ",$22,"--- ARITHMETIC ---",$22,CR ; 50 PRINT "--- ARITHMETIC ---"
@@ -273,8 +274,8 @@ GOSUB_TOP  = GOSUB_LO+31   ; initial/empty GOSUB_SP value (topmost stack byte)
          .DB $C2,$01,"PRINT ",$22,"col1",$22,$3B,"TAB(3)",$3B,$22,"col2",$22,$3B,"TAB(3)",$3B,$22,"col3",$22,CR ; 450 PRINT "col1";TAB(3);"col2";TAB(3);"col3"
          .DB $CC,$01,"PRINT ",$22,"bytes free:",$22,$3B,"FREE",CR      ; 460 PRINT "bytes free:"; FREE
          .DB $E0,$01,"PRINT ",$22,"--- POKE / PEEK ---",$22,CR ; 480 PRINT "--- POKE / PEEK ---"
-         .DB $EA,$01,"POKE 900,42",CR                       ; 490 POKE 900,42
-         .DB $F4,$01,"PRINT ",$22,"poked 42, read back ",$22,$3B,"PEEK(900)",CR ; 500 PRINT "poked 42, read back ";PEEK(900)
+         .DB $EA,$01,"POKE 255,170",CR                       ; 490 POKE 255,170
+         .DB $F4,$01,"PRINT ",$22,"poked 170, read back ",$22,$3B,"HEX$(PEEK(255))",CR ; 500 PRINT "poked 170, read back ";HEX$(PEEK(255))
          .DB $FE,$01,"PRINT ",$22,"--- RND ---",$22,CR      ; 510 PRINT "--- RND ---"
          .DB $08,$02,"PRINT RND",$3B,$22," ",$22,$3B,"RND",$3B,$22," ",$22,$3B,"RND",$3B,$22," ",$22,$3B,"RND",$3B,$22," ",$22,$3B,"RND",CR ; 520 PRINT RND;" ";RND;" ";RND;" ";RND;" ";RND
          .DB $12,$02,"I=1",CR                               ; 530 I=1
@@ -311,7 +312,7 @@ GOSUB_TOP  = GOSUB_LO+31   ; initial/empty GOSUB_SP value (topmost stack byte)
          .DB $48,$03,"I=I+6",CR                             ; 840 I=I+6
          .DB $52,$03,"GOTO 630",CR                          ; 850 GOTO 630
          .DB $5C,$03,"END",CR                               ; 860 END
-SHOWCASE_END:	.DB 0
+SHOWCASE_END:	.DW 0
 
         .ENDIF
 
@@ -338,9 +339,9 @@ T_K   = 203              ; $4B + $80  ('K' -- BREAK, PEEK)
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
         .IF KOWALSKI
-STR_BANNER: .DB "uBASIC6502 v1.8"  ; startup banner, rolls into CRLF
+STR_BANNER: .DB "uBASIC6502 v1.9"  ; startup banner, rolls into CRLF
         .ELSE
-STR_BANNER: .DB "JB uBASIC v1.8"  ; startup banner, rolls into CRLF
+STR_BANNER: .DB "JB uBASIC v1.9"  ; startup banner, rolls into CRLF
         .ENDIF
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
@@ -408,6 +409,7 @@ KW_FREE:  .DB "FR"              ; 0-arg
 KW_THEN:  .DB "TH"
 KW_CHRS:  .DB "CH"
 KW_TAB:   .DB "TA"
+KW_HEX:   .DB "HE"
 
 FUNC_TAB_OFF = FUNC_TAB-UNI_TAB
 
@@ -436,13 +438,14 @@ INIT:
          STA PE               ; Replace with `JSR DO_NEW` for clean program (ROM)
          LDA #>SHOWCASE_END
          STA PE+1
-        .ELSE
+        .ENDIF
+
          ; --- 6522 VIA setup: PA0 = TX output, PA1-PA7 = inputs ---
          LDA #VIA_TX          ; DDRA: bit 0 = output, bits 1-7 = input
          STA VIA_DDRA
          LDA #VIA_TX          ; TX line idles HIGH (mark = logic 1)
          STA VIA_ORA
-        .ENDIF
+
         ;  STR_BANNER
          LDA #<STR_BANNER
          JSR PUTSTR           ; print banner + CR+LF
@@ -450,7 +453,6 @@ INIT:
          JSR DO_FREE          ; Free bytes      
          JSR PRT16            ; print  
          JSR PRNL
-         
          ; fall through into MAIN
 
 ; =============================================================================
@@ -813,7 +815,7 @@ DP_CHR: LDX #KW_CHRS-UNI_TAB
 
 DP_TAB:  LDX #KW_TAB-UNI_TAB    ; x destroyed so reload 
          JSR MTCHKW           ; matched "TAB"?
-         BCS DP_NORM
+         BCS DP_HEX
          JSR E2_PAR           ; Yes it is, Swallow `(`, get value, and swallow closing `)`
 	 LDY T0               ; get number of Spaces 
          BMI DP_AFT           ; Ignore negative
@@ -823,6 +825,14 @@ DP_TLOOP:
          JSR PUTCH 
          DEY
          BPL DP_TLOOP         ; always taken
+
+DP_HEX:
+         LDX #KW_HEX-UNI_TAB
+         JSR MTCHKW           ; matched "CHR$"?
+         BCS DP_NORM
+         JSR E2_PAR           ; Yes it is, Swallow `(`, get value, and swallow closing `)`
+         JSR PRT_HEX
+         BNE DP_AFT            ; PUTCH always leaves A=VIA_TX=1 (Z=0): unconditional   
 
 DP_NORM: JSR EXPR             ; numeric expression
          JSR PRT16
@@ -983,22 +993,6 @@ GO_DO:   JSR GOTOL            ; find line: C=0 found, C=1 not found
          JMP RUNGO            ; jump into run loop
 
 ; =============================================================================
-; GET_TWO_ARGS  --  shared helper: parse "expr,expr"
-;
-;   In:  IP -> first expression text
-;   Out: T4 = first arg value, T0 = second arg value, IP advanced past both
-;   Clobbers: A X Y T0 T1 T2 T4 IP  (same as EXPR/EAT_EXPR, which do the
-;             actual parsing)
-; =============================================================================
-GET_TWO_ARGS:
-         JSR EXPR              ; first arg -> T0
-         LDA T0
-         STA T4
-         LDA T0+1
-         STA T4+1
-         JMP EAT_EXPR          ; Tail Call skip spaces, eat ',', second arg -> T0
-
-; =============================================================================
 ; DO_LIST  --  LIST [n,m]  :  print program lines, optional range
 ;
 ;   In:  IP -> optional "n,m" range digits, or CR/end-of-statement for
@@ -1050,7 +1044,7 @@ LS_LN:   JSR PE_CMP
          SBC T1+1
          BCC LS_SKIP
          JSR PRT16             ; in range: print it
-         LDY #0                ; PRT16's contract doesn't guarantee Y on exit
+;         LDY #0                ; PRT16's contract doesn't guarantee Y on exit
          LDA #' '
          JSR PUTCH
          JSR ADD2_LP            ; advance LP past the 2-byte header for the body walk
@@ -1180,8 +1174,8 @@ SK_LP:   JSR GETCI            ; advance IP past CR (SKIPEOL inlined)
 ;   Clobbers: A X PE Zero Page(e.g. VARS)
 ; =============================================================================
 DO_NEW:
-         LDX #$ff
          LDA #0
+         TAX
 INIT_Z:  STA 0,X              ; clear zero-page byte at X
          DEX
          BNE INIT_Z
@@ -1323,13 +1317,27 @@ GT_R:    CLC
          RTS
 
 ; =============================================================================
-; EAT_EXPR  --  skip spaces, consume one char (e.g. '('), evaluate expression
+; GET_TWO_ARGS  --  shared helper: parse "expr,expr"
 ;
+;   In:  IP -> first expression text
+;   Out: T4 = first arg value, T0 = second arg value, IP advanced past both
+;   Clobbers: A X Y T0 T1 T2 T4 IP  (same as EXPR/EAT_EXPR, which do the
+;             actual parsing)
+; =============================================================================
+GET_TWO_ARGS:
+         JSR EXPR              ; first arg -> T0
+         LDA T0
+         STA T4
+         LDA T0+1
+         STA T4+1
+;         JMP EAT_EXPR          ; Tail Call skip spaces, eat ',', second arg -> T0
+        ; drop through
+; =============================================================================
+; EAT_EXPR  --  skip spaces, consume one char (e.g. '('), evaluate expression
+;   Consumes one char (e.g. opening '('), then falls through into EXPR.
 ;   In:  IP -> char to consume (leading spaces skipped first)
 ;   Out: T0 = expression result; IP advanced past expression
 ;   Clobbers: A X Y T0 T1 T2 IP
-;
-;   Consumes one char (e.g. opening '('), then falls through into EXPR.
 ; =============================================================================
 EAT_EXPR:
          JSR WEAT             ; skip spaces then consume one char
@@ -1995,7 +2003,7 @@ RTS_1:   RTS
 ; =============================================================================
 UCIP:    LDY #0
          LDA (IP),Y
-        BNE UC  ; always taken as BASIC lines never contain a nul
+         BNE UC  ; always taken as BASIC lines never contain a nul
 
 ; =============================================================================
 ; WSKIP / WPEEK  --  skip spaces; return first non-space in A
@@ -2018,44 +2026,56 @@ WPEEK:   LDY #0
          BNE WSKIP            ; always taken (' ' = $20, nonzero)
 
 ; =============================================================================
-; PRT16  --  print T0 as a signed decimal integer
-;
-;   In:  T0 = signed 16-bit value
-;   Out: decimal digits printed to terminal; T0 destroyed
-;   Clobbers: A Y T0
-;
-;   Algorithm: 16-bit shift-and-subtract BCD extraction; recursive so digits
-;   print highest-first without a digit buffer.
-;   Falls through into PUTCH to print the final (lowest) digit.
+; PRT_HEX / PRT16 - Unified Variable-Width Printer
+; In: T0 (16-bit value). T1 is used as scratch for the Base.
+;   Clobbers: A Y T0 T1
+; =============================================================================
+; =============================================================================
+; PRT_HEX / PRT16 - Unified Variable-Width Printer (Ultra-Golfed)
+; In: T0 (16-bit value). T1 is used as scratch for the Base.
 ; =============================================================================
 PRT16:
-         LDA T0+1
-         BPL PRT16GO          ; positive: skip sign handling
-         LDA #'-'
+         LDA T0+1           ; Check sign of T0
+         BPL PRT16_POS      ; If positive, skip negation
+         LDA #'-'           ; Print '-'
          JSR PUTCH
-         JSR NEG16
-PRT16GO:
-         LDY #16
-         LDA #0
-PRT16DIV:
+         JSR NEG16          ; Absolute value of T0
+PRT16_POS:
+         LDA #10            ; A = 10 (Dec Base)
+         BNE PRT_MERGE      ; Unconditional jump over Hex (10 is not 0!)
+PRT_HEX:
+         LDA #'$'           ; Print '$' prefix
+         JSR PUTCH
+         LDA #16            ; A = 16 (Hex Base)
+PRT_MERGE:
+         STA T1             ; Store Radix (10 or 16)
+PRT_LOOP_INIT:
+         LDY #16            ; Setup 16-bit division
+         LDA #0             ; Clear remainder
+PRT_DIV_LOOP:
          ASL T0
          ROL T0+1
-         ROL                  ; shift MSB of T0 into remainder (in A)
-         CMP #10
-         BCC PRT16SKP
-         SBC #10
+         ROL                ; ROL A (accumulates remainder)
+         CMP T1             ; Compare against Radix in T1
+         BCC PRT_SKIP
+         SBC T1
          INC T0
-PRT16SKP:
+PRT_SKIP:
          DEY
-         BNE PRT16DIV
-         PHA                  ; push remainder digit
+         BNE PRT_DIV_LOOP
+         PHA                ; Push remainder (0-9 or 0-15)
          LDA T0
          ORA T0+1
-         BEQ PRT16PRNT        ; quotient zero: most-significant digit
-         JSR PRT16GO          ; recurse to print more-significant digits first
-PRT16PRNT:
-         PLA
-         ORA #'0'             ; convert 0-9 to ASCII '0'-'9'
+         BEQ PRT_PRNT       ; If quotient is 0, we are done recursing
+         JSR PRT_LOOP_INIT  ; Recurse for next MSB digit (T1 is preserved!)
+PRT_PRNT:
+         PLA                ; Pop remainder
+PRT_HEXN:
+         ORA #$30           ; Convert 0-15 to ASCII
+         CMP #$3A
+         BCC PRT_HEXN_OK
+         ADC #$06           ; Adjust for A-F
+PRT_HEXN_OK:
          ; fall through into PUTCH
 
 ; =============================================================================
@@ -2088,51 +2108,42 @@ GETCH:   JSR RND_SHUFFLE
          LDA IO_IN
          BEQ GETCH          ; spin until a char is available
          RTS
+
 	.ELSE
 ; =============================================================================
-; PUTCH  --  transmit one character via 6522 VIA PA0 (1200 baud @ 1 MHz)
-;   In:  A = character to transmit
-;   Out: TX line left high (idle mark state)
-;   Clobbers: A, X, T3, T4 (Preserves Y)
+; PUTCH  --  Transmit character in A via 6522 VIA PA0 (1200 baud @ 1 MHz)
+;   Out: character sent; T3 destroyed
+;   Clobbers: A, X, T3, T4
 ; =============================================================================
 PUTCH:
-         STA T3              ; Save character to shift out
-
-         ; --- Start bit: TX = 0 ---
-         LDA #$00
-         STA VIA_ORA
-         JSR DELAY_BIT
-
-         ; --- 8 data bits, LSB first ---
-         LDX #8
-PC_LOOP: LSR T3              ; Bit 0 -> Carry
-         LDA #$00
-         ROL                 ; A = 0 + Carry (0 or 1) -- 1 byte smaller than ADC
-         STA VIA_ORA         ; Drive bit on PA0
-         JSR DELAY_BIT       ; Delay ~818 cy (+14 cy loop = 832 cy total bit time)
-         DEX
-         BNE PC_LOOP
-
-         ; --- Stop bit: TX = 1 ---
-         LDA #VIA_TX
-         STA VIA_ORA
-         RTS
+         STA T3              ; 2 bytes - Save character
+         LDX #10             ; 2 bytes - Send 10 bits total (Start + 8 Data + Stop)
+         CLC                 ; 1 byte  - Seed Carry with 0 for the Start bit
+PC_LOOP:
+         LDA #$00            ; 2 bytes 
+         ROL                 ; 1 byte  - A = Carry (0 or 1)
+         STA VIA_ORA         ; 3 bytes - Drive bit on PA0
+         JSR DELAY_BIT       ; 3 bytes - Delay ~818 cy 
+         SEC                 ; 1 byte  - Seed Stop bits (1s fill in from the top)
+         ROR T3              ; 2 bytes - Data bit -> Carry, 1 -> MSB
+         DEX                 ; 1 byte
+         BNE PC_LOOP         ; 2 bytes
+         RTS                 ; 1 byte
 
 ; =============================================================================
-; DELAY_BIT / DELAY_HALF  --  serial timing delays for 1200 baud @ 1 MHz
-;   In:  Entry point selects delay count
+; DELAY_BIT / DELAY_HALF  --  timing delays for 1200 baud @ 1 MHz
 ;   Out: T4 = 0, Z=1
 ;   Clobbers: A, T4
 ; =============================================================================
 DELAY_BIT:
-         LDA #100            ; Full bit delay count (~818 cycles)
-         .DB $2C             ; BIT abs trick (skips 'LDA #50')
+         LDA #100            ; 2 bytes - Full bit delay count (~818 cycles)
+         .DB $2C             ; 1 byte  - BIT abs trick (swallows 'LDA #50')
 DELAY_HALF:
-         LDA #50             ; Half bit delay count (~416 cycles)
-         STA T4
-DL_LOOP: DEC T4              ; 5 cycles
-         BNE DL_LOOP         ; 3 cycles (8 cycles per loop iteration)
-         RTS
+         LDA #50             ; 2 bytes - Half bit delay count (~416 cycles)
+         STA T4              ; 2 bytes
+DL_LOOP: DEC T4              ; 2 bytes - 5 cycles
+         BNE DL_LOOP         ; 2 bytes - 3 cycles (8 cycles per loop iteration)
+         RTS                 ; 1 byte
 
 ; =============================================================================
 ; GETCH  --  receive one character via 6522 VIA PA1 (1200 baud @ 1 MHz)
@@ -2140,27 +2151,24 @@ DL_LOOP: DEC T4              ; 5 cycles
 ;   Clobbers: A, X, T3, T4 (Preserves Y)
 ; =============================================================================
 GETCH:   
-GC_WAIT: JSR RND_SHUFFLE     ; Harvest keystroke timing entropy for RNG seed
-         LDA VIA_ORA
-         AND #VIA_RX         ; Test PA1 (RX line)
-         BNE GC_WAIT         ; Non-zero = mark (idle high): keep waiting
+GC_WAIT: JSR RND_SHUFFLE     ; 3 bytes - Harvest keystroke timing entropy
+         LDA VIA_ORA         ; 3 bytes
+         AND #VIA_RX         ; 2 bytes - Test PA1 (RX line)
+         BNE GC_WAIT         ; 2 bytes - Non-zero = mark (idle high): wait
+         
+         JSR DELAY_HALF      ; 3 bytes - Advance to mid-point of Start bit       
+         ; --- Read 9 bits: Start bit + 8 Data bits ---
+         LDX #9              ; 2 bytes
+GC_LOOP: LDA VIA_ORA         ; 3 bytes - Sample Port A
+         LSR                 ; 1 byte  - PA0 -> Carry
+         LSR                 ; 1 byte  - PA1 (RX bit) -> Carry
+         ROR T3              ; 2 bytes - Shift RX into MSB of T3
+         JSR DELAY_BIT       ; 3 bytes - Delay 1 bit time to next bit center
+         DEX                 ; 1 byte
+         BNE GC_LOOP         ; 2 bytes      
+         LDA T3              ; 2 bytes - Return received character in A
+         RTS                 ; 1 byte  - (Start bit safely discarded into Carry!)
 
-         ; --- Align to center of Data Bit 0 ---
-         JSR DELAY_HALF      ; Advance to mid-point of Start bit (~420 cy)
-         JSR DELAY_BIT       ; Advance to mid-point of Bit 0 (~1254 cy total)
-
-         ; --- Sample 8 data bits LSB first into T3 ---
-         LDX #8
-GC_LOOP: LDA VIA_ORA         ; Sample Port A
-         LSR                 ; PA0 -> Carry
-         LSR                 ; PA1 (RX bit) -> Carry
-         ROR T3              ; Shift Carry into MSB of T3
-         JSR DELAY_BIT       ; Delay ~818 cy (+18 cy loop = 836 cy total bit time)
-         DEX
-         BNE GC_LOOP
-
-         LDA T3              ; Return received character in A
-         RTS
 	.ENDIF
 
 ROMEND: ; for auditing
