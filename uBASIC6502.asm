@@ -1,5 +1,5 @@
 ; =============================================================================
-; JB-uBASIC6502 v1.9  --  2 KB Tiny BASIC (NMOS 6502) for John Bell 80-153 SBC
+; JB-uBASIC6502 v1.11  --  2 KB Tiny BASIC (NMOS 6502) for John Bell 80-153 SBC
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Note: Due to bitbang serial IO, either use the JB-Sim65c02 simulator for 
@@ -16,8 +16,9 @@ KOWALSKI   = 1
 ;   NMI    : NMI is unused. 
 ;
 ; RAM layout for 1 KB target:
-;   $0000-$008C  zero-page (IP/CURLN/PE/LP/T0-T2/RUN/OP/IBUF/T3
-;                VARS/RUNSP/GOSUB_SP/GOSUB stack)
+;   $0000-$007F  zero-page (IP/CURLN/PE/LP/T0-T4/RUN/IBUF
+;                VARS/RUNSP/GOSUB_SP/GOSUB stack); ZPEND=$7F, fits the
+;                $80-$FF/$180-$1FF hardware-stack RAM alias constraint
 ;   $0100-$017F  Hardware stack (page 1, mandatory)
 ;   $0180-$03FF  BASIC program store (RAM_TOP=$0400)
 ;
@@ -52,11 +53,11 @@ KOWALSKI   = 1
 ;   the dividend (truncating, C-style), not floored: (0-7)%3 = -1.
 ;
 ; GOTO/GOSUB accepts expressions 
-;   GOSUB nesting is limited to 8 levels; a 9th nested call raises "?3 out
+;   GOSUB nesting is limited to 4 levels; a 5th nested call raises "?3 out
 ;   of memory" rather than corrupting the return-frame stack.
 ;   GOTO/GOSUB to an undefined line number raises "?1".
 ;
-; Input buffer is 40 usable chars + CR terminator. Each keypress past the
+; Input buffer is 35 usable chars + CR terminator. Each keypress past the
 ;   limit sounds BELL ($07) and is discarded -- not stored, not
 ;   echoed, index does not advance. Backspace deletes normally when buffer full
 ;
@@ -82,6 +83,15 @@ KOWALSKI   = 1
 ;   No tokenisation; body bytes are stored exactly as typed.
 ;
 ; ---- version lineage --------------------------------------------------------
+;   V1.11 (Aug 2026)  11 bytes free before vectors
+;                     BUG FIX: EXPR1 stashed operator in OP, but is recursive, 
+;                     so parenthesized sub-expression with another */,/,%
+;                     clobbered it (e.g. "2*(10/5)" ran as division).
+;                     Operator now held on the hw stack across the call,
+;                     popped into T3 (mirrors EXPR_ADD's existing pattern).
+;                     EXPR's relational-mask stash moved OP->T3 too.
+;   V1.10 (Aug 2026)  Zero page optimised to $80 bytes: 8->4 GOSUB levels, T3, OP
+;                     IBUF_MAX 41->36 (42->37 bytes). No logic changes.
 ;   V1.9 (Aug 2026)   10 bytes free. Refactor Getch/Putch, Added HEX$(val) to PRINT.
 ;   V1.8 (Jul 2026)   21 bytes free. Updated all subroutine headers.
 ;   V1.7 (Jul 2026)   22 bytes free. Fixed Kowalski-incompatible syntax in UNI_TAB 
@@ -125,7 +135,7 @@ RAM_TOP  = $0400             ; Bell board has 1k SRAM (1 KB: 2x 2114)
 
 HWSTACK  = $7f               ; Give more space to PROG
 PROG     = $101 + HWSTACK    ; Prog Start above Stack 
-IBUF_MAX = 41                ; highest valid index into IBUF
+IBUF_MAX = 36                ; highest valid index into IBUF
 CR       = $0D               ; ASCII carriage return
 LF       = $0A               ; ASCII line feed
 BS       = $08               ; ASCII backspace
@@ -159,7 +169,7 @@ T1:         .RS 2              ; 16-bit: secondary scratch word
         
 ; Note IP and CURLN must be sequential for GOSUB/RETURN stack push
 T2:         .RS 2              ; 16-bit: tertiary scratch word / STMT jump target
-T3:         .RS 2              ; 16-bit: PNUM x10-multiply scratch, RXCHAR/TXCHAR
+T3:         .RS 1              ; 8-bit:  PNUM x10-multiply scratch hi, RXCHAR/TXCHAR
 T4:         .RS 2              ; 16-bit: General scratch, DO_POKE, DELAY, free for others
 IP:         .RS 2              ; 16-bit: interpreter pointer
 CURLN:      .RS 2              ; 16-bit: currently-executing line number
@@ -167,10 +177,9 @@ PE:         .RS 2              ; 16-bit: program end (one past last byte)
 LP:         .RS 2              ; 16-bit: line pointer / multi-purpose scratch
 RND_SEED:   .RS 2              ; 16-bit: Galois LFSR state for RND 
 RUN:        .RS 1              ; 8-bit:  run flag ($00 = immediate, $FF = running)
-OP:         .RS 1              ; 8-bit:  saved operator for MUL/DIV/MOD ('*'/'/'/'%')
 RUNSP:      .RS 1              ; 8-bit:  stack-pointer snapshot for GOTO/BREAK unwind
 GOSUB_SP:   .RS 1              ; 8-bit:  GOSUB/RETURN stack pointer (holds ZP address directly)
-GOSUB_LO:   .RS 32             ; base of the 8-level GOSUB return-frame stack (32 bytes)
+GOSUB_LO:   .RS 16             ; base of the 4-level GOSUB return-frame stack (16 bytes)
 VARS:       .RS 52             ; 52-byte variable store (A-Z, 2 bytes each)
 IBUF:       .RS IBUF_MAX+1     ; Input line buffer 
 ZPEND:		; audit
@@ -188,22 +197,27 @@ ZPEND:		; audit
 ;          dispatch rewrite -- MATCH_DISPATCH doesn't touch T2 at all now)
 ;   T3   : (a) PNUM's x10-multiply scratch, live only during decimal
 ;          parsing/printing; (b) bitbang GETCH/PUTCH's RXCHAR/TXCHAR shift
-;          register, live only during serial I/O. Never concurrent: PNUM
-;          runs during parsing, GETCH/PUTCH during I/O, not both at once.
+;          register, live only during serial I/O; (c) EXPR's relational
+;          mask / EXPR1's MUL-DIV-MOD operator stash (v1.11), live only
+;          after the operator's own recursive right-operand evaluation
+;          has fully returned -- the operator itself is held on the
+;          hardware stack, not T3, during that recursive call, which is
+;          what fixes v1.10's "2*(10/5)" nested-parens bug (a fixed ZP
+;          byte there got clobbered by the inner EXPR1 re-entry). Never
+;          concurrent with (a)/(b): no PNUM or serial I/O call happens
+;          between EXPR/EXPR1 popping the operator and its last use.
 ;   T4   : (a) DO_POKE/GET_TWO_ARGS' first-argument holder, live only
 ;          within a single POKE/LIST-range statement's own execution;
 ;          (b) DELAY_BIT/DELAY_HALF's countdown counter, live only during
 ;          a single bit-time delay. Never concurrent: DO_POKE's body
 ;          doesn't call PUTCH between setting T4 and reading it back.
-;   OP   : relational/MUL-DIV-MOD operator stash -- live only within
-;          EXPR/EXPR1's own scan-operator-then-apply window
 ;   LP   : line-store scan pointer -- shared by EDITLN, GOTOL, DO_LIST,
 ;          LSKIP, DELINE, PE_CMP, INSLINE; each call fully consumes LP
 ;          before any nested call that might also use it
 ; -------------------------------------------------------------------------
 ; Defined here so no forward reference
 GOSUB_FULL = GOSUB_LO+3    ; lowest X for which a full 4-byte push still fits 
-GOSUB_TOP  = GOSUB_LO+31   ; initial/empty GOSUB_SP value (topmost stack byte)
+GOSUB_TOP  = GOSUB_LO+15   ; initial/empty GOSUB_SP value (topmost stack byte)
 
         .IF KOWALSKI
 	.ORG PROG
@@ -339,9 +353,9 @@ T_K   = 203              ; $4B + $80  ('K' -- BREAK, PEEK)
 ; ---- human-readable strings -------------------------------------------------
 ; Last byte of each string has bit 7 set; PUTSTR masks it before printing.
         .IF KOWALSKI
-STR_BANNER: .DB "uBASIC6502 v1.9"  ; startup banner, rolls into CRLF
+STR_BANNER: .DB "uBASIC6502 v1.11"  ; startup banner, rolls into CRLF
         .ELSE
-STR_BANNER: .DB "JB uBASIC v1.9"  ; startup banner, rolls into CRLF
+STR_BANNER: .DB "JB uBASIC v1.11"  ; startup banner, rolls into CRLF
         .ENDIF
 STR_CRLF:   .DB CR, T_LF       ; CR + LF
 STR_IN:     .DB " IN", T_SP    ; " IN " (error annotation: " IN <linenum>")
@@ -1349,7 +1363,7 @@ EAT_EXPR:
 ;   In:  IP -> expression text
 ;   Out: T0 = signed 16-bit result; true=$FFFF, false=$0000
 ;        IP advanced past expression
-;   Clobbers: A X Y T0 T1 T2 OP IP
+;   Clobbers: A X Y T0 T1 T2 T3 IP
 ;
 ;   Operator bitmask built in X: LT=1  EQ=2  GT=4
 ;   Signed comparison uses the N XOR V trick (BVC / EOR #$80 / BMI) so no
@@ -1387,7 +1401,7 @@ RL_DONE: CPX #0               ; any relational operator found?
          PHA                  ; push mask onto stack
          JSR EXPR_ADD         ; right operand -> T0
          PLA                  ; pop mask
-         STA OP               ; stash in OP (ZP $0F, idle during eval)
+         STA T3               ; stash mask in T3 (idle here, no calls before use)
          PLA                  ; left hi (pushed second, pops first)
          STA T1+1
          PLA                  ; left lo
@@ -1423,7 +1437,7 @@ RL_NO_FLIP:
 RL_IS_LT:
          LDA #1               ; LT
 
-RL_TEST: AND OP               ; result bit AND operator mask
+RL_TEST: AND T3               ; result bit AND operator mask
          BEQ REL_F            ; no overlap -> false
          LDA #$FF             ; must be true
 	 .DB $2C              ; Executes "BIT $00A9" (swallows LDA #0)
@@ -1484,12 +1498,20 @@ EA_SUM:  CLC
 ; EXPR1  --  multiplicative level: * / %  (merged MUL/DIV/MOD kernel)
 ;   In:  IP -> expression text
 ;   Out: T0 = result; IP advanced
-;   Clobbers: A X Y T0 T1 T2 OP IP
+;   Clobbers: A X Y T0 T1 T2 T3 IP
 ;
-;   The operator ('*', '/', or '%') is saved in OP so a single sign-correction
-;   preamble and postamble serves all three operations.  '/' and '%' both use
-;   the DIV kernel; they differ only in which of quotient (T1) or remainder
-;   (T2) is copied to T0 as the result.
+;   The operator ('*', '/', or '%') is held on the hardware stack across
+;   the recursive right-operand evaluation (JSR EXPR2), then popped into
+;   T3, so a single sign-correction preamble and postamble serves all
+;   three operations.  '/' and '%' both use the DIV kernel; they differ
+;   only in which of quotient (T1) or remainder (T2) is copied to T0 as
+;   the result.
+;
+;   v1.11 FIX: operator used to be stashed directly in a fixed ZP byte
+;   (OP) before the recursive call, which a parenthesized sub-expression
+;   containing another */,/,% would silently clobber (e.g. "2*(10/5)"
+;   ran as division). Now preserved on the hardware stack instead, which
+;   is recursion-safe, and the OP byte has been removed entirely.
 ; =============================================================================
 EXPR1:
          JSR EXPR2
@@ -1524,7 +1546,7 @@ E1_DB:   ASL T1               ; shift dividend left into T2 (shift-subtract meth
          INC T1               ; quotient bit = 1
 E1_DS:   DEY
          BNE E1_DB
-         LDA OP               ; MOD ('%'): use remainder in T2; else quotient T1
+         LDA T3               ; MOD ('%'): use remainder in T2; else quotient T1
          CMP #'%'
          BEQ E1_MOD
          LDA T1               ; copy quotient to T0
@@ -1539,7 +1561,13 @@ E1_MOD:  LDA T2               ; '%': copy remainder (T2) to T0
          JMP E1_SIGN
 
 ; --- MUL/DIV dispatch (operator fetch, sign determination, kernel select) ----
-E1_MD:   STA OP               ; save operator ('*', '/', or '%')
+;   v1.11 FIX: operator is pushed on the hardware stack (not stashed in a
+;   fixed ZP byte) across the JSR EXPR2 below, because EXPR2 can recurse
+;   back into EXPR1 for a parenthesized sub-expression containing another
+;   */,/,% -- a fixed-byte stash would get clobbered by that inner call
+;   (e.g. "2*(10/5)" silently ran as division). Popped into T3 once the
+;   recursive call is done and it's safe to hold a scratch value again.
+E1_MD:   PHA                  ; save operator on hw stack (survives recursion)
          JSR GETCI            ; consume operator
          LDA T0               ; push left operand (will become T1)
          PHA
@@ -1550,7 +1578,8 @@ E1_MD:   STA OP               ; save operator ('*', '/', or '%')
          STA T1+1
          PLA
          STA T1
-         LDA OP
+         PLA
+         STA T3               ; pop operator into scratch (T3 idle here); A still holds it
          CMP #'*'             ; zero-div check for '/' and '%' (not '*')
          BEQ E1_NOCHK
          LDA T0               ; division/mod: check for zero divisor
@@ -1570,7 +1599,7 @@ E1_P2:   LDA #0
          STA T2
          STA T2+1
          LDY #16
-         LDA OP
+         LDA T3
          CMP #'*'             ; dispatch: '*' -> MUL; '/' or '%' -> DIV
          BNE E1_DO_DIV
          ; --- MUL kernel: T2 = T1 * T0 (shift-and-add) ----------------------
