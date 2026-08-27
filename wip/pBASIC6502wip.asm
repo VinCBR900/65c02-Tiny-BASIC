@@ -1,5 +1,5 @@
 ; =============================================================================
-; PicoBASIC65c02 v0.4  --  Proof of Concept 1 KB Tiny BASIC for 65c02 
+; PicoBASIC65c02 v0.5  --  Proof of Concept 1 KB Tiny BASIC for 65c02 
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Note: Kowalski Memory Mapped IO for now.
@@ -19,18 +19,19 @@ KOWALSKI        = 1
 ;   $0180-$03FF  BASIC program store (RAM_TOP=$0400)
 ;
 ; Statements accepted (full or 2-letter prefix):
-;   INPUT  END  GOTO  IF..THEN  PRINT      
+;   INPUT  END  GOTO <expr> IF  PRINT  WR <expr>
 ;   LIST  NEW  RUN
-;
+; WR <expr> emits an ASCII char - replaces CHR$, not usable in PRINT
+
 ; Arithmetic: + - * /  (unary -) Left to Right Precidence 
 ; Relops: =  <
 ;
 ; Numbers : signed 16-bit  (-32768 .. 32767)
-; Print   : "literals", `;`, CHR$(char) - no string vars
+; Print   : "literals", `;` - no string vars
 ;
 ; KNOWN LIMITATIONS
 ;
-; GETLINE - no Backspace support or range limits - too many characters will crash
+; GETLINE - no Backspace support or range limits - too many characters will crash.
 ;
 ; DO_ERROR - minimal error stub, shows error number, no line
 ;
@@ -45,22 +46,21 @@ KOWALSKI        = 1
 ; Relops: Only "<" and "=" are supported - use flipped operands for ">", e.g.
 ;   "A>B" as "B<A".  Hence ">=", "<=", "<>" not supported.
 ;
+; IF <expr> <stmt> : no THEN keyword "IF 3<5 PRINT 1" not "IF 3<5 THEN PRINT 1".
+;   Nests freely since IF is itself a statement: "IF a IF b stmt".
+;
 ; Two Character keyword matching - only 2 chars matched then rest of the word
-;   is consumed until a space or `(`.  Spaces are needed: `10 PRINT CHR$(65);"Hello"`
-;   works, `10 PR CH(65);"Hello"` also works, but `10 PRINTCHR$(65);"Hello"` prints
-;   "65Hello", not `AHello`.
+;   is consumed until a space or `(`.  Spaces are needed: `10 PRINT A works,
+;   `10 PR A` also works, but `10 PRINTA` does not.
 ;
 ; Char Case: All commands must be UPPERCASE apart from PRINt string literals
 ;
-; No `:` multi-statement separator, no FOR/NEXT, no arrays/DIM, no string
-;   variables -- see the above list above for the full set.
+; No `:` multi-statement support, no GOSUB?RETURN, FOR/NEXT, no arrays/DIM/strings
 ;
 ; Numbers are signed 16-bit only (-32768..32767); arithmetic overflow
 ;   wraps silently (e.g. 32767+1 = -32768) -- it does not raise an error.
 ;
 ; Input buffer is 35 usable chars + CR terminator
-;
-; CHR$(n) only valid only in PRINT line 
 ;
 ; To save Space, LET keyword not used. 
 ;
@@ -93,10 +93,26 @@ KOWALSKI        = 1
 ;                        - GETLINE, DO-ERROR minimized.  
 ;                        - DELINE/EDITLN/INSLINE code-golfed.
 ;                        - EXPR code golfed for O(n) MUL
-;   v0.4              Refactor for size, now 1200 bytes
-;                        - Convreted to 65c02 opcodes to save space.
-;                        - Generalized T0_CMP_LP -> T0_CMPX
-;                        - Code golf for DELINE, INSLINE, EDITLN.
+;   v0.4              Refactor for Size - 1181 bytes
+;                       - Generalized T0_CMP_LP -> T0_CMPX 
+;                       - Bugfix DELINE's shift loop.
+;                       - Added few 65c02 opcodes
+;                       - Refactor DO_MD for seperate entry points for MUL/DIV
+;   v0.4a             Refactor/Bug Fix - 1186 bytes 
+;                       - Generalized ADD_T1_X to add (T0,Y) into (T0,X)
+;                         instead of hardcoding T1 as the addend. 
+;                       - Reused ADD_T1_X in PNUM's digit-accumulate
+;                         loop (T3 += T0 x10): X=T3, Y=0/T0 fixed for the
+;                         whole loop (ADD_T1_X clobbers neither)
+;   v0.5              Continued Refactor for Size - 911 bytes before vectors
+;                        - Removed CHR$ and THEN; added WR <expr> - writes a
+;                          ASCII char, statement-level replacement for CHR$
+;                        - DO_IF: dropped optional-THEN JSR MTCHKW.  IF still
+;                          nestsas its own statement ("IF a IF b stmt").
+;                        - MTCHKW: dropped trailing-'$' special case for CHR$
+;                        - Showcase updated: "THEN" dropped from every IF;
+;                          CHR$(expr) converted to WR expr
+;                        - ASK/INPUT broken - late breaking.
 ; ---- assembler mode ---------------------------------------------------------
          .opt proc65c02
 
@@ -140,12 +156,16 @@ T0:         .RS 2              ; 16-bit: primary scratch word / expression resul
 T1:         .RS 2              ; 16-bit: secondary scratch word
         .ENDIF
         
-; Note IP and CURLN must be sequential for GOSUB/RETURN stack push
+; 16 bit regs should be sequential for helper subs
 T2:         .RS 2              ; 16-bit: tertiary scratch word / STMT jump target
-T3:         .RS 2              ; 16-bit: PNUM x10-multiply accumulator (lo/hi);
+T3:         .RS 2              ; 16-bit: PNUM x10-multiply accumulator (lo/hi)
 IP:         .RS 2              ; 16-bit: interpreter pointer
 CURLN:      .RS 2              ; 16-bit: currently-executing line number
+        .IF KOWALSKI
+PE:         .DW SHOWCASE_END   ; Preload Showcase for testing
+        .ELSE
 PE:         .RS 2              ; 16-bit: program end (one past last byte)
+        .ENDIF
 LP:         .RS 2              ; 16-bit: line pointer / multi-purpose scratch
 RUN:        .RS 1              ; 8-bit:  run flag ($00 = immediate, $FF = running)
 RUNSP:      .RS 1              ; 8-bit:  stack-pointer snapshot for GOTO/BREAK unwind
@@ -154,10 +174,10 @@ LLEN:       .RS 1              ; Line length counter
 IBUF:       .RS IBUF_MAX+1     ; Input line buffer 
 ZPEND:		; audit
 ; ---- Zero-page lifetime notes -----------------------------------------
-; T3 serve two unrelated purposes at different times; safe only
-; because this is a single-threaded interpreter with no reentrancy between
-; the two uses of either byte. If that ever changes (e.g. an IRQ-driven
-; path that touches these), re-check these pairings.
+; Most of these bytes serve a single, obvious purpose. Where a byte serves
+; more than one at different times, that's safe only because this is a
+; single-threaded interpreter with no reentrancy between the uses. If that
+; ever changes (e.g. an IRQ-driven path that touches these), re-check.
 ;   T0   : primary scratch / expression result -- live during nearly any
 ;          statement or expression evaluation; the most heavily reused byte
 ;   T1   : secondary scratch -- DO_OP's left-operand stash (all six
@@ -166,11 +186,15 @@ ZPEND:		; audit
 ;   T2   : tertiary scratch -- PUTSTR/PRNL's string pointer; historically
 ;          also a STMT jump target (no longer true after the RTS-trick
 ;          dispatch rewrite -- MATCH_DISPATCH doesn't touch T2 at all now)
-;   T3   : (a) PNUM's x10-multiply accumulator -- now a proper 16-bit pair
-;          (T3 lo, T3+1 hi), live only during decimal parsing/printing,
-;          adjacent so its final value can be copied to T0 via X_TO_T0;
-;          (b) DO_MD's raw operator char ('*' vs '/'), live only after DO_OP's recursive
-;          right-operand evaluation has fully returned
+;   T3   : PNUM's x10-multiply accumulator -- a proper 16-bit pair (T3 lo,
+;          T3+1 hi), live only during decimal parsing/printing, adjacent
+;          so its final value can be copied to T0 via X_TO_T0. (DO_MD used
+;          to stash the raw '*'/'/' char here too, checked twice at
+;          runtime; UNI_TAB now gives '*' and '/' separate entry points
+;          -- MUL_ENTRY/DIV_ENTRY -- so the operator is encoded by which
+;          one got jumped to, and DO_MD instead threads it through as Y
+;          (0=multiply, 1=divide) across its shared sign-computation body,
+;          which doesn't otherwise touch Y)
 ;   LP   : line-store scan pointer -- shared by EDITLN, GOTOL, DO_LIST,
 ;          LSKIP, DELINE, PE_CMP_LP, INSLINE; each call fully consumes LP
 ;          before any nested call that might also use it
@@ -191,26 +215,29 @@ ZPEND:		; audit
 ; =============================================================================
 
          .DB $14,$00,"PRINT ",$22,"-- Pico-BASIC SHOWCASE --",$22,CR ;
-         .DB $1E,$00,"PRINT ",$22,"--- PRINT / CHR$ ---",$22,CR ; 30 PRINT "--- PRINT / CHR$ ---"
-         .DB $28,$00,"PRINT CHR$(65)",$3B,"CHR$(66)",$3B,"CHR$(67)",CR ; 40 PRINT CHR$(65);CHR$(66);CHR$(67)
+         .DB $1E,$00,"PRINT ",$22,"--- PRINT / WR ---",$22,CR ; 30 PRINT "--- PRINT / WR ---"
+         .DB $28,$00,"WR 65",CR                             ; 40 WR 65
+         .DB $29,$00,"WR 66",CR                             ; 41 WR 66
+         .DB $2A,$00,"WR 67",CR                             ; 42 WR 67
+         .DB $2B,$00,"PRINT",CR                              ; 43 PRINT
          .DB $32,$00,"PRINT ",$22,"--- ARITHMETIC ---",$22,CR ; 50 PRINT "--- ARITHMETIC ---"
          .DB $3C,$00,"PRINT ",$22,"3+4=",$22,$3B,"3+4",$3B,$22,"  10-3=",$22,$3B,"10-3",$3B,$22,"  6*7=",$22,$3B,"6*7",CR ; 60 PRINT "3+4=";3+4;"  10-3=";10-3;"  6*7=";6*7
          .DB $46,$00,"PRINT ",$22,"20/4=",$22,$3B,"20/4",CR ; 70 PRINT "20/4=";20/4
          .DB $50,$00,"PRINT ",$22,"--- COMPARISONS ---",$22,CR ; 80 PRINT "--- COMPARISONS ---"
-         .DB $64,$00,"IF 3<5 THEN PRINT ",$22,"3<5 ok",$22,CR ; 100 IF 3<5 THEN PRINT "3<5 ok"
-         .DB $82,$00,"IF 3=3 THEN PRINT ",$22,"3=3 ok",$22,CR ; 130 IF 3=3 THEN PRINT "3=3 ok"
+         .DB $64,$00,"IF 3<5 PRINT ",$22,"3<5 ok",$22,CR    ; 100 IF 3<5 PRINT "3<5 ok"
+         .DB $82,$00,"IF 3=3 PRINT ",$22,"3=3 ok",$22,CR    ; 130 IF 3=3 PRINT "3=3 ok"
          .DB $FA,$00,"PRINT ",$22,"--- LOOP via GOTO ---",$22,CR ; 250 PRINT "--- LOOP via GOTO ---"
          .DB $04,$01,"I=1",CR                               ; 260 I=1
-         .DB $0E,$01,"IF 5<I THEN GOTO 310",CR              ; 270 IF 5<I THEN GOTO 310
+         .DB $0E,$01,"IF 5<I GOTO 310",CR                   ; 270 IF 5<I GOTO 310
          .DB $18,$01,"PRINT I",$3B,CR                       ; 280 PRINT I;
          .DB $22,$01,"I=I+1",CR                             ; 290 I=I+1
          .DB $2C,$01,"GOTO 270",CR                          ; 300 GOTO 270
          .DB $36,$01,"PRINT ",$22,$22,CR                    ; 310 PRINT ""
          .DB $40,$01,"PRINT ",$22,"--- NESTED LOOP ---",$22,CR ; 320 PRINT "--- NESTED LOOP ---"
          .DB $4A,$01,"I=1",CR                               ; 330 I=1
-         .DB $54,$01,"IF 3<I THEN GOTO 610",CR              ; 340 IF 3<I THEN GOTO 610
+         .DB $54,$01,"IF 3<I GOTO 610",CR                   ; 340 IF 3<I GOTO 610
          .DB $5E,$01,"J=1",CR                               ; 350 J=1
-         .DB $68,$01,"IF 3<J THEN GOTO 400",CR              ; 360 IF 3<J THEN GOTO 400
+         .DB $68,$01,"IF 3<J GOTO 400",CR                   ; 360 IF 3<J GOTO 400
          .DB $72,$01,"PRINT J",$3B,CR                       ; 370 PRINT J;
          .DB $7C,$01,"J=J+1",CR                             ; 380 J=J+1
          .DB $86,$01,"GOTO 360",CR                          ; 390 GOTO 360
@@ -219,24 +246,24 @@ ZPEND:		; audit
          .DB $A4,$01,"GOTO 340",CR                          ; 420 GOTO 340
          .DB $62,$02,"PRINT ",$22,"--- MANDELBROT ---",$22,CR ; 610 PRINT "--- MANDELBROT ---"
          .DB $6C,$02,"I=-64",CR                             ; 620 I=-64
-         .DB $76,$02,"IF 56<I THEN GOTO 860",CR             ; 630 IF 56<I THEN GOTO 860
+         .DB $76,$02,"IF 56<I GOTO 860",CR                  ; 630 IF 56<I GOTO 860
          .DB $80,$02,"D=I",CR                               ; 640 D=I
          .DB $8A,$02,"C=-120",CR                            ; 650 C=-120
-         .DB $94,$02,"IF 4<C THEN GOTO 830",CR              ; 660 IF 4<C THEN GOTO 830
+         .DB $94,$02,"IF 4<C GOTO 830",CR                   ; 660 IF 4<C GOTO 830
          .DB $9E,$02,"A=C",CR                               ; 670 A=C
          .DB $A8,$02,"B=D",CR                               ; 680 B=D
          .DB $B2,$02,"E=0",CR                               ; 690 E=0
          .DB $BC,$02,"N=1",CR                               ; 700 N=1
-         .DB $C6,$02,"IF 16<N THEN GOTO 790",CR             ; 710 IF 16<N THEN GOTO 790
-         .DB $D0,$02,"IF 0<E THEN GOTO 770",CR              ; 720 IF 0<E THEN GOTO 770
+         .DB $C6,$02,"IF 16<N GOTO 790",CR                  ; 710 IF 16<N GOTO 790
+         .DB $D0,$02,"IF 0<E GOTO 770",CR                   ; 720 IF 0<E GOTO 770
          .DB $DA,$02,"T=(A*A/64)-(B*B/64)+C",CR             ; 730 T=(A*A/64)-(B*B/64)+C
          .DB $E4,$02,"B=2*A*B/64+D",CR                      ; 740 B=2*A*B/64+D
          .DB $EE,$02,"A=T",CR                               ; 750 A=T
-         .DB $F8,$02,"IF 256<((A*A/64)+(B*B/64)) THEN IF E=0 THEN E=N",CR ; 760 IF 256<((A*A/64)+(B*B/64)) THEN IF E=0 THEN E=N
+         .DB $F8,$02,"IF 256<((A*A/64)+(B*B/64)) IF E=0 E=N",CR ; 760 IF 256<((A*A/64)+(B*B/64)) IF E=0 E=N
          .DB $02,$03,"N=N+1",CR                             ; 770 N=N+1
-         .DB $0C,$03,"IF N<17 THEN GOTO 710",CR             ; 780 IF N<17 THEN GOTO 710 (N<=16, integer-exact)
-         .DB $16,$03,"IF 0<E THEN PRINT CHR$(E+32)",$3B,CR  ; 790 IF 0<E THEN PRINT CHR$(E+32);
-         .DB $20,$03,"IF E=0 THEN PRINT CHR$(32)",$3B,CR    ; 800 IF E=0 THEN PRINT CHR$(32);
+         .DB $0C,$03,"IF N<17 GOTO 710",CR                  ; 780 IF N<17 GOTO 710 (N<=16, integer-exact)
+         .DB $16,$03,"IF 0<E WR E+32",CR                    ; 790 IF 0<E WR E+32
+         .DB $20,$03,"IF E=0 WR 32",CR                      ; 800 IF E=0 WR 32
          .DB $2A,$03,"C=C+4",CR                             ; 810 C=C+4
          .DB $34,$03,"GOTO 660",CR                          ; 820 GOTO 660
          .DB $3E,$03,"PRINT ",$22,$22,CR                    ; 830 PRINT ""
@@ -250,20 +277,14 @@ SHOWCASE_END:	.DW 0
 ; =============================================================================
 ; ROM START  
          .ORG ORIGIN
-; =============================================================================
-; STRING TABLE 
-;
-
-; ---- human-readable strings -------------------------------------------------
-STR_BANNER: .DB "pBASIC v0.4",0  ; startup banner
 
 ; =============================================================================
 ; UNI_TAB -- unified operator + statement dispatch table.
 ;
 ;   Operator section (offsets 0-17, stride 3: 1 raw char, (handler-1)_lo,
 ;   (handler-1)_hi), 6 entries. Scanned by EXPR_LOOP/OP_SCAN (X counts down
-;   by 3 from 15). '*' and '/' share one handler (DO_MD), which
-;   distinguishes them itself.
+;   by 3 from 15). '*' and '/' each get their own entry point
+;   (MUL_ENTRY/DIV_ENTRY) into the shared DO_MD body.
 ;
 ;   KW_TAB (statement section, offsets 18+, stride 4: 2 raw ASCII keyword
 ;   chars, (handler-1)_lo, (handler-1)_hi), terminated by a 3-byte $FF
@@ -279,9 +300,9 @@ UNI_TAB:
           .DB "+"
           .DW DO_ADD-1
           .DB "/"
-          .DW DO_MD-1
+          .DW DIV_ENTRY-1
           .DB "*"
-          .DW DO_MD-1
+          .DW MUL_ENTRY-1
           .DB "="
           .DW DO_EQ-1
           .DB "<"
@@ -300,18 +321,14 @@ KW_RUN:   .DB "RU"
           .DW DO_RUN-1
 KW_NEW:   .DB "NE"
           .DW DO_NEW-1
-KW_INPUT: .DB "IN"      
+KW_INPUT: .DB "AS"              ; was INPUT, now ASK to avoid 1 char dispatch collision      
           .DW DO_INPUT-1
 KW_END:   .DB "EN"
           .DW DO_END-1
+KW_WR:    .DB "WR"
+          .DW DO_WR-1
           .DB $FF               ; sentinel: no-match -> DO_LET
           .DW DO_LET-1
-
-; ---- Special one-off keywords: NOT part of the dispatch walk above; matched
-; directly via a standalone JSR MTCHKW with X = <label>-UNI_TAB (must stay
-; within 256 bytes of UNI_TAB -- true here by a wide margin).
-KW_THEN:  .DB "TH"
-KW_CHRS:  .DB "CH"
 
 ; =============================================================================
 ; INIT  --  cold start
@@ -327,22 +344,12 @@ INIT:
          LDX #HWSTACK
          TXS                  ; set stack to top of page 1
          CLD                  ; ensure binary (not decimal) mode
-         JSR DO_NEW           ; setup PE and PROG
 
         .IF KOWALSKI     
-         ; --- Setup showcase  
-         LDA #<SHOWCASE_END   ; point PE at end of pre-loaded showcase program
-         STA PE               ; 
-         LDA #>SHOWCASE_END
-         STA PE+1
+         JSR DO_END           ; setup PE and PROG
+        .ELSE
+         JSR DO_NEW           ; setup PE and PROG
         .ENDIF
-
-         LDA #<STR_BANNER     ; Signon banner
-         STA IP               ; Just happens to be zero
-         LDA #>STR_BANNER
-         STA IP+1
-         JSR DP_STR
-         ; fall through into MAIN
 
 ; =============================================================================
 ; MAIN  --  immediate-mode prompt / dispatch loop
@@ -518,34 +525,12 @@ SK_LP:   JSR GETCI            ; advance IP past CR (SKIPEOL inlined)
  	 BRA RUNLP		; always taken
 
 ; =============================================================================
-; DO_NEW  --  NEW  :  clear program store and all variables
-;
-;   In:  --
-;   Out: PE = PROG; Zero Page cleared, gosub stack reset   
-;   Clobbers: A X PE Zero Page(e.g. VARS)
+; DO_NEW  --  NEW  :  Set default program store
+; DO_END  --  END  :  halt program execution and return to immediate mode
 ; =============================================================================
 DO_NEW:
-         LDA #0
-         TAX
-INIT_Z:  STA 0,X              ; clear zero-page byte at X
-         DEX
-         BNE INIT_Z
-
          LDX #4
          JSR PROG2X            ; PE = PROG
-
-         ; drop through - harmless but saves a RET
-; =============================================================================
-; DO_END  --  END  :  halt program execution and return to immediate mode
-;
-;   In:  --
-;   Out: RUN = 0; returns to STMT -> RUNLP which exits to MAIN
-;   Clobbers: A RUN
-;
-;   DO_END is the STMT dispatch handler.  RUNEND is the internal label reached
-;   when the program runs off the end of the store, or when RUN is cleared by
-;   another path.  Both converge here: LDA #0 / STA RUN then RTS.
-; =============================================================================
 DO_END:
 RUNEND:  STZ RUN
 EL_DN:
@@ -582,25 +567,25 @@ DL_LL:   LDA (LP),Y
          STA PE
          LDA PE+1
          SBC #0
-         STA PE+1              ; PE = old PE - length, i.e. the correct
-                                ; shrunk end -- computed BEFORE the loop, so
-                                ; it doubles as the loop's stop target (fixes
-                                ; the old bug: loop used to run `length`
-                                ; times -- the deleted line's OWN size --
-                                ; instead of stopping at the real new end,
-                                ; silently dropping/truncating anything
-                                ; stored after the deleted line)
+         STA PE+1              ; PE = old PE - length (= new PE)
 
+         ; Top-tested loop: test BEFORE copying. This must NOT be bottom-
+         ; tested (do-while) -- deleting the LAST line in the program is a
+         ; legitimate zero-shift case (T0 starts already == new PE), and a
+         ; do-while runs one iteration regardless, stepping T0 past PE with
+         ; no way back short of a full 16-bit wraparound. Top-testing also
+         ; means X only needs loading once, unconditionally, right here --
+         ; no risk of a branch skipping the load and leaving X pointing at
+         ; whatever it held before this routine ran.
          LDX #PE
-DL_CP:   JSR T0_CMPX            ; reached the new end yet?
+DL_CP:   JSR T0_CMPX
          BEQ DL_DONE
-         LDA (T0),Y             ; read from source = T0+length (data that
-                                 ; needs to shift down to close the gap)
-         STA (T0)               ; write to dest = T0 (65C02 plain indirect)
+         LDA (T0),Y
+         STA (T0)
          INC T0
          BNE DL_CP
          INC T0+1
-         BNE DL_CP
+         BRA DL_CP
 DL_DONE: RTS
 
 ; =============================================================================
@@ -701,10 +686,9 @@ DO_LIST:
          JSR PROG2LP
 LS_LN:   JSR PE_CMP_LP           ; PE == LP
          BEQ LS_DONE          ; end of program: branches to shared RTS above
-LS_GO:   LDY #0
-         LDA (LP),Y           ; read line number lo
+         LDY #1
+         LDA (LP)             ; read line number lo
          STA T0
-         INY                  ; Y=1
          LDA (LP),Y           ; read line number hi
          STA T0+1
          JSR PRT16            ; print line number
@@ -796,17 +780,15 @@ TCX_NE:  RTS
 
 ; =============================================================================
 ; MTCHKW  --  case-insensitive match of a 2-char keyword prefix at IP against
-;             UNI_TAB entry X, then consumes any further trailing letters/'$'.
+;             UNI_TAB entry X, then consumes any further trailing letters.
 ;
 ;   In:  X = byte offset of the keyword entry within UNI_TAB (its first two
-;        bytes are the raw keyword chars); the special one-off keywords
-;        KW_THEN/KW_CHRS are matched the same way, X = <label>-UNI_TAB
+;        bytes are the raw keyword chars)
 ;   Out: match:    C=0, IP advanced past the keyword. X unchanged.
 ;        no match: C=1, IP restored to entry value, X unchanged.
 ;   Clobbers: A Y  (T2 is NOT clobbered -- caller may hold a jump target)
 ;
-;   IP is saved in LP on entry and restored on failure. Shares its fail exit
-;   (MK_FAIL/MK_SEC) with GOTOL -- do not rename.
+;   IP is saved in LP on entry and restored on failure.
 ;
 ; =============================================================================
 MTCHKW:
@@ -831,14 +813,11 @@ MK_SKIP:
          SEC
          SBC #'A'              ; shift 'A'-'Z' down to 0-25; remainder kept in A
          CMP #26
-         BCS MK_OK             ; not a letter: exit, A still holds the remainder
+         BCS MK_RTS             ; not a letter: done
          JSR GETCI
          BRA MK_SKIP           ; always taken (token chars are nonzero)
 
-MK_OK:   CMP #$E3              ; remainder == '$'-'A' (mod 256)? reuses A, no re-peek
-         BNE MK_RTS            ; not '$': fall through to return success
-         JSR GETCI             ; it IS '$': consume it
-MK_RTS:  CLC                  ; N flag survives CLC untouched (inline saves 2 bytes)
+MK_RTS:  CLC
          RTS
 
 MK_FAIL: SEC                  ; C=1: no match
@@ -912,6 +891,8 @@ EAT_EXPR:
 ;   Out: T0 = result; IP advanced past expression
 ;   Clobbers: A X Y T0 T1 T2 T3 IP
 ; =============================================================================
+E1_OVFL: LDA #ERR_OV
+         JMP DO_ERROR
 
 ; --- Relational: Equality ---
 DO_EQ:   LDX #T1
@@ -948,10 +929,12 @@ DO_OP:
          PLA
          STA T1+1             ; pop left operand hi -> T1+1
          PLX                  ; pop operator's table offset -> X
-         LDA UNI_TAB,X        ; recover the raw operator char (DO_MD needs
-         STA T3               ; it to tell '*' from '/'); harmless for the
-                              ; other four handlers, which ignore T3
          JMP MD_FAIL          ; tail call into MATCH_DISPATCH's RTS gadget
+
+; --- Addition & Subtraction ---
+DO_SUB:  JSR NEG16            ; negate right operand (T0), fall through to ADD
+DO_ADD:  LDX #0               ; Target X=0 (T0). Sets Z flag
+         BRA DO_ADD_TAIL      ; Jumps straight into shared ADD logic      
 
 EXPR:
          JSR EXPR2            ; parse the first atom -> T0
@@ -967,12 +950,14 @@ OP_SCAN: CMP UNI_TAB,X
          RTS                  ; no operator matched: result in T0, exit cleanly
 
 ; --- Multiplication & Division ---
-DO_MD:   LDA T3
-         LSR                  ; Bit 0 into carry: '*' ($2A) -> C=0, '/' ($2F) -> C=1
-         BCC E1_NOCHK
+DIV_ENTRY:
          LDA T0
          ORA T0+1
          BEQ E1_OVFL          ; T0 == 0 -> Division by zero error
+         LDY #1                ; remember: divide (Y survives the shared
+         .DB $2C               ; sign-prep below untouched -- checked)
+MUL_ENTRY:
+         LDY #0                ; remember: multiply
 E1_NOCHK:
          LDA T1+1
          EOR T0+1
@@ -985,57 +970,59 @@ E1_P1:   LDA T0+1
          JSR NEG16            ; Make T0 positive
 E1_P2:   STZ T2               ; Clear T2 (product/quotient accumulator)
          STZ T2+1
-         LDA T3
-         LSR                  ; Re-evaluate operator char
-         BCS DIV_LOOP
+         TYA                   ; which operator? (Y set above, still intact)
+         BNE DIV_LOOP
 
 MUL_LOOP:
+         LDX #4               ; Target X=4 (T2)
+ML_LP:
          LDA T0               ; 16-bit decrement of T0 (multiplicand doubles as loop counter)
          BNE MLLP
          DEC T0+1
          BMI MD_DONE          ; Once T0+1 wraps from $00 to $FF, we're done
 MLLP:    DEC T0
-         LDX #4               ; Target X=4 (T2)
 DO_ADD_TAIL:                  ; --- SHARED INLINE ADDITION KERNEL ---
-         CLC
-         LDA T0,X             ; If X=0, this is T0. If X=4, this is T2.
-         ADC T1               ; T1 is the other operand for BOTH add and multiply
-         STA T0,X
-         LDA T0+1,X
-         ADC T1+1
-         STA T0+1,X
+         LDY #2               ; Addend = T1 for both ADD and MUL callers
+         JSR ADD_T1_X
          TXA                  ; 1-byte trick to check X
          BNE MUL_LOOP         ; If X=4, loop back to multiply
          BRA EXPR_LOOP        ; If X=0, addition is done 
 
-; --- Addition & Subtraction ---
-DO_SUB:  JSR NEG16            ; negate right operand (T0), fall through to ADD
-DO_ADD:  LDX #0               ; Target X=0 (T0). Sets Z flag
-         BRA DO_ADD_TAIL      ; Jumps straight into shared ADD logic
-         
-E1_OVFL: LDA #ERR_OV
-         JMP DO_ERROR
+; =============================================================================
+; ADD_T1_X  --  (T0,X) += (T0,Y), 16-bit
+;   In:  X = dest offset (0=T0, 4=T2); Y = addend offset (0=T0, 2=T1)
+;   Out: (T0,X) = (T0,X) + (T0,Y); carry = result of high-byte ADC
+;   Clobbers: A
+; =============================================================================
+ADD_T1_X:
+         CLC
+         LDA T0,X             ; If X=0, this is T0. If X=4, this is T2.
+         ADC T0,Y              ; Y picks the addend: T1 for ADD/MUL, T0 for DIV
+         STA T0,X
+         LDA T0+1,X
+         ADC T0+1,Y
+         STA T0+1,X
+         RTS
 
 DIV_LOOP:
-         SEC                  ; Repeated subtraction: T1 -= T0
-         LDA T1
-         SBC T0
-         STA T1               ; Unconditional write avoids TAX + STX 
-         LDA T1+1
-         SBC T0+1
-         STA T1+1             ; We don't care if T1 is corrupted on the final over-subtract
-         BCC MD_DONE          ; Stop once T1 < T0
+        JSR NEG16            ; T0 = -T0 (negated divisor)
+        LDY #0                ; Addend = T0 (negated divisor) via generalized
+                              ; ADD_T1_X -- no swap needed, dest is T1 directly.
+DV_LP:
+        LDX #T1               ; Dest = T1 (running dividend)
+         JSR ADD_T1_X
+         BCC MD_DONE          ; Stop once dividend < divisor
          INC T2               ; Quotient tally
-         BNE DIV_LOOP
+         BNE DV_LP
          INC T2+1
-         BNE DIV_LOOP
+         BNE DV_LP
 
 MD_DONE: LDX #T2-VARS        ; wraps
          JSR X_TO_T0
          PLA                  ; Retrieve sign
          BPL E1_POS
          JSR NEG16            ; Apply sign
-E1_POS:  JMP EXPR_LOOP
+E1_POS:  BRA EXPR_LOOP
 
 E2_NEG:  JSR E2_POS           ; consume '-', evaluate atom
          ; drop through
@@ -1045,7 +1032,7 @@ E2_NEG:  JSR E2_POS           ; consume '-', evaluate atom
 ; In:  T0 or T1 = value to negate. Selected dynamically by offset mapping.
 ; Clobbers: A X
 ; =============================================================================
-NEG16:   LDX #0
+NEG16:   LDX #0                 ; in place negate
          .DB $2C              ; BIT abs: skips next 2 bytes (the LDX #2)
 NEG_T1:  LDX #2
          SEC
@@ -1069,6 +1056,8 @@ NEG_T1:  LDX #2
 ;
 ;   Note: E2_BAD returns T0=0 for unrecognised atoms (no error raised).
 ; =============================================================================
+E2_BAD:  JMP REL_F              ; return zero
+
 E2_POS:  JSR GETCI            ; consume unary '+', then fall through
 EXPR2:
          JSR WPEEK
@@ -1092,7 +1081,7 @@ E2_LIT:  ; A still contains char from WPEEK
 ;
 ;   In:  IP -> ASCII digits (leading spaces skipped automatically)
 ;   Out: T0 = parsed value; IP advanced past the last digit
-;   Clobbers: A X Y T0 T3
+;   Clobbers: A X Y T0 T1 T3
 ;   Stops at the first non-digit without consuming it.
 ; =============================================================================
 PNUM:
@@ -1106,16 +1095,16 @@ PN_LP:   LDA (IP)              ; peek without consuming
 
          STA T3                ; seed running sum lo with digit
          STY T3+1               ; seed running sum hi with 0
-         LDX #10               ; T3:T3+1 = digit + 10*T0
-         ; [OPT] CMP #10 guaranteed Carry is CLEAR here (No CLC needed)
-PN_ML:   
-         LDA T3
-         ADC T0
-         STA T3
-         LDA T3+1
-         ADC T0+1
-         STA T3+1
-         DEX
+         LDX #T3               ; T3:T3+1 = digit + 10*T0, via ADD_T1_X (X=T3
+                                ; dest, Y=0/T0 addend -- both fixed all loop,
+                                ; ADD_T1_X clobbers neither)
+         LDA #10
+         STA T1                ; loop counter (T1 free here: PNUM only runs
+                                ; while parsing an atom, before DO_OP stashes
+                                ; anything there -- see DO_OP's stack save)
+PN_ML:
+         JSR ADD_T1_X
+         DEC T1
          BNE PN_ML
          ; Copy T3:T3+1 to T0
          LDX #T3-VARS         ; wraps
@@ -1126,7 +1115,6 @@ PN_ML:
          JSR GETCI             ; consume digit, advances IP 16-bit
          BNE PN_LP              ; guaranteed to branch since A != 0
 
-E2_BAD:  JMP REL_F              ; return zero
 
 E2_VAR:  JSR PARSE_VAR               ; variable name (single letter A-Z)?
 	 BCS E2_BAD
@@ -1150,8 +1138,6 @@ E2_PAR:  JSR GETCI            ; consume '('
 ;   Out: A = char consumed; IP advanced past it
 ;   Clobbers: A IP
 ;
-;   Falls through into GETCI after skipping spaces. E2_PAR falls through
-;   into this directly from above -- do not insert anything between them.
 ; =============================================================================
 WEAT:    JSR WSKIP            ; skip spaces, then fall through
         ; DROP THROUGH
@@ -1177,7 +1163,7 @@ GETCI_SK: RTS
 ;   Out: if true, statement executed; if false, returns (STMT will SKIPEOL)
 ;   Clobbers: A X Y T0 T1 T2 IP
 ;
-;   On true: consumes optional THEN, then falls through into STMT.
+;   Falls straight through into STMT to execute the consequent (no THEN).
 ;   On false: branches to nearest preceding RTS (DO_IF_F = GETCI_SK).
 ; =============================================================================
 DO_IF:
@@ -1185,8 +1171,6 @@ DO_IF:
          LDA T0
          ORA T0+1              ; check for zero
          BEQ DO_IF_F          ; false: return
-         LDX #KW_THEN-UNI_TAB
-         JSR MTCHKW           ; consume optional THEN keyword
          ; fall through into STMT to execute the consequent
 
 ; =============================================================================
@@ -1196,10 +1180,6 @@ DO_IF:
 ;   Out: statement executed; IP advanced
 ;   Clobbers: A X Y T0 T1 T2 IP
 ;
-;   Falls through directly into MATCH_DISPATCH; a match runs the handler
-;   and RTS's to STMT's caller, no match falls through to DO_LET
-;   (implicit "X=...") via the sentinel. Nothing may be inserted between
-;   here and MATCH_DISPATCH.
 ; =============================================================================
 STMT:
          JSR WPEEK
@@ -1325,6 +1305,28 @@ DP_RET:
 RTS_1:   RTS
 
 ; =============================================================================
+; GETCH  --  read one character from Kowalski terminal (blocking)
+;
+;   In:  --
+;   Out: A = character read and echo
+;   Clobbers: A
+; =============================================================================
+GETCH:   LDA IO_IN
+         BEQ GETCH          ; spin until a char is available
+         BRA PUTCH
+
+; =============================================================================
+; DO_WR  --  WR <expr>  :  write one raw ASCII char (low byte of <expr>)
+;
+;   In:  IP -> expression text
+;   Out: one character written to the terminal; IP advanced
+;   Clobbers: A X Y T0 T1 T2 IP
+; =============================================================================
+DO_WR:   JSR EXPR             ; evaluate <expr> -> T0
+         LDA T0
+         BRA PUTCH            ; tail call: PUTCH's own RTS returns to caller
+
+; =============================================================================
 ; GETLINE  --  MINIMAL read one line from the terminal into IBUF; set IP = IBUF
 ;
 ;   Three entry points sharing one body:
@@ -1333,10 +1335,9 @@ RTS_1:   RTS
 ;
 ;   In:  --
 ;   Out: IBUF filled with input, CR-terminated; X is # chars; LLEN is no chars
-;   Clobbers: A X is GETLINE's own buffer index
+;   Clobbers: A, X is GETLINE's own buffer index
 ;   
 ;   Note: NO Range checking/Backspace support - Overflow could crash  
-;   
 ; =============================================================================
 GETLINE_M:
          LDA #'>'            ; (2) Prompt for Direct Mode
@@ -1359,7 +1360,7 @@ GL_LOOP:
 ;   Out: output written to terminal; IP advanced past statement
 ;   Clobbers: A X Y T0 T1 T2 IP
 ;
-;   Items: string literals ("..."), CHR$(expr), or numeric expressions.
+;   Items: string literals ("..."), or numeric expressions.
 ;   Items separated by ';' suppress the inter-item space.
 ;   A trailing ';' suppresses the final CR/LF.
 ;   At end of items (or with no items) falls through into PUTSTR to emit CR/LF.
@@ -1375,7 +1376,7 @@ DP_TOP:  JSR WPEEK
          CMP #CR+1            ; NUL(0) and CR(13) are both < CR+1 -- one check
          BCC DP_NL            ; catches both "end of line" cases at once
          CMP #'"'
-         BNE DP_CHR
+         BNE DP_NORM
          JSR GETCI            ; consume opening '"'
 DP_STR:  JSR GETCI            ; read string body char by char
          CMP #'"'
@@ -1384,14 +1385,6 @@ DP_STR:  JSR GETCI            ; read string body char by char
          BCC DP_NL            ; unterminated string -- print CR/LF and stop
          JSR PUTCH
          BRA DP_STR           ; PUTCH always leaves A=VIA_TX=1 (Z=0): unconditional
-
-DP_CHR: LDX #KW_CHRS-UNI_TAB
-         JSR MTCHKW           ; matched "CHR$"?
-         BCS DP_NORM
-         JSR E2_PAR           ; Yes it is, Swallow `(`, get value, and swallow closing `)`
-         LDA T0
-         JSR PUTCH
-         BRA DP_AFT            ; PUTCH always leaves A=VIA_TX=1 (Z=0): unconditional
 
 DP_NORM: JSR EXPR             ; numeric expression
          JSR PRT16
@@ -1403,17 +1396,6 @@ DP_AFT:  JSR WPEEK
          CMP #CR+1            ; NUL(0) and CR(13) are both < CR+1 -- one check
          BCC DP_RET           ; trailing ';': suppress CR/LF (DP_RET = IN_DN = RTS above)
          BRA DP_TOP            ; always taken (just proved carry set, i.e. A >= CR+1)
-       
-; =============================================================================
-; GETCH  --  read one character from Kowalski terminal (blocking)
-;
-;   In:  --
-;   Out: A = character read and echo
-;   Clobbers: A
-; =============================================================================
-GETCH:   LDA IO_IN
-         BEQ GETCH          ; spin until a char is available
-         BRA PUTCH
 
 ROMEND: ; for auditing
 
