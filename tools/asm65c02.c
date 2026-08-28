@@ -258,13 +258,13 @@
  */
 typedef enum {
     M_IMP, M_ACC, M_IMM, M_ZP, M_ZPX, M_ZPY,
-    M_ABS, M_ABSX, M_ABSY, M_IND, M_IND_ZP, M_IND_Y, M_IND_X, M_IND_ABSX, M_REL,
+    M_ABS, M_ABSX, M_ABSY, M_IND, M_IND_ZP, M_IND_Y, M_IND_X, M_IND_ABSX, M_REL, M_INVALID,
     M_UNKNOWN
 } Mode;
 
 static int mode_size[] = {
     1, 1, 2, 2, 2, 2,      /* IMP ACC IMM ZP ZPX ZPY */
-    3, 3, 3, 3, 2, 2, 2, 3, 2 /* ABS ABSX ABSY IND IND_ZP IND_Y IND_X IND_ABSX REL */
+    3, 3, 3, 3, 2, 2, 2, 3, 2, 1 /* ABS ABSX ABSY IND IND_ZP IND_Y IND_X IND_ABSX REL INVALID */
 };
 
 /* ── opcode table entry ───────────────────────────────────────────────────── */
@@ -1456,6 +1456,21 @@ static Operand parse_operand(const char *raw_op, const char *mn, int pc, int pas
             }
             /* check what follows the close paren */
             const char *after = skip_ws(o + close + 1);
+            if (*after == ',') {
+                const char *regp = skip_ws(after + 1);
+                if (tolower((unsigned char)*regp) == 'x' &&
+                    *skip_ws(regp + 1) == '\0') {
+                    /* "(zp),X" is not a 6502/65C02 addressing mode.  The
+                     * indexed-indirect form puts the X inside the parens:
+                     * "(zp,X)".  Without this explicit rejection, the generic
+                     * trailing ",X" parser below treats "(zp)" as a grouped
+                     * expression and silently emits "zp,X" instead. */
+                    if (pass2)
+                        add_error(lineno, "Invalid addressing mode '(...),X'; use '(zp,X)' for indexed indirect or 'addr,X' for indexed addressing");
+                    res.mode = M_INVALID;
+                    return res;
+                }
+            }
             if (*after == ',' && tolower((unsigned char)*(skip_ws(after+1))) == 'y') {
                 /* (zp),Y */
                 char inner[LINE_LEN];
@@ -2848,6 +2863,7 @@ static int assemble(const char *source) {
 
         Operand oper = parse_operand(op, mn, pc, 1, lineno);
         Mode m = promote(mn, oper.mode);
+        if (m == M_INVALID) continue;
 
         /* v1.19: [Kowalski] -- RMB/SMB take the generic single-operand
            path (unlike BBR/BBS above), so their legacy-spelling check
