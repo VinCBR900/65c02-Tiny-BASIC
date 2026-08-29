@@ -10,8 +10,8 @@
 
 Here we have several Tiny BASIC for 6502/65c02
   * **pBASIC - TINY** - Proof of Concept 1kbyte Tiny BASIC interpreter for 65c02 - 16 bit signed INTs, +-*/ math
-  * **uBASIC - SMALL** - Targeted at original NMOS 6502, meets 1976 Tiny BASIC spec for 16 bit signed ints, fits in 2kbyte including bitbang serial IO on a VIA 6522
-  * **4kBASIC - FAST** - Targeted at 65c02, this is an Extended 16bit signed in Tiny BASIC with `FOR`/`NEXT`, CORDIC `SIN`/`COS` degree functions and Bitwise operators.  Fits in a 4kbyte EPROM.
+  * **uBASIC - SMALL** - Targeted at original NMOS 6502, meets 1976 Tiny BASIC spec for 16 bit signed ints, fits in 2kbyte with multiple features including bitbang serial IO on a VIA 6522
+  * **4kBASIC - FAST** - Targeted at 65c02, this is a Tokenized, Extended 16bit signed in Tiny BASIC with `FOR`/`NEXT`, CORDIC `SIN`/`COS` degree functions and Bitwise operators.  Fits in a 4kbyte EPROM.
   * **mini-BASIC - TRIG** - Targeted at 65c02, 4 byte floating point with radian based TRIG: `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`, and Transcendental `LN`/`EXP`   
 
 You can see the development progression - first came uBASIC, then extended 4k BASIC with some trig support, then mini-BASIC with 4byte floats, full trig, and transcendental.
@@ -26,7 +26,7 @@ https://vincbr900.github.io/65c02-Tiny-BASIC/
 
 **<1024 bytes assembled. ROM at $FC00–$FFFF**
 
-A tiny but complete integer Tiny BASIC. No tokeniser - BASIC program lines are stored as raw ASCII and re-parsed on every execution. This costs RAM and speed but keeps the interpreter very small. 
+A tiny but mostly complete integer Tiny BASIC. No tokeniser - BASIC program lines are stored as raw ASCII and re-parsed on every execution. 
 
 **Statements:** 
   * `END` `GOTO <expr>`  `IF` `ASK (INPUT)`  `PRINT [;]` `WR char`     
@@ -49,7 +49,7 @@ A tiny but complete integer Tiny BASIC. No tokeniser - BASIC program lines are s
 
 **<2048 bytes assembled. ROM at $F800–$FFFF**
 
-A minimal but complete integer Tiny BASIC. No tokeniser - BASIC program lines are stored as raw ASCII and re-parsed on every execution. This costs RAM and speed but keeps the interpreter very small. 
+A small but feature rich integer Tiny BASIC. No tokeniser - BASIC program lines are stored as raw ASCII and re-parsed on every execution. 
 
 This interpreter has also been ported to the John Bell 80-153 single board computer.  A modified `sim65c02` simulator (`JB-sim65c02`) is provided for this version.
 
@@ -59,8 +59,10 @@ This interpreter has also been ported to the John Bell 80-153 single board compu
 
 **Expressions:** 
   * `+` `-` `*` `/` `%`(mod) `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)`
-  * Variables `A`–`Z` signed 16-bit integers, −32768 to 32767
+  * Variables `A`–`Z`, signed 16-bit integers
+  * Number reresentation: decimal −32768 to 32767, Hex $0000-$FFFF 
   * Functions: `ABS(val)`   `FREE`   `PEEK(addr)`  `RND`   `USR(addr)`  
+  * Biteise: `XOR(a,b)`   `AND(a,b)`   `OR(a,b)`  `NOT(a)`
 
 **Notes**
 - Uses **2 character matching** - with 3rd char match for `GOSUB`/`GOTO` and `RETURN`/`REM`.  Matches anything after e.g. PROCEED matches PRINT.  Therefore  spaces are important e.g. `PRINT TAB(5);"hello"` prints 5 spaces then `Hello` and works, whereas `PRINTTAB(5);"HELLO"` prints `5Hello` and does not.
