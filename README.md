@@ -41,7 +41,7 @@ A tiny but complete integer Tiny BASIC. No tokeniser - BASIC program lines are s
 - Uses **2 character testing where only 1st char is matched** - e.g. `PRINT`, `PR`, `PX` all executes `DO_PRINT`.  So spaces are important e.g. `PRINT A;"=Test"` prints "5=Test" if A is 5, whereas `PRINTA;"=Test"` prints `=Test`.
 - **Expressions supported in GOTO** - `GOTO`, `GOTO X`, `GOTO 10*I` all work.  
 - **Left to Right Operator Precidence** — up to you to use Parenthesis to get the right order
-- **BASIC Line Handling** - to save space in -lease insertion/deletion not supported.  This means you can only change the last line - either update or delete.  So if you enter 10 lines and notice an error on line 2, you must delete lines 10, 9, 8, 7, 6, 5, 4, 3 in sequence. Sorry. 
+- **BASIC Line Handling** - to save space in-place insertion/deletion not supported.  This means you can only change the last line - either update or delete.  So if you enter 10 lines and notice an error on line 2, you must delete lines 10, 9, 8, 7, 6, 5, 4, 3 in sequence. Sorry. 
 
 **Errors** Minimal error handling, just printed as `!'
 
