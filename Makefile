@@ -1,16 +1,25 @@
 # =============================================================================
-# Makefile  --  65C02 Tiny BASIC build (native tools/ROMs + web/Wasm demo) (v3)
+# Makefile  --  65C02 Tiny BASIC build (native tools/ROMs + web/Wasm demo) (v4)
 #
 # Usage:
 #   make roms        -- build native uBASIC6502.bin/mini-BASIC65c02.bin/
-#                        4kBASIC.bin/pBASIC65c02.bin (binaries for burning to
-#                        actual EEPROM/flash) plus tools/asm65c02
+#                        4kBASIC.bin/pBASIC65c02.bin (ROM-range binaries, for
+#                        burning to actual EEPROM/flash) plus tools/asm65c02
 #   make native-smoke -- native build sanity check for sim65c02.c
 #   make web-dist     -- build dist/ (index.html + sim65c02.js/.wasm +
 #                         assets/*.bin) for the GitHub Pages browser demo
 #   make clean        -- remove all generated files
 #
 # History:
+#   v4 (Aug 2026) — Corrected v3: pBASIC65c02.bin follows the SAME pattern
+#     as the other three ROMs after all, not a special case. `make roms`
+#     (native EEPROM-burn image) uses -r with pBASIC65c02's actual ROM
+#     range ($FC00-$FFFF, its 1KB footprint); only the web-assets build
+#     omits -r for the full 64KB flat image containing the RAM showcase.
+#     v3's "no -r for native too" was a misreading of the earlier answer
+#     ("full 64kbytes as it includes an embedded showcase in RAM") -- that
+#     answer was about web-assets, matching v2's existing rationale, not a
+#     new native-build behaviour. Reverted the native rule accordingly.
 #   v3 (Aug 2026) — Added pBASIC65c02.asm as a fourth ROM (native + web).
 #     Unlike the other three sources, pBASIC65c02.bin is built WITHOUT -r
 #     (full 64KB flat image) for BOTH the `roms` target and web-assets,
@@ -102,11 +111,8 @@ mini-BASIC65c02.bin: mini-BASIC65c02.asm $(ASM)
 4kBASIC.bin: 4kBASIC.asm $(ASM)
 	$(ASM) $< -o $@ -r '$$F000-$$FFFF'
 
-# No -r here (unlike the other three): pBASIC65c02.asm's showcase demo
-# lives in RAM outside the ROM code range, so the EEPROM-burn image needs
-# the full 64KB flat dump too, not just the web-assets one. See v3 history.
 pBASIC65c02.bin: pBASIC65c02.asm $(ASM)
-	$(ASM) $< -o $@
+	$(ASM) $< -o $@ -r '$$FC00-$$FFFF'
 
 $(WEB_ASSETS_DIR):
 	mkdir -p $@
