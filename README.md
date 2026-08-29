@@ -9,6 +9,7 @@
 > To be frank, without these agents this work would not have been possible.
 
 Here we have several Tiny BASIC for 6502/65c02
+  * **pBASIC - TINY** - Proof of Concept 1kbyte Tiny BASIC interpreter for 65c02 - 16 bit signed INTs, +-*/ math
   * **uBASIC - SMALL** - Targeted at original NMOS 6502, meets 1976 Tiny BASIC spec for 16 bit signed ints, fits in 2kbyte including bitbang serial IO on a VIA 6522
   * **4kBASIC - FAST** - Targeted at 65c02, this is an Extended 16bit signed in Tiny BASIC with `FOR`/`NEXT`, CORDIC `SIN`/`COS` degree functions and Bitwise operators.  Fits in a 4kbyte EPROM.
   * **mini-BASIC - TRIG** - Targeted at 65c02, 4 byte floating point with radian based TRIG: `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`, and Transcendental `LN`/`EXP`   
@@ -20,6 +21,29 @@ https://vincbr900.github.io/65c02-Tiny-BASIC/
 
 > If you've found these Tiny BASIC interpreters useful for learning, retrocomputing, or your own projects, you can buy me a coffee.  Donations are entirely optional but greatly appreciated.
 > [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/vpcrabtreeZ)
+
+### pBASIC65c02 — fits in a 2708/2758 EPROM (<1 KByte)
+
+**<1024 bytes assembled. ROM at $FC00–$FFFF**
+
+A tiny but complete integer Tiny BASIC. No tokeniser - BASIC program lines are stored as raw ASCII and re-parsed on every execution. This costs RAM and speed but keeps the interpreter very small. 
+
+**Statements:** 
+  * `END` `GOTO <expr>`  `IF` `ASK (INPUT)`  `PRINT [;]` `WR char`     
+  * `LIST ` `NEW` `RUN`
+
+**Expressions:** 
+  * `+` `-` `*` `/` 
+  * Variables `A`–`Z` signed 16-bit integers, −32768 to 32767
+  * Functions: **None**  
+
+**Notes**
+- Uses **2 character testing where only 1st char is matched** - e.g. `PRINT`, `PR`, `PX` all executes `DO_PRINT`.  So spaces are important e.g. `PRINT A;"=Test"` prints "5=Test" if A is 5, whereas `PRINTA;"=Test"` prints `=Test`.
+- **Expressions supported in GOTO** - `GOTO`, `GOTO X`, `GOTO 10*I` all work.  
+- **Left to Right Operator Precidence** — up to you to use Parenthesis to get the right order
+- **BASIC Line Handling** - to save space in -lease insertion/deletion not supported.  This means you can only change the last line - either update or delete.  So if you enter 10 lines and notice an error on line 2, you must delete lines 10, 9, 8, 7, 6, 5, 4, 3 in sequence. Sorry. 
+
+**Errors** Minimal error handling, just printed as `!'
 
 ### uBASIC6502 — fits in a 2716 EPROM (<2 KByte)
 
