@@ -1,5 +1,5 @@
 <!--
-  index65c02.html  —  65C02 Tiny BASIC Browser Runner  (v4, Aug 2026)
+  index65c02.html  —  65C02 Tiny BASIC Browser Runner  (v5, Aug 2026)
 
   Usage:
     Served as the repository's GitHub Pages front end for the WebAssembly
@@ -11,6 +11,15 @@
     terminal.
 
   History:
+    v5 (Aug 2026) — Added pBASIC65c02.asm as a fourth dropdown option
+      (assets/pBASIC65c02.bin), alongside uBASIC6502, mini-BASIC65c02 and
+      4kBASIC. GETCH/PUTCH defaults are unchanged ($E004/$E001, same as
+      the others), so the shared "Command-line options" box needs no new
+      per-ROM handling. Requires the corresponding Makefile v3 change:
+      pBASIC65c02.bin is built WITHOUT -r for both `make roms` and
+      web-assets (full 64KB flat image), unlike the other three ROMs,
+      because its showcase demo also lives in RAM outside the ROM code
+      range on the native build, not just the web one.
     v4 (Aug 2026) — Added 4kBASIC.asm as a third dropdown option
       (assets/4kBASIC.bin), alongside uBASIC6502 and mini-BASIC65c02.
       Requires the corresponding Makefile fix (4kBASIC.bin was never
@@ -144,6 +153,7 @@
           <option value="assets/uBASIC6502.bin" selected>uBASIC6502.asm — 2 KB uBASIC</option>
           <option value="assets/mini-BASIC65c02.bin">mini-BASIC65c02.asm — 4 KB mini BASIC</option>
           <option value="assets/4kBASIC.bin">4kBASIC.asm — 4 KB BASIC</option>
+          <option value="assets/pBASIC65c02.bin">pBASIC65c02.asm — 1 KB Pico-BASIC</option>
         </select>
       </div>
       <div>
