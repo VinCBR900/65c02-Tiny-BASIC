@@ -1,9 +1,9 @@
 # =============================================================================
-# Makefile  --  65C02 Tiny BASIC build (native tools/ROMs + web/Wasm demo) (v2)
+# Makefile  --  65C02 Tiny BASIC build (native tools/ROMs + web/Wasm demo) (v3)
 #
 # Usage:
 #   make roms        -- build native uBASIC6502.bin/mini-BASIC65c02.bin/
-#                        4kBASIC.bin (ROM-range binaries, for burning to
+#                        4kBASIC.bin/pBASIC65c02.bin (binaries for burning to
 #                        actual EEPROM/flash) plus tools/asm65c02
 #   make native-smoke -- native build sanity check for sim65c02.c
 #   make web-dist     -- build dist/ (index.html + sim65c02.js/.wasm +
@@ -11,6 +11,17 @@
 #   make clean        -- remove all generated files
 #
 # History:
+#   v3 (Aug 2026) — Added pBASIC65c02.asm as a fourth ROM (native + web).
+#     Unlike the other three sources, pBASIC65c02.bin is built WITHOUT -r
+#     (full 64KB flat image) for BOTH the `roms` target and web-assets,
+#     because it too has an embedded showcase demo living in RAM (around
+#     $0200) separate from its ROM code range -- the same class of bug v2
+#     fixed for the web build of uBASIC6502/mini-BASIC65c02, except here it
+#     also applies to the native EEPROM-burn image, per explicit
+#     confirmation, so `roms` gets no -r flag for this one source only.
+#     GETCH/PUTCH defaults ($E004/$E001) and maxcycles handling are
+#     unchanged and shared with the other ROMs via sim65c02.c's existing
+#     browser hooks.
 #   v2 (Aug 2026) — Web-assets ROMs (web/assets/*.bin) are now built WITHOUT
 #     -r (full 64KB flat image) instead of the ROM-only address range used
 #     by `make roms`. Root cause: uBASIC6502.asm/mini-BASIC65c02.asm's INIT
@@ -41,12 +52,12 @@ SIM_SRC := $(TOOLS_DIR)/sim65c02.c
 DIST_DIR := dist
 EMCC ?= emcc
 
-ROMS := uBASIC6502.bin mini-BASIC65c02.bin 4kBASIC.bin
+ROMS := uBASIC6502.bin mini-BASIC65c02.bin 4kBASIC.bin pBASIC65c02.bin
 WEB_ASSETS_DIR := web/assets
-WEB_ROMS := $(WEB_ASSETS_DIR)/uBASIC6502.bin $(WEB_ASSETS_DIR)/mini-BASIC65c02.bin $(WEB_ASSETS_DIR)/4kBASIC.bin
+WEB_ROMS := $(WEB_ASSETS_DIR)/uBASIC6502.bin $(WEB_ASSETS_DIR)/mini-BASIC65c02.bin $(WEB_ASSETS_DIR)/4kBASIC.bin $(WEB_ASSETS_DIR)/pBASIC65c02.bin
 WASM_EXPORTS := ["_sim65c02_select","_sim65c02_input","_sim65c02_run_chunk","_sim65c02_cycles","_sim65c02_set_io_addrs","_sim65c02_set_maxcycles"]
 SIZES_MD := Sizes.md
-LSTS := uBASIC6502.LST mini-BASIC65c02.LST 4kBASIC.LST
+LSTS := uBASIC6502.LST mini-BASIC65c02.LST 4kBASIC.LST pBASIC65c02.LST
 
 all: roms
 
@@ -91,6 +102,12 @@ mini-BASIC65c02.bin: mini-BASIC65c02.asm $(ASM)
 4kBASIC.bin: 4kBASIC.asm $(ASM)
 	$(ASM) $< -o $@ -r '$$F000-$$FFFF'
 
+# No -r here (unlike the other three): pBASIC65c02.asm's showcase demo
+# lives in RAM outside the ROM code range, so the EEPROM-burn image needs
+# the full 64KB flat dump too, not just the web-assets one. See v3 history.
+pBASIC65c02.bin: pBASIC65c02.asm $(ASM)
+	$(ASM) $< -o $@
+
 $(WEB_ASSETS_DIR):
 	mkdir -p $@
 
@@ -103,7 +120,10 @@ $(WEB_ASSETS_DIR)/mini-BASIC65c02.bin: mini-BASIC65c02.asm $(ASM) | $(WEB_ASSETS
 $(WEB_ASSETS_DIR)/4kBASIC.bin: 4kBASIC.asm $(ASM) | $(WEB_ASSETS_DIR)
 	$(ASM) $< -o $@ -NoList
 
-$(SIZES_MD): uBASIC6502.asm mini-BASIC65c02.asm 4kBASIC.asm $(ASM)
+$(WEB_ASSETS_DIR)/pBASIC65c02.bin: pBASIC65c02.asm $(ASM) | $(WEB_ASSETS_DIR)
+	$(ASM) $< -o $@ -NoList
+
+$(SIZES_MD): uBASIC6502.asm mini-BASIC65c02.asm 4kBASIC.asm pBASIC65c02.asm $(ASM)
 	@{ \
 		echo "# ROM Free Space"; \
 		echo; \
@@ -112,7 +132,7 @@ $(SIZES_MD): uBASIC6502.asm mini-BASIC65c02.asm 4kBASIC.asm $(ASM)
 		echo; \
 		echo "| Source | LAST_ROM_CODE | Free bytes before vectors |"; \
 		echo "| --- | --- | ---: |"; \
-		for src in uBASIC6502.asm mini-BASIC65c02.asm 4kBASIC.asm; do \
+		for src in uBASIC6502.asm mini-BASIC65c02.asm 4kBASIC.asm pBASIC65c02.asm; do \
 			dump=`$(ASM) $$src --dump-all`; \
 			last_hex=`printf '%s\n' "$$dump" | sed -n 's/^ *\(\$$[0-9A-F]\{4\}\)  LAST_ROM_CODE$$/\1/p'`; \
 			if [ -z "$$last_hex" ]; then \
