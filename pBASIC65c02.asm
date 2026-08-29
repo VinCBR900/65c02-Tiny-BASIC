@@ -1,12 +1,12 @@
 ; =============================================================================
-; PicoBASIC65c02 v0.9  --  Proof of Concept 1 KB Tiny BASIC for 65c02 
+; PicoBASIC65c02 v1.0  --  Proof of Concept 1 KB Tiny BASIC for 65c02 
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Note: Kowalski Memory Mapped IO for now.
 KOWALSKI        = 1
 ;
 ;   CPU    : 65c02 (wanted NMOS but need extra code density)
-;   ROM    : Currently 2 KB  $F800-$FFFF for developmetn but will be $FC00-FFFF
+;   ROM    : 1 KB  $FC00-$FFFF - use 2kbyte for development, see ORIGIN label 
 ;   RAM    : 1 KB  $0000-$03FF
 ;   I/O    : Kowalski emulation 0xE001 PUTCH, 0xE004 GETCH
 ;   NMI/IRQ: Not used
@@ -19,8 +19,11 @@ KOWALSKI        = 1
 ;   $0180-$03FF  BASIC program store (RAM_TOP=$0400)
 ;
 ; Statements accepted (full or 2-letter prefix):
-;   INPUT  END  GOTO <expr> IF  PRINT  WR <expr>
+;   ASK[=INPUT]  END  GOTO <expr> IF  PRINT  WR <expr>
 ;   LIST  NEW  RUN
+;
+; ASK is INPUT's keyword -- 'I' was already taken by IF, so INPUT is
+;   dispatched on 'A' (see TOK_CHARS).
 ; WR <expr> emits an ASCII char - replaces CHR$, not usable in PRINT
 
 ; Arithmetic: + - * /  (unary -) Left to Right Precidence 
@@ -33,9 +36,15 @@ KOWALSKI        = 1
 ;
 ; GETLINE - no Backspace support or range limits - too many characters will crash.
 ;
-; DO_ERROR - minimal error stub, shows error number, no line
+; DO_ERROR - minimal error stub: prints bare "!", no  error code or line number. 
 ;
 ; DO_GO - "GO 10" as FIRST command of a session fails since RUNSP is 0 from NEW.
+;
+; EDITLN is append-only: a typed line number is only accepted if
+;   it's greater than every line currently stored (appends), or if it
+;   matches the current LAST stored line (in-place replace, or delete when
+;   the body is empty). Editing or deleting any earlier/mid-program line
+;   number is rejected with "!" 
 ;
 ; No operator precedence: all six operators (+,-,*,/,=,<) evaluate left to right,
 ;   same tier. Use parentheses to group, e.g. "A*A/64-B*B/64+C" must be written
@@ -60,11 +69,9 @@ KOWALSKI        = 1
 ; Numbers are signed 16-bit only (-32768..32767); arithmetic overflow
 ;   wraps silently (e.g. 32767+1 = -32768) -- it does not raise an error.
 ;
-; Input buffer is 35 usable chars + CR terminator
-;
 ; To save Space, LET keyword not used. 
 ;
-; Error codes
+; Error codes (defined but not used - errors just print "!")
 ;   ?0  syntax / bad expression
 ;   ?1  undefined line number
 ;   ?2  division by zero
@@ -76,146 +83,80 @@ KOWALSKI        = 1
 ;   Line format:  <lineno_lo> <lineno_hi> <raw ASCII body> <CR>
 ;   No tokenisation; body bytes are stored exactly as typed.
 ;
-; ---- version lineage --------------------------------------------------------
-;   v0.1              Initial port from NMOS uBASIC 2kbyte V1.11 
-;   v0.2              Initial Size reduction pass toward 1 KB target:
-;                        - Dropped `%` (MOD), GOSUB/RETURN 
-;                          Relops narrowed to `=` and `<` only
-;                        - Removed Functions and args extraction
-;                        - MATCH_DISPATCH: folded matched-handler push
-;                          and sentinel/no-match push into shared tail.
-;                        - Initial update of Showcase for new functionality
-;   v0.3              Refactor for size, now 1294 Bytes 
-;                        - EXPR/EXPR_ADD/EXPR1 replaced with EXPR/EXPR_LOOP,
-;                          left to right precedence, no tiers.
-;                        - UNI_TAB gained an operator section (6 entries,
-;                          stride 3) ahead of the statement section
-;                        - GETLINE, DO-ERROR minimized.  
-;                        - DELINE/EDITLN/INSLINE code-golfed.
-;                        - EXPR code golfed for O(n) MUL
-;   v0.4              Refactor for Size - 1181 bytes
-;                       - Generalized T0_CMP_LP -> T0_CMPX 
-;                       - Bugfix DELINE's shift loop.
-;                       - Added few 65c02 opcodes
-;                       - Refactor DO_MD for seperate entry points for MUL/DIV
-;   v0.4a             Refactor/Bug Fix - 1186 bytes 
-;                       - Generalized ADD_X_Y to add (T0,Y) into (T0,X)
-;                         instead of hardcoding T1 as the addend. 
-;                       - Reused ADD_X_Y in PNUM's digit-accumulate
-;                         loop (T3 += T0 x10): X=T3, Y=0/T0 fixed for the
-;                         whole loop (ADD_X_Y clobbers neither)
-;   v0.5              Continued Refactor for Size - 911 bytes before vectors
-;                        - Removed CHR$ and THEN; added WR <expr> - writes a
-;                          ASCII char, statement-level replacement for CHR$
-;                        - DO_IF: dropped optional-THEN JSR MTCHKW.  IF still
-;                          nestsas its own statement ("IF a IF b stmt").
-;                        - MTCHKW: dropped trailing-'$' special case for CHR$
-;                        - Showcase updated: "THEN" dropped from every IF;
-;                          CHR$(expr) converted to WR expr
-;                        - ASK/INPUT broken - late breaking.
-;   v0.6              Dispatch refactor - 962 bytes free before vectors
-;                      Replaced UNI_TAB (stride-3 operator + stride-4
-;                      2-char-keyword KW_TAB, RTS-trick dispatch) with
-;                      TOK_CHARS (flat 1 byte/token: 6 operator chars +
-;                      9 statement 1st-letters, unique by design -- see
-;                      the "ASK" rename note from v0.5^) + TOK_VECS (flat
-;                      2 bytes/token, exact addresses) dispatched via
-;                      JMP (TOK_VECS,X). MATCH_DISPATCH now matches a
-;                      statement on its 1st letter alone (was: full
-;                      MTCHKW 2-char compare) -- MTCHKW removed, its
-;                      trailing-letter-skip loop now inlined as SKIP_KW.
-;   v0.7              Debugged a hand-optimized rewrite of EDITLN/INSLINE/
-;                      DELINE (submitted with "adding new lines" broken --
-;                      hung on the very first line typed after NEW). Found
-;                      and fixed 3 bugs, all in the same line-store area:
-;                        - INSLINE's IN_CP copy loop: source, written as
-;                          "LDA (IP),X" / "STA (LP),X", isn't valid 6502/
-;                          65C02 syntax -- indirect-indexed addressing only
-;                          exists as ",Y" (indexed-indirect "(zp,X)" is a
-;                          different mode entirely, computed before the
-;                          dereference). The assembler silently accepted it
-;                          as plain zero-page,X instead of erroring, so it
-;                          compiled to reading/writing raw zero page at
-;                          IP+X / LP+X -- corrupting IP/CURLN/PE/LP/RUN as
-;                          X counted up. This alone was the reported hang.
-;                          Rewritten with Y (free at that point in the
-;                          routine) as proper indirect-indexed addressing.
-;                        - DELINE's shift-down copy was "LDA (T0)/STA (T0)"
-;                          -- same address both sides, a no-op. PE shrank
-;                          by the deleted line's length but the following
-;                          lines' bytes never actually moved down to close
-;                          the gap, desyncing the store from PE (visible
-;                          as a stale duplicate line surviving past the
-;                          new PE, and worse corruption once a 2nd delete
-;                          or insert compounded on top of the first).
-;                          Rewritten to genuinely shift: reads the byte
-;                          `length` bytes ahead (Y, held constant as an
-;                          actual value for the whole loop -- unlike T1
-;                          just above it, which is reused as an address)
-;                          and writes it to T0, walking T0 up to the new
-;                          PE.
-;                        - DO_RUN/RUNLP had no boundary check: after the
-;                          last real line's CR, it would unconditionally
-;                          try to read "the next line" header regardless
-;                          of whether IP had reached PE. Harmless before
-;                          this session (DELINE's shift was a no-op, so
-;                          deleting never left well-formed leftover data
-;                          behind to misread as a phantom extra line) and
-;                          harmless for a program ending in a real END.
-;                          Became a real, reproducible bug once DELINE's
-;                          shift was fixed to actually shift: the freed
-;                          tail past the new PE is left as-is (not
-;                          cleared), and for a multi-line delete-then-RUN
-;                          that tail can be a genuine well-formed leftover
-;                          line, which RUNLP would then execute as if it
-;                          were really there. Added an explicit IP==PE
-;                          check at the top of RUNLP; RUN now also exits
-;                          cleanly (no spurious "!") when a program simply
-;                          runs off the end without an explicit END.
-;                      All 3 verified via sim65c02: single insert,
-;                      out-of-order insert (mid-store shift), exact-match
-;                      replace, delete-only (both list-preserving and
-;                      with multiple trailing lines needing to shift),
-;                      GOTO/IF loop, and the full preloaded showcase.
-;   v0.8              Code golf: DELINE's "PE -= length" was an inline
-;                      SEC/LDA/SBC/STA pair (13 bytes) -- swapped for the
-;                      already-shared NEG_T1+ADD_X_Y helpers (10 bytes at
-;                      the call site, paid for elsewhere already). Length
-;                      (in Y from the DL_LL scan) survives untouched
-;                      through X_TO_T0 and NEG_T1 -- neither clobbers Y --
-;                      so it only needs stashing across the ADD_X_Y call
-;                      itself, which repurposes Y as T1's address, not a
-;                      value; 65C02 PHY/PLY (1 byte each, no TYA/TAY
-;                      needed) instead of stack-via-A. Net 3 bytes: 952
-;                      free (was 949). Full regression re-verified
-;                      unchanged (same 6 cases as v0.7's entry above).
-;   v0.9               954 bytes free before vectors
-;                      Code golf: INSLINE's "new PE = old PE + gap length"
-;                      computed via T0 (a copy of old PE, taken moments
-;                      earlier for the shift loop below) then stored to
-;                      PE (12 bytes: TYA/CLC/ADC T0/STA PE/LDA T0+1/
-;                      ADC #0/STA PE+1). PE's own storage is still the
-;                      old value untouched at that point (T0 is only a
-;                      copy of it), so the add can target PE directly --
-;                      and the high-byte step can drop from an
-;                      unconditional LDA/ADC #0/STA to the standard
-;                      BCC/INC carry-propagate idiom, since the addend's
-;                      (gap length's) own high byte is always 0. 10 bytes.
-;                      Checked ADD_X_Y/ADD_A_X_Y first (same idea as
-;                      DELINE's v0.8 entry above): no win here -- Y (gap
-;                      length) is needed again right after by the shift
-;                      loop's STA (T0),Y, and ADD_X_Y's calling
-;                      convention repurposes Y as the addend's address,
-;                      so surviving the call costs a mandatory PHY/PLY
-;                      with no free ride this time (DELINE's NEG_T1
-;                      detour didn't touch Y; nothing does here) --
-;                      would've been 13 bytes, 1 *worse* than the
-;                      original, so skipped in favor of the direct form.
-;                      Net 2 bytes: 954 free (was 952). Regression
-;                      re-verified (same 6 cases, plus a new 7th: 30
-;                      sequential single-line inserts, chosen to force
-;                      PE's low byte through a page-boundary carry and
-;                      specifically exercise the new BCC/INC path).
+; =============================================================================
+; CHANGE HISTORY
+; =============================================================================
+;
+; v1.0 — Headroom Pass ($FC00 Origin, 2 bytes free, +4 saved)
+;   - Control Flow: Reordered code blocks to convert multiple JMPs to 2-byte BRAs
+;     (e.g., EL_ERR, GOTOL not-found path, PARSE_VAR tail call).
+;   - EL_CPY: Reordered copy loop to use pre-increment and fall-through (-2 bytes).
+;   - SKIP_KW: Merged SK_CONT and SKIP_KW into a single consume-then-check loop,
+;     reusing GETCI's accumulator state (-2 bytes).
+;   - EDITLN: Restructured EL_CPY payload copy to pre-increment. Reused X register
+;     for PE/LP rewind to drop a redundant LDX.
+;   - Docs: Cleaned Stale references to PUTSTR, INSLINE, DELINE, and updated
+;     DO_ERROR limitations to reflect append-only store.
+;   - Docs: Fixed reversed polarity documentation on CHK_CHAR carry flag.
+;
+; v0.10 — Append-Only Line Store (7 bytes over) 
+;   - EDITLN Rewrite: Replaced arbitrary insertion with an append-only/tail-replace
+;     model. New lines must be >= the last stored line.
+;   - DELINE and INSLINE removed entirely, dead code T0_CMP_LP LLEN variables.
+;   - Optimization: Replaced inline LDA/STA pairs with X_TO_T0/T0_TO_X helpers.
+;
+; v0.9 — Size Optimization (954 bytes free, +2 saved)
+;   - INSLINE: Simplified new PE calculation by adding gap length directly to PE
+;     (using BCC/INC carry propagation) rather than copying via T0.
+;
+; v0.8 — Size Optimization (952 bytes free, +3 saved)
+;   - DELINE: Replaced 13-byte inline PE subtraction with shared NEG_T1 + ADD_X_Y
+;     helpers (10 bytes). Stashed Y register across helper call using PHY/PLY.
+;
+; v0.7 — Line Store Bug Fixes
+;   - INSLINE (IN_CP) Bugfix: Replaced invalid LDA (IP),X syntax with LDA (IP),Y 
+;     and updated assembler.
+;   - DELINE: Fixed shift-down copy loop (was LDA (T0)/STA (T0) no-op). Updated loop
+;     to close memory gaps properly.
+;   - RUNLP: Added explicit IP == PE boundary check to prevent executing leftover data
+;     past program end after line deletions.
+;
+; v0.6 — Dispatch Refactor (962 bytes free)
+;   - Replaced UNI_TAB with flat dispatch tables: TOK_CHARS (1 byte/token for
+;     6 operators + 9 unique statement first-letters) and TOK_VECS (2 bytes/token).
+;   - Dispatched via JMP (TOK_VECS,X). Replaced full 2-character MTCHKW compare
+;     with single-letter matching in MATCH_DISPATCH; inlined trailing skip loop.
+;
+; v0.5 — Continued Size Refactor (911 bytes free before vectors)
+;   - Scope changes: Removed CHR$ and THEN. Added WR <expr> (writes ASCII char)
+;     as a statement-level replacement for CHR$.
+;   - DO_IF: Dropped optional THEN matching; IF now nests natively.
+;   - MTCHKW: Removed trailing '$' special case.
+;
+; v0.4a — Refactor & Bug Fix (1186 bytes)
+;   - ADD_X_Y: Generalized to add (T0,Y) into (T0,X) instead of hardcoding T1.
+;   - PNUM: Reused ADD_X_Y in digit-accumulate loop, replacing redundant logic.
+;
+; v0.4 — Size Refactor (1181 bytes)
+;   - Generalization: Replaced T0_CMP_LP with generalized T0_CMPX.
+;   - DO_MD: Split into separate entry points for MUL and DIV.
+;   - Fixes: Corrected DELINE shift loop. Added select 65C02 opcodes.
+;
+; v0.3 — Size Refactor (1294 bytes)
+;   - EXPR: Replaced tiered parsing with EXPR/EXPR_LOOP (strict left-to-right
+;     precedence, no tiers). Optimized MUL to O(n).
+;   - Dispatch: Prepended 6 operator entries (stride 3) to UNI_TAB.
+;   - Code Golf: Minimized GETLINE, DO_ERROR, DELINE, EDITLN, and INSLINE.
+;
+; v0.2 — Initial 1KB Target Pass
+;   - Language Changes: Dropped % (MOD) and GOSUB/RETURN. Relational operators
+;     narrowed to = and < only. Removed functions and argument extraction.
+;   - MATCH_DISPATCH: Merged matched-handler and sentinel pushes into a shared tail.
+;
+; v0.1 — Initial Port
+;   - Initial port from NMOS uBASIC 2kbyte V1.11.
+; =============================================================================
+
 ; ---- assembler mode ---------------------------------------------------------
          .opt proc65c02
 
@@ -224,7 +165,7 @@ IO_OUT   = $E001             ; UART output: write character to terminal
 IO_IN    = $E004             ; UART input:  read character (0 = no char ready)
 
 ; Interpreter Defines
-ORIGIN   = $F800
+ORIGIN   = $FC00
 RAM_TOP  = $0400             ; Assume 1k SRAM (1 KB: 2x 2114)
 HWSTACK  = $7f               ; Give more space to PROG
 PROG     = $101 + HWSTACK    ; Prog Start above Stack 
@@ -270,34 +211,20 @@ LP:         .RS 2              ; 16-bit: line pointer / multi-purpose scratch
 RUN:        .RS 1              ; 8-bit:  run flag ($00 = immediate, $FF = running)
 RUNSP:      .RS 1              ; 8-bit:  stack-pointer snapshot for GOTO/BREAK unwind
 VARS:       .RS 52             ; 52-byte variable store (A-Z, 2 bytes each)
-LLEN:       .RS 1              ; Line length counter 
-IBUF:       .RS IBUF_MAX+1     ; Input line buffer 
+IBUF:       .RS 1              ; Input line buffer 
 ZPEND:		; audit
 ; ---- Zero-page lifetime notes -----------------------------------------
-; Most of these bytes serve a single, obvious purpose. Where a byte serves
-; more than one at different times, that's safe only because this is a
-; single-threaded interpreter with no reentrancy between the uses. If that
-; ever changes (e.g. an IRQ-driven path that touches these), re-check.
 ;   T0   : primary scratch / expression result -- live during nearly any
 ;          statement or expression evaluation; the most heavily reused byte
 ;   T1   : secondary scratch -- OP_HIT's left-operand stash (all six
 ;          operator handlers read it), also the MUL/DIV kernel's
 ;          dividend/multiplicand working value
-;   T2   : tertiary scratch -- PUTSTR/PRNL's string pointer; historically
-;          also a STMT jump target (no longer true since the RTS-trick
-;          dispatch was retired -- MATCH_DISPATCH doesn't touch T2 at all)
-;   T3   : PNUM's x10-multiply accumulator -- a proper 16-bit pair (T3 lo,
-;          T3+1 hi), live only during decimal parsing/printing, adjacent
-;          so its final value can be copied to T0 via X_TO_T0. (DO_MD used
-;          to stash the raw '*'/'/' char here too, checked twice at
-;          runtime; TOK_CHARS/TOK_VECS give '*' and '/' separate entry
-;          points -- MUL_ENTRY/DIV_ENTRY -- so the operator is encoded by
-;          which one got jumped to, and DO_MD instead threads it through
-;          as Y (0=multiply, 1=divide) across its shared sign-computation
-;          body, which doesn't otherwise touch Y)
+;   T2   : tertiary scratch -- MUL/DIV kernel's product/quotient
+;          accumulator (E1_P2/MD_DONE) 
+;   T3   : PNUM's x10-multiply accumulator
 ;   LP   : line-store scan pointer -- shared by EDITLN, GOTOL, DO_LIST,
-;          LSKIP, DELINE, PE_CMP_LP, INSLINE; each call fully consumes LP
-;          before any nested call that might also use it
+;          LSKIP, PE_CMP_LP; each call fully consumes LP before any
+;          nested call that might also use it
 ; -------------------------------------------------------------------------
 
         .IF KOWALSKI
@@ -309,8 +236,6 @@ ZPEND:		; audit
 ;   Runs of plain characters are quoted strings; a literal `"` or `;` in the
 ;   BASIC text is emitted as a raw byte ($22 / $3B) instead of inside.
 ;   One statement per line throughout
-;
-; TO-DO: Finalize showcase once BASIC functionality stabilizes 
 ; 
 ; =============================================================================
 
@@ -419,258 +344,34 @@ TOK_VECS:
           .DW DO_LET          ; index 15: fallback vector for LET/assignment
 
 ; =============================================================================
-; INIT  --  cold start
+; EDITLN  --  MINIMAL append-only line-store editor
 ;
-;   In:  -- (entered via reset vector at $FFFC, or Kowalski JMP trampoline)
-;   Out: never returns; falls through into MAIN
-;   Clobbers: everything
+;   In:  IP -> line-number digits (MAIN has already confirmed the line
+;        starts with a digit)
+;   Out: accepted line appended to the end of the store, or the current
+;        LAST line is replaced/deleted in place; PE/LP updated. Any other
+;        target line number falls through to DO_ERROR and does not return
+;        here.
+;   Clobbers: A X Y T0 T1 IP CURLN PE LP
 ;
-;   clears all zero-page RAM, sets the stack, enables IRQs, initialises PE
-;   to PROG (empty program store), prints the banner, then falls into MAIN.
+;   Rule: a target line number is only accepted if it is greater than
+;   every line currently stored (plain append), or if it exactly matches
+;   the current LAST stored line (in-place replace, or delete when the
+;   typed body is CR-only). Anything else -- a match on a non-last line,
+;   or a number that falls before/between existing lines -- is rejected.
+;   Because storage order is thereby kept == numeric order, GOTOL/DO_RUN/
+;   DO_LIST need no changes: they already walk storage order top to
+;   bottom and never assumed sorted order themselves.
 ; =============================================================================
-INIT:
-         LDX #HWSTACK
-         TXS                  ; set stack to top of page 1
-         CLD                  ; ensure binary (not decimal) mode
-
-        .IF KOWALSKI     
-         JSR DO_END           ; setup RUN
-        .ELSE
-         JSR DO_NEW           ; setup PE, PROG, RUN
-        .ENDIF
-
-; =============================================================================
-; MAIN  --  immediate-mode prompt / dispatch loop
-;
-;   In:  -- (entered by fall-through from INIT/DO_END, or JMP from EDITLN)
-;   Out: never returns (loops back to itself indefinitely)
-;   Clobbers: everything
-;
-;   Reads one line from the terminal.  Lines that start with a digit are
-;   routed to EDITLN (program store editor); else executed via STMT.
-; =============================================================================
-MAIN:
-         LDX #HWSTACK
-         TXS                  ; Reset stack
-         STZ RUN              ; not running
-
-         JSR GETLINE_M        ; print "> "; read line
-
-         JSR WPEEK            ; skip spaces; peek first non-space char into A
-         CMP #CR
-         BEQ MAIN             ; blank line: restart prompt
-         SEC
-         SBC #'0'             ; map '0'..'9' to 0..9; anything outside -> not a digit
-         CMP #10
-         BCS MAIN_DIR         ; >= 10: not a digit -- treat as direct statement
-         JSR EDITLN           ; digit: store / delete numbered line
-         BRA MAIN
-MAIN_DIR:
-         JSR STMT              ; execute as immediate statement
-         BRA MAIN
-
-; =============================================================================
-; DO_LET  --  LET <var> = <expr>  or implicit  <var> = <expr>
-;
-;   In:  IP -> variable name (with optional leading spaces)
-;   Out: variable assigned; IP advanced
-;   Clobbers: A X T0 IP
-;
-; =============================================================================
-DO_LET:
-         JSR PARSE_VAR
-         BCS DL_DN
-         PHA
-         JSR WPEEK
-         CMP #'='
-         BNE DL_POP           ; no '=': bad assignment
-         JSR GETCI            ; consume '='
-         JSR EXPR             ; evaluate RHS -> T0
-         ; falls through into STORE_VAR 
-
-; =============================================================================
-; STORE_VAR  --  shared tail: pop var_offset pushed by caller, store T0 there
-;
-;   In:  T0 = value to store; hardware stack top = var_offset (from PARSE_VAR)
-;   Out: VARS[var_offset] = T0; RTS to caller's caller
-;   Clobbers: A X
-; =============================================================================
-STORE_VAR:
-         PLX            ; restore offset
-         .DB $2c         ; consume next 2 bytes
-T0_TO_CURLN:
-         LDX #CURLN-VARS         ; wraps
-T0_TO_X:         
-         LDA T0
-         STA VARS,X
-         LDA T0+1
-         STA VARS+1,X
-DL_DN:   
-        RTS            
-
-DL_POP:  PLA
-        ; drop through
-; =============================================================================
-; DO_ERROR  --  Useless Error Stub
-; =============================================================================
-DO_ERR_UK:  ;LDA #ERR_UK ; Unknown Var
-;DO_IN_DN:   LDA #ERR_SN ; Syntax Error
-DO_ERR_UL:  ;LDA #ERR_UL ; Unknown Line 
-DO_ERR_OV:  ;LDA #ERR_OV ; Overflow/Div0
-DO_ERROR:
-         ; Generic Error
-         LDA #'!'
-         JSR PUTCH            ; print "N"
-         JSR PRNL             ; CR+LF after error message
-         BRA MAIN
-
-; =============================================================================
-; PARSE_VAR  --  parse a single-letter variable name at IP
-;
-;   In:  IP -> variable name text (leading spaces are skipped)
-;   Out: success: C=0, A = VARS offset (0,2,4..50 for A-Z), IP advanced past
-;        the letter
-;        failure (char not A-Z): C=1, IP unchanged
-;   Clobbers: A
-; =============================================================================
-PARSE_VAR:
-         JSR WPEEK       ; (3)
-         JSR CHK_CHAR    ; Is it a char
-         BCS DO_ERR_UL   ; (2) Nope 
-         ASL             ; (1) double the index for VARS lookup
-         JMP BUMP_IP     ; (3) increments IP, leaves Carry clear (C=0)
-
-; =============================================================================
-; DO_INPUT  --  INPUT <var>
-;
-;   In:  IP -> variable name in source
-;   Out: named variable updated; IP restored to position after variable name
-;   Clobbers: A X Y T0 T1 T2 IP
-; =============================================================================
-DO_INPUT:
-         JSR PARSE_VAR         ; skip spaces; peek var name uppercased
-	 BCS DO_ERR_UK
-         PHA                  ; [S: var_offset]
-         JSR GETLINE          ; Read user input; IP = IBUF
-         JSR EXPR             ; evaluate expression -> T0
-         BRA STORE_VAR         ; tail call: pop var_offset, store T0, RTS
-
-; =============================================================================
-; DO_GO  --  GOTO <linenum>
-;
-;   In:  IP -> line number digits
-;        NOTE: IP and CURLN must be sequential in Zero Page.
-;   Out: IP = body of target line; stack unwound to RUNSP; RUNGO
-;   Clobbers: A X Y T0 IP SP CURLN  (CURLN via GOTOL on a successful lookup)
-;
-; =============================================================================
-DO_GO:
-         JSR EXPR             ; Parse target line number -> T0 (LP no longer needed)
-         JSR GOTOL            ; find line: C=0 found, C=1 not found
-         BCS DO_ERR_UL        ; Line not found error 
-         LDX RUNSP
-         TXS                  ; restore SP to pre-statement state
-         BRA RUNGO            ; Always taken jump into run loop
-
-; =============================================================================
-; DO_RUN  --  RUN  :  execute program starting from the first line
-;
-;   In:  PE = current program end
-;   Out: program executes; returns to MAIN on END/error/STOP
-;   Clobbers: A X Y T0 T1 T2 IP SP RUN CURLN RUNSP
-;
-;   RUNLP: top of the per-line execution loop.  Saves SP so GOTO can unwind.
-;   RUNGO: mid-loop entry used by GOTO (after IP is already set to body).
-; =============================================================================
-DO_RUN:
-         LDX #0
-         JSR PROG2X           ; PROG to IP
-         SMB #0,RUN           ; set run flag (only bit0 is ever tested --
-RUNLP:   LDA IP                ; IP == PE? (natural end of program --
-         CMP PE                ; may not be a hard stop otherwise: e.g.
-         BNE RL_GO             ; DELINE's compaction leaves old, well-
-         LDA IP+1              ; formed data sitting past the new PE,
-         CMP PE+1               ; which would otherwise look like one
-         BEQ RUNEND             ; more real line to execute)
-RL_GO:   TSX
-         STX RUNSP            ; snapshot SP for GOTO / error recovery
-         JSR GETCI            ; read line-number lo
-         STA CURLN
-         JSR GETCI            ; read line-number hi
-         STA CURLN+1
-RUNGO:   JSR STMT               ; execute the statement on this line
-         BBR #0,RUN,RUNEND     ; RUN cleared by END/error -- stop
-SK_LP:   JSR GETCI            ; advance IP past CR (SKIPEOL inlined)
-         CMP #CR
-         BNE SK_LP
- 	 BRA RUNLP		; always taken
-
-; =============================================================================
-; DO_NEW  --  NEW  :  Set default program store
-; DO_END  --  END  :  halt program execution and return to immediate mode
-; =============================================================================
-DO_NEW:
-         LDX #4
-         JSR PROG2X            ; PE = PROG
-DO_END:
-RUNEND:  STZ RUN
-EL_DN:
-DL_DONE: RTS
-
-; =============================================================================
-; DELINE  --  remove the line at LP from the program store; adjust PE
-;
-;   In:  LP -> start of line to delete (the line-number lo byte)
-;        PE -> one past the last program byte
-;   Out: line removed; PE = new end of program
-;        LP is PRESERVED (unlike the original routine -- callers no longer
-;        need to save/restore it around this call)
-;   Clobbers: A X Y T0 T1 PE
-;
-; =============================================================================
-DELINE:
-         LDY #2
-DL_LL:   LDA (LP),Y
-         INY
-         CMP #CR
-         BNE DL_LL            ; Y = length (this line's full size, incl.
-                               ; header+CR) -- stays fixed as the loop's
-                               ; constant source-ahead offset throughout
-         LDX #LP-VARS
-         JSR X_TO_T0           ; T0 = LP (single shifting pointer)
-         STY T1                ; T1 = length (plain byte value, 0 hi --
-         STZ T1+1              ; a line is always well under 256 bytes)
-         PHY                   ; stash length -- ADD_X_Y is about to
-                                ; repurpose Y as T1's address, not a value
-         JSR NEG_T1            ; T1 = -length
-         LDX #PE
-         LDY #T1
-         JSR ADD_X_Y           ; PE += T1 (= PE - length)
-         PLY                   ; Y = length again: fixed read-ahead
-                                ; offset for the whole loop below
-         LDX #PE
-         ; Top-tested loop: test BEFORE copying.
-DL_CP:   JSR T0_CMPX           ; T0 == (new, already-shrunk) PE ?
-         BEQ DL_DONE
-         LDA (T0),Y            ; read the byte `length` ahead (source)
-         STA (T0)              ; write to T0 itself (dest)
-         ; Bump T0
-         INC T0
-         BNE DL_CP
-         INC T0+1
-         BRA DL_CP
-
-; =============================================================================
-; EDITLN  --  insert, replace, or delete a numbered line in the program store
-; =============================================================================
+EL_ERR:  JMP DO_ERROR           ; out of order / mid-store edit rejected
 EDITLN:
          JSR PNUM             ; parse line number -> T0; IP advances past digits
          JSR T0_TO_CURLN
          JSR PROG2LP
          BRA EL_FL            ; skip the LSKIP on first pass
-EL_SKIP: JSR LSKIP            ; advance LP to next line (Z=1 on return)
-EL_FL:   JSR PE_CMP_LP        ; is LP == PE? (reached end of store)
-         BEQ EL_INS           ; yes: insert at end
+EL_SKIP: JSR LSKIP            ; advance LP to next line
+EL_FL:   JSR PE_CMP_LP        ; reached end of store?
+         BEQ EL_CHK_CR        ; yes: nothing to match against -- append
 
          ; --- 16-BIT COMPARISON BLOCK ---
          LDY #1
@@ -681,71 +382,50 @@ EL_FL:   JSR PE_CMP_LP        ; is LP == PE? (reached end of store)
          CMP CURLN            ; Compare low bytes
          
 EL_CK_LO:BCC EL_SKIP          ; stored line < target: keep scanning
-         BNE EL_INS           ; stored line > target: insert before here (skip DELINE)
-         JSR DELINE           ; exact match: delete existing (LP preserved)
-EL_INS:  JSR WPEEK            ; skip spaces + peek (no consume) first body char
-         CMP #CR
-         BEQ EL_DN            ; CR only: delete-only
-         ; fall through into INSLINE to insert the body
+         BNE EL_ERR           ; stored line > target: out of order
 
-; =============================================================================
-; INSLINE  --  insert one line at LP; body text comes from IP (in IBUF)
-; NOTE - MINIMAL, no Out of memory/RAM checks
-; =============================================================================
-INSLINE:
-         ; Calculate new line length and store in Y
-         SEC
-         LDA LLEN
-         SBC IP               ; IP is ZP pointer, subtracts IP_LO
-         CLC
-         ADC #<IBUF+2         ; +2 for the 2-byte line number header
-         TAY                  ; Y = Gap Length (Insertion size)
+         ; --- exact match: legal only if it's the LAST stored line ---
+         LDX #LP-VARS
+         JSR X_TO_T0           ; T0 = LP (start of the matched line)
+         JSR LSKIP             ; advance LP past the matched line
+         JSR PE_CMP_LP         ; did that land on the end of the store?
+         BNE EL_ERR            ; no: an earlier line -- reject
 
-         ; Set T0 = Old PE
+  ;       LDX #LP-VARS
+         JSR T0_TO_X             ; LP = T0 (ready to overwrite in place)
          LDX #PE-VARS
-         JSR X_TO_T0
+         JSR T0_TO_X            ; PE = T0 (excise the matched line)
 
-         ; New PE = old PE (still sitting in PE, untouched so far) + Y
-         TYA
-         CLC
-         ADC PE
-         STA PE
-         BCC IN_NC             ; gap length's own hi byte is always 0 --
-         INC PE+1              ; only a carry can reach PE+1
-IN_NC:
-
-         ; Check if we are inserting at the very end of the file
-         JSR T0_CMP_LP          ; If old PE == LP, nothing to shift
-         BEQ IN_HDR
-         
-         ; --- 65C02 ONE-POINTER SHIFT LOOP ---
-IN_BK:   LDA T0               ; 16-bit pre-decrement source (T0)
-         BNE IN_D0
-         DEC T0+1
-IN_D0:   DEC T0
-
-         LDA (T0)             ; 65C02: Read from Source
-         STA (T0),Y           ; 65C02: Write to Dest (Source + Gap Length)
-         
-         JSR T0_CMP_LP        ; Stop when T0 has shifted the byte at LP
-         BNE IN_BK
-         
-         ; --- INSERTION ---
-IN_HDR:  LDA CURLN            
-         STA (LP)             ; write line number lo
-         LDY #1
-         LDA CURLN+1          
-         STA (LP),Y           ; write line number hi
-         JSR ADD2_LP          ; advance LP by 2 for the payload
-         
-         LDY #0
-IN_CP:   LDA (IP),Y           ; copy payload from IBUF
-         STA (LP),Y
-         INY
+EL_CHK_CR:
+         JSR WPEEK             ; skip spaces + peek (no consume) first body char
          CMP #CR
-         BNE IN_CP
-LS_DONE:
-         RTS
+         BEQ EL_DN             ; CR only: delete-only, done
+        ; *LP=CURLN
+         LDA CURLN
+         STA (LP)              ; write line number lo
+         LDY #1
+         LDA CURLN+1
+         STA (LP),Y            ; write line number hi
+         ;
+         JSR ADD2_LP           ; LP += 2, past the header
+
+         LDY #$FF
+EL_CPY:  INY
+         LDA (IP),Y            ; copy payload from IBUF
+         STA (LP),Y
+         CMP #CR
+         BNE EL_CPY
+
+EL_UPD:  TYA                   ; A = payload length (excluding CR)
+         SEC                   ; carry set = the +1 for the CR just stored
+         ADC LP
+         STA PE
+         LDA LP+1
+         ADC #0
+         STA PE+1
+EL_DN:
+LS_DONE: RTS                    ; shared with DO_LIST's end-of-program exit
+
 
 ; =============================================================================
 ; DO_LIST  --  LIST  :  print all program lines in source form
@@ -758,11 +438,13 @@ DO_LIST:
          JSR PROG2LP
 LS_LN:   JSR PE_CMP_LP           ; PE == LP
          BEQ LS_DONE          ; end of program: branches to shared RTS above
+         ; T0 = line number
          LDY #1
          LDA (LP)             ; read line number lo
          STA T0
          LDA (LP),Y           ; read line number hi
          STA T0+1
+         ;
          JSR PRT16            ; print line number
          JSR PRTSPACE
          JSR ADD2_LP
@@ -793,31 +475,30 @@ LS_EOL:  JSR PRNL              ; print CR+LF at end of each listed line
 ; =============================================================================
 GOTOL:
          JSR PROG2LP
-GT_SC:   JSR PE_CMP_LP            ; test LP == PE (end of store)
-         BEQ GT_FAIL           ; not found
-         LDA (LP)              ; read line-number lo
-         CMP T0                ; compare line-number lo
+GT_SC:   JSR PE_CMP_LP        ; If LP == PE, Z=1 AND C=1
+         BEQ COPY_LP_IP       ; End of program? Exit immediately! (Carry is already 1!)
+         
+         LDA (LP)             ; 65C02: implied Y=0 (Read line-number lo)
+         CMP T0
          BNE GT_NX
          LDY #1
          LDA (LP),Y
          CMP T0+1             ; compare line-number hi
-         BEQ GT_OK
-GT_NX:   JSR LSKIP             ; advance LP to next line (shared w/ EDITLN)
-         BEQ GT_SC              ; LSKIP's only exit is via CMP #CR -- Z=1 guaranteed
+         BEQ GT_OK            ; Found it!
+         
+GT_NX:   JSR LSKIP            ; advance LP to next line
+         BRA GT_SC            ; 65C02: Use BRA instead of BEQ (same size, more robust)
 
-GT_OK:   ; Copy T0 to CURLN
-         JSR T0_TO_CURLN
+GT_OK:   JSR T0_TO_CURLN
          JSR ADD2_LP          ; LP += 2, past the 2-byte header
-         CLC                  ; C=0: found
+         CLC                  ; C=0 means Success
+         
 COPY_LP_IP:
-         LDA LP               ; IP = LP (Carry flag passes through these unchanged)
+         LDA LP               ; Carry flag passes through these unchanged
          STA IP
          LDA LP+1
          STA IP+1
-         RTS                  ; Exit with C=0 (from GT_OK) or C=1 (from GT_FAIL)
-
-GT_FAIL: SEC                  ; C=1: not found
-         BRA COPY_LP_IP
+         RTS                  ; Exit. C=1 (Not Found) or C=0 (Found)
 
 ; =============================================================================
 ; EXPR  --  strictly left-to-right expression evaluator (no operator
@@ -826,11 +507,7 @@ GT_FAIL: SEC                  ; C=1: not found
 ;   real examples of exactly this).
 ;
 ;   Operators matched against TOK_CHARS's operator section (X counts up
-;   from -1 -- see TOK_CHARS/TOK_VECS header). OP_HIT plays DO_OP's old
-;   role: consumes the operator, stashes the left operand (T0) on the
-;   hardware stack, parses the right operand via EXPR2 into T0, then pops
-;   the left operand into T1 -- before falling into the DO_DISP trampoline
-;   shared with MATCH_DISPATCH.
+;   from -1 -- see TOK_CHARS/TOK_VECS header).
 ;
 ;   In:  IP -> expression text
 ;   Out: T0 = result; IP advanced past expression
@@ -899,7 +576,8 @@ DO_DISP:
          TXA
          ASL                  ; *2 for word offset into TOK_VECS
          TAX
-         JMP (TOK_VECS,X)
+         JMP (TOK_VECS,X)       ; and jump to DO_xxx
+         
 EXPR:
          JSR EXPR2            ; parse the first atom -> T0
 EXPR_LOOP:
@@ -962,6 +640,7 @@ DV_LP:
          INC T2               ; Quotient tally
          BNE DV_LP
          INC T2+1
+         ;
          BNE DV_LP
 
 MD_DONE: LDX #T2-VARS        ; Copy T2 to T0
@@ -1082,16 +761,216 @@ E2_PAR:  JSR GETCI            ; consume '('
 ;
 ;   In:  IP -> char to fetch
 ;   Out: A = char; IP incremented (16-bit)
-;   Clobbers: A Y IP
+;   Clobbers: A IP
 ; =============================================================================
 GETCI:   LDA (IP)
 BUMP_IP:         
          INC IP               ; 16-bit increment
-         BNE GETCI_SK
+         BNE GETCI_RTS
          INC IP+1
+GETCI_RTS:        
+         RTS
+
+; =============================================================================
+; INIT  --  cold start
+;
+;   In:  -- (entered via reset vector at $FFFC, or Kowalski JMP trampoline)
+;   Out: never returns; falls through into MAIN
+;   Clobbers: everything
+;
+;   clears all zero-page RAM, sets the stack, enables IRQs, initialises PE
+;   to PROG (empty program store), prints the banner, then falls into MAIN.
+; =============================================================================
+INIT:
+         LDX #HWSTACK
+         TXS                  ; set stack to top of page 1
+         CLD                  ; ensure binary (not decimal) mode
+
+        .IF KOWALSKI     
+         JSR DO_END           ; setup RUN
+        .ELSE
+         JSR DO_NEW           ; setup PE, PROG, RUN
+        .ENDIF
+
+; =============================================================================
+; MAIN  --  immediate-mode prompt / dispatch loop
+;
+;   In:  -- (entered by fall-through from INIT/DO_END, or JMP from DO_ERROR)
+;   Out: never returns (loops back to itself indefinitely)
+;   Clobbers: everything
+;
+;   Reads one line from the terminal.  Lines that start with a digit are
+;   routed to EDITLN (program store editor); else executed via STMT.
+; =============================================================================
+MAIN:
+         LDX #HWSTACK
+         TXS                  ; Reset stack
+         STZ RUN              ; not running
+
+         JSR GETLINE_M        ; print "> "; read line
+
+         JSR WPEEK            ; skip spaces; peek first non-space char into A
+         CMP #CR
+         BEQ MAIN             ; blank line: restart prompt
+         SEC
+         SBC #'0'             ; map '0'..'9' to 0..9; anything outside -> not a digit
+         CMP #10
+         BCS MAIN_DIR         ; >= 10: not a digit -- treat as direct statement
+         JSR EDITLN           ; digit: store / delete numbered line
+         BRA MAIN
+MAIN_DIR:
+         JSR STMT              ; execute as immediate statement
+         BRA MAIN
+
+; =============================================================================
+; DO_LET  --  LET <var> = <expr>  or implicit  <var> = <expr>
+;
+;   In:  IP -> variable name (with optional leading spaces)
+;   Out: variable assigned; IP advanced
+;   Clobbers: A X T0 IP
+;
+; =============================================================================
+DO_LET:
+         JSR PARSE_VAR
+         BCS DL_DN
+         PHA
+         JSR WPEEK
+         CMP #'='
+         BNE DL_POP           ; no '=': bad assignment
+         JSR GETCI            ; consume '='
+         JSR EXPR             ; evaluate RHS -> T0
+         ; falls through into STORE_VAR 
+
+; =============================================================================
+; STORE_VAR  --  shared tail: pop var_offset pushed by caller, store T0 there
+;
+;   In:  T0 = value to store; hardware stack top = var_offset (from PARSE_VAR)
+;   Out: VARS[var_offset] = T0; RTS to caller's caller
+;   Clobbers: A X
+; =============================================================================
+STORE_VAR:
+         PLX            ; restore offset
+         .DB $2c         ; consume next 2 bytes
+T0_TO_CURLN:
+         LDX #CURLN-VARS         ; wraps
+T0_TO_X:         
+         LDA T0
+         STA VARS,X
+         LDA T0+1
+         STA VARS+1,X
 DO_IF_F:
-GETCI_SK: RTS
-         
+DL_DN:   
+        RTS            
+
+DL_POP:  PLA
+        ; drop through
+; =============================================================================
+; DO_ERROR  --  Useless Error Stub
+; =============================================================================
+DO_ERR_UK:  ;LDA #ERR_UK ; Unknown Var
+;DO_IN_SN:   LDA #ERR_SN ; Syntax Error
+DO_ERR_UL:  ;LDA #ERR_UL ; Unknown Line 
+DO_ERR_OV:  ;LDA #ERR_OV ; Overflow/Div0
+DO_ERROR:
+         ; Generic Error
+         LDA #'!'
+         JSR PUTCH            ; print "N"
+         JSR PRNL             ; CR+LF after error message
+         BRA MAIN
+
+; =============================================================================
+; PARSE_VAR  --  parse a single-letter variable name at IP
+;
+;   In:  IP -> variable name text (leading spaces are skipped)
+;   Out: success: C=0, A = VARS offset (0,2,4..50 for A-Z), IP advanced past
+;        the letter
+;        failure (char not A-Z): C=1, IP unchanged
+;   Clobbers: A
+; =============================================================================
+PARSE_VAR:
+         JSR WPEEK       ; (3)
+         JSR CHK_CHAR    ; Is it a char
+         BCS DO_ERR_UL   ; (2) Nope 
+         ASL             ; (1) double the index for VARS lookup
+         BRA BUMP_IP     ; (2) increments IP, leaves Carry clear (C=0)
+
+; =============================================================================
+; DO_NEW  --  NEW  :  Set default program store
+; DO_END  --  END  :  halt program execution and return to immediate mode
+; =============================================================================
+DO_NEW:
+         LDX #4
+         JSR PROG2X            ; PE = PROG
+DO_END:
+RUNEND:  STZ RUN
+GETCI_SK: 
+DL_DONE: RTS
+
+; =============================================================================
+; DO_INPUT  --  INPUT <var>
+;
+;   In:  IP -> variable name in source
+;   Out: named variable updated; IP restored to position after variable name
+;   Clobbers: A X Y T0 T1 T2 IP
+; =============================================================================
+DO_INPUT:
+         JSR PARSE_VAR         ; skip spaces; peek var name uppercased
+	 BCS DO_ERR_UK
+         PHA                  ; [S: var_offset]
+         JSR GETLINE          ; Read user input; IP = IBUF
+         JSR EXPR             ; evaluate expression -> T0
+         BRA STORE_VAR         ; tail call: pop var_offset, store T0, RTS
+
+; =============================================================================
+; DO_GO  --  GOTO <linenum>
+;
+;   In:  IP -> line number digits
+;        NOTE: IP and CURLN must be sequential in Zero Page.
+;   Out: IP = body of target line; stack unwound to RUNSP; RUNGO
+;   Clobbers: A X Y T0 IP SP CURLN  (CURLN via GOTOL on a successful lookup)
+;
+; =============================================================================
+DO_GO:
+         JSR EXPR             ; Parse target line number -> T0 (LP no longer needed)
+         JSR GOTOL            ; find line: C=0 found, C=1 not found
+         BCS DO_ERR_UL        ; Line not found error 
+         LDX RUNSP
+         TXS                  ; restore SP to pre-statement state
+         BRA RUNGO            ; Always taken jump into run loop
+
+; =============================================================================
+; DO_RUN  --  RUN  :  execute program starting from the first line
+;
+;   In:  PE = current program end
+;   Out: program executes; returns to MAIN on END/error/STOP
+;   Clobbers: A X Y T0 T1 T2 IP SP RUN CURLN RUNSP
+;
+;   RUNLP: top of the per-line execution loop.  Saves SP so GOTO can unwind.
+;   RUNGO: mid-loop entry used by GOTO (after IP is already set to body).
+; =============================================================================
+DO_RUN:
+         LDX #0
+         JSR PROG2X           ; PROG to IP
+         SMB #0,RUN           ; set run flag (only bit0 is ever tested --
+RUNLP:   LDA IP                ; IP == PE? (natural end of program --
+         CMP PE                ; may not be a hard stop otherwise: a
+         BNE RL_GO             ; deleted/replaced last line leaves old,
+         LDA IP+1              ; well-formed data sitting past the new
+         CMP PE+1               ; PE, which would otherwise look like
+         BEQ RUNEND             ; one more real line to execute)
+RL_GO:   TSX
+         STX RUNSP            ; snapshot SP for GOTO / error recovery
+         JSR GETCI            ; read line-number lo
+         STA CURLN
+         JSR GETCI            ; read line-number hi
+         STA CURLN+1
+RUNGO:   JSR STMT               ; execute the statement on this line
+         BBR #0,RUN,RUNEND     ; RUN cleared by END/error -- stop
+SK_LP:   JSR GETCI            ; advance IP past CR (SKIPEOL inlined)
+         CMP #CR
+         BNE SK_LP
+ 	 BRA RUNLP		; always taken
+
 ; =============================================================================
 ; DO_IF  --  IF <expr> THEN <stmt>  (THEN keyword is optional)
 ;
@@ -1151,11 +1030,10 @@ MD_LP:   INX
 DO_LET_IDX:
         JMP DO_LET
 
-SK_CONT: JSR GETCI
-SKIP_KW: LDA (IP)              ; consume the keyword's letters (starting
+SKIP_KW: JSR GETCI              ; consume next letter (char lands in A too)
          JSR CHK_CHAR
-         BCC SK_CONT           ; still a letter: keep skipping
-         JMP DO_DISP           ; not a letter: done skipping, dispatch
+         BCC SKIP_KW            ; still a letter: keep consuming
+         JMP DO_DISP
 
 ; =============================================================================
 ; PRT16  --  print T0 as a signed decimal integer
@@ -1238,7 +1116,7 @@ DO_WR:   JSR EXPR             ; evaluate <expr> -> T0
 ;     GETLINE    no prompt
 ;
 ;   In:  --
-;   Out: IBUF filled with input, CR-terminated; X is # chars; LLEN is # chars
+;   Out: IBUF filled with input, CR-terminated; X is # chars
 ;   Clobbers: A, X is GETLINE's own buffer index
 ;   
 ;   Note: NO Range checking/Backspace support - Overflow could crash  
@@ -1260,7 +1138,6 @@ GL_LOOP:
          INX            ; (1) Advance index
          CMP #CR        ; (2) Was it a carriage return?
          BNE GL_LOOP    ; (2) If not, keep reading
-         STX LLEN       ; save Line Len for whoever wants it 
         ; drop through
 ; =============================================================================
 ; DO_PRINT  --  PRINT [item [; item] ...]
@@ -1272,7 +1149,7 @@ GL_LOOP:
 ;   Items: string literals ("..."), or numeric expressions.
 ;   Items separated by ';' suppress the inter-item space.
 ;   A trailing ';' suppresses the final CR/LF.
-;   At end of items (or with no items) falls through into PUTSTR to emit CR/LF.
+;   At end of items (or with no items) falls through into PRNL to emit CR/LF.
 ; =============================================================================
 DP_NL:   
 PRNL:    LDA #CR
@@ -1343,7 +1220,7 @@ CHK_CHAR:
 ;   In:  IP -> text (may start with spaces)
 ;   Out: A = first non-space char; IP advanced past any leading spaces
 ;        (char is NOT consumed -- IP still points to it)
-;   Clobbers: A Y  (Y via GETCI when a space is skipped)
+;   Clobbers: A
 ;
 ;   Two labels for the same entry point (names document caller intent):
 ;     WSKIP     -- skip side-effect is desired
@@ -1357,7 +1234,7 @@ WPEEK:   LDA (IP)
          BRA WSKIP            ; always taken (' ' = $20, nonzero)
 
 ; =============================================================================
-; ADD2_LP  --  LP += 2 (shared by INSLINE and DO_LIST, skip a 2-byte header)
+; ADD2_LP  --  LP += 2 (shared by EDITLN, DO_LIST, GOTOL, and LSKIP internally)
 ;
 ;   In:  LP
 ;   Out: LP advanced by 2
@@ -1383,7 +1260,7 @@ PROG2X:  LDA #<PROG
          RTS
 
 ; =============================================================================
-; PE_CMP_LP  --  compare LP against PE (shared by EDITLN, GOTOL, DO_LIST/FETCH)
+; PE_CMP_LP  --  compare LP against PE (shared by EDITLN, GOTOL, DO_LIST)
 ;
 ;   In:  LP
 ;   Out: Z=1 if LP == PE, Z=0 otherwise
@@ -1418,8 +1295,6 @@ LSK_LP:  LDA (LP)       ; Read current character
 ;   Out: Z=1 if T0 == (X,X+1), Z=0 otherwise
 ;   Clobbers: A
 ; =============================================================================
-T0_CMP_LP:
-         LDX #LP
 T0_CMPX:
          LDA T0
          CMP 0,X
