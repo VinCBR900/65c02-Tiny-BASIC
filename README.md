@@ -22,7 +22,7 @@ https://vincbr900.github.io/65c02-Tiny-BASIC/
 > If you've found these Tiny BASIC interpreters useful for learning, retrocomputing, or your own projects, you can buy me a coffee.  Donations are entirely optional but greatly appreciated.
 > [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/vpcrabtreeZ)
 
-### pBASIC65c02 — fits in a 2708/2758 EPROM (<1 KByte)
+### Pico-BASIC `pBASIC65c02.ASM` — fits in a 2708/2758 EPROM (<1 KByte)
 
 **<1024 bytes assembled. ROM at $FC00–$FFFF**
 
@@ -45,7 +45,7 @@ A tiny but complete integer Tiny BASIC. No tokeniser - BASIC program lines are s
 
 **Errors** Minimal error handling, just printed as `!'
 
-### uBASIC6502 — fits in a 2716 EPROM (<2 KByte)
+### Micro-BASIC `uBASIC6502.ASM` — fits in a 2716 EPROM (<2 KByte)
 
 **<2048 bytes assembled. ROM at $F800–$FFFF**
 
