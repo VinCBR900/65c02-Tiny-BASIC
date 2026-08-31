@@ -87,11 +87,17 @@ KOWALSKI        = 1
 ; CHANGE HISTORY
 ; =============================================================================
 ;
-; v1.1 — 11 bytes free before vectors
-;   - DO_EQ: inlined T0_CMPX its only caller, only for T1.
-;   - Reordered for local BRA
+; v1.1 — 4 bytes free before vectors
+;   - Inlined T0_CMPX in DO_EQ as only caller.
+;   - Refactored ADD_T0_X as shortcut for ADD_Y_X as most common caller.
+;   - Reordered for subroutine local BRA.
+;   - Inlined NEG_T1 to NEG_X plus setup as only one caller.
+;   - Shared some Relop setup with DO_DISP.
+;   - Refactored *LP with X comparison CMP_PLP_X, hardly any benefit.
+;   - Minor opcode tweaks here and there for a couple bytes.
+;   - Restored Signon Banner (requires 21 bytes if you want to cut it)
 ;
-; v1.0 — Headroom Pass ($FC00 Origin, 2 bytes free, +4 saved)
+; v1.0 — Headroom Pass ($FC00 Origin, 2 bytes free)
 ;   - Control Flow: Reordered code blocks to convert multiple JMPs to 2-byte BRAs
 ;     (e.g., EL_ERR, GOTOL not-found path, PARSE_VAR tail call).
 ;   - EL_CPY: Reordered copy loop to use pre-increment and fall-through (-2 bytes).
@@ -114,7 +120,7 @@ KOWALSKI        = 1
 ;     (using BCC/INC carry propagation) rather than copying via T0.
 ;
 ; v0.8 — Size Optimization (952 bytes free, +3 saved)
-;   - DELINE: Replaced 13-byte inline PE subtraction with shared NEG_T1 + ADD_X_Y
+;   - DELINE: Replaced 13-byte inline PE subtraction with shared NEG_T1 + ADD_Y_X
 ;     helpers (10 bytes). Stashed Y register across helper call using PHY/PLY.
 ;
 ; v0.7 — Line Store Bug Fixes
@@ -138,8 +144,8 @@ KOWALSKI        = 1
 ;   - MTCHKW: Removed trailing '$' special case.
 ;
 ; v0.4a — Refactor & Bug Fix (1186 bytes)
-;   - ADD_X_Y: Generalized to add (T0,Y) into (T0,X) instead of hardcoding T1.
-;   - PNUM: Reused ADD_X_Y in digit-accumulate loop, replacing redundant logic.
+;   - ADD_Y_X: Generalized to add (T0,Y) into (T0,X) instead of hardcoding T1.
+;   - PNUM: Reused ADD_Y_X in digit-accumulate loop, replacing redundant logic.
 ;
 ; v0.4 — Size Refactor (1181 bytes)
 ;   - Generalization: Replaced T0_CMP_LP with generalized T0_CMPX.
@@ -217,9 +223,10 @@ RUNSP:      .RS 1              ; 8-bit:  stack-pointer snapshot for GOTO/BREAK u
 VARS:       .RS 52             ; 52-byte variable store (A-Z, 2 bytes each)
 IBUF:       .RS 1              ; Input line buffer 
 ZPEND:		; audit
+
 ; ---- Zero-page lifetime notes -----------------------------------------
 ;   T0   : primary scratch / expression result -- live during nearly any
-;          statement or expression evaluation; the most heavily reused byte
+;          statement or expression evaluation
 ;   T1   : secondary scratch -- OP_HIT's left-operand stash (all six
 ;          operator handlers read it), also the MUL/DIV kernel's
 ;          dividend/multiplicand working value
@@ -306,6 +313,8 @@ SHOWCASE_END:	.DW 0
 ; =============================================================================
 ; ROM START  
          .ORG ORIGIN
+; Banner must be at $xx00          
+BANNER: .DB "pBASIC V1.1",0
 
 ; =============================================================================
 ; TOK_CHARS / TOK_VECS -- combined match-char + dispatch-vector tables.
@@ -396,17 +405,14 @@ GOTOL:
          JSR PROG2LP
 GT_SC:   JSR PE_CMP_LP        ; If LP == PE, Z=1 AND C=1
          BEQ COPY_LP_IP       ; End of program? Exit immediately! (Carry is already 1!)
-         
-         LDA (LP)             ; 65C02: implied Y=0 (Read line-number lo)
-         CMP T0
-         BNE GT_NX
-         LDY #1
-         LDA (LP),Y
-         CMP T0+1             ; compare line-number hi
+
+        LDX #T0 ;compare with T0
+        JSR CMP_PLP_X
+         ;
          BEQ GT_OK            ; Found it!
          
 GT_NX:   JSR LSKIP            ; advance LP to next line
-         BRA GT_SC            ; 65C02: Use BRA instead of BEQ (same size, more robust)
+         BRA GT_SC            ; Loop
 
 GT_OK:   JSR T0_TO_CURLN
          JSR ADD2_LP          ; LP += 2, past the 2-byte header
@@ -418,6 +424,7 @@ COPY_LP_IP:
          LDA LP+1
          STA IP+1
 LS_DONE:
+EL_DN:
          RTS                  ; Exit. C=1 (Not Found) or C=0 (Found)
 
 ; =============================================================================
@@ -448,15 +455,9 @@ EDITLN:
 EL_SKIP: JSR LSKIP            ; advance LP to next line
 EL_FL:   JSR PE_CMP_LP        ; reached end of store?
          BEQ EL_CHK_CR        ; yes: nothing to match against -- append
+        LDX #CURLN              ; compare CURLN with *LP
+        JSR CMP_PLP_X           ; returns with Y=1
 
-         ; --- 16-BIT COMPARISON BLOCK ---
-         LDY #1
-         LDA (LP),Y           ; Compare high bytes first
-         CMP CURLN+1
-         BNE EL_CK_LO         ; If different, flags are ready for evaluation
-         LDA (LP)             ; 
-         CMP CURLN            ; Compare low bytes
-         
 EL_CK_LO:BCC EL_SKIP          ; stored line < target: keep scanning
          BNE EL_ERR           ; stored line > target: out of order
 
@@ -467,7 +468,6 @@ EL_CK_LO:BCC EL_SKIP          ; stored line < target: keep scanning
          JSR PE_CMP_LP         ; did that land on the end of the store?
          BNE EL_ERR            ; no: an earlier line -- reject
 
-  ;       LDX #LP-VARS
          JSR T0_TO_X             ; LP = T0 (ready to overwrite in place)
          LDX #PE-VARS
          JSR T0_TO_X            ; PE = T0 (excise the matched line)
@@ -476,13 +476,13 @@ EL_CHK_CR:
          JSR WPEEK             ; skip spaces + peek (no consume) first body char
          CMP #CR
          BEQ EL_DN             ; CR only: delete-only, done
+        
         ; *LP=CURLN
          LDA CURLN
          STA (LP)              ; write line number lo
-         LDY #1
          LDA CURLN+1
-         STA (LP),Y            ; write line number hi
-         ;
+         STA (LP),Y            ; write line number hi (Y is 1 from above)
+         ;      
          JSR ADD2_LP           ; LP += 2, past the header
 
          LDY #$FF
@@ -492,6 +492,7 @@ EL_CPY:  INY
          CMP #CR
          BNE EL_CPY
 
+        ; this is the only place PE arithmetic occurs 
 EL_UPD:  TYA                   ; A = payload length (excluding CR)
          SEC                   ; carry set = the +1 for the CR just stored
          ADC LP
@@ -499,8 +500,7 @@ EL_UPD:  TYA                   ; A = payload length (excluding CR)
          LDA LP+1
          ADC #0
          STA PE+1
-EL_DN:
-        RTS                    ; shared with DO_LIST's end-of-program exit
+         RTS                    ;
 
 ; =============================================================================
 ; EXPR  --  strictly left-to-right expression evaluator (no operator
@@ -519,23 +519,20 @@ E1_OVFL:  ;JMP DO_ERR_OV
 EL_ERR:  JMP DO_ERROR           ; out of order / mid-store edit rejected
 
 ; --- Relational: Equality ---
-DO_EQ:   LDA T0                ; equality is symmetric: T0 vs T1 == T1 vs T0
-         CMP T1                ; (inlined former T0_CMPX -- single caller,
-         BNE REL_F              ; no indexed ,X form needed once specialised
-         LDA T0+1                ; to T1)
-         CMP T1+1
+; LDA T1/ CMP T0 already done
+DO_EQ:   BNE REL_F              ; no indexed ,X form needed once specialised
+         LDA T1+1                ; to T1)
+         CMP T0+1
          BEQ REL_T
          BRA REL_F            ; always taken (Z=0 here)
 
 ; --- Relational: Less Than ---
-DO_LT:   LDA T1
-         CMP T0               ; Replaces SEC + SBC T0
-         LDA T1+1
+; LDA T1/ CMP T0 already done
+DO_LT:   LDA T1+1
          SBC T0+1
          BVC NO_FLIP          ; N XOR V trick for signed comparison
          EOR #$80
 NO_FLIP: BMI REL_T            ; If N=1, condition is true
-
 REL_F:   LDA #0               ; False: Result = $0000
          .DB $2C              ; BIT abs trick: skips the next 2 bytes (LDA #$FF)
 REL_T:   LDA #$FF             ; True:  Result = $FFFF
@@ -544,7 +541,7 @@ REL_T:   LDA #$FF             ; True:  Result = $FFFF
          BRA EXPR_LOOP
 
 ; --- Addition & Subtraction ---
-DO_SUB:  JSR NEG16            ; negate right operand (T0), fall through to ADD
+DO_SUB:  JSR NEG_T0            ; negate right operand (T0), fall through to ADD
 DO_ADD:  LDX #T0              ; Target X=0 (T0). Sets Z flag
          BRA DO_ADD_TAIL      ; Jumps straight into shared ADD logic      
 
@@ -582,19 +579,22 @@ DO_DISP:
          TXA
          ASL                  ; *2 for word offset into TOK_VECS
          TAX
+         ; Initial Relop setup - ignored by Arithmetic & Statements
+         LDA T1
+         CMP T0
+         ; And Jump
          JMP (TOK_VECS,X)       ; and jump to DO_xxx
          
 EXPR:
          JSR EXPR2            ; parse the first atom -> T0
 EXPR_LOOP:
          JSR WPEEK            ; peek next char (not consumed)
-         LDX #$FF             ; pre-decremented for INX
-OP_SCAN: INX
-         CMP TOK_CHARS,X
-         BEQ OP_HIT           ; found a matching operator
-         CPX #OP_COUNT-1
-         BNE OP_SCAN
-         RTS                  ; no operator matched: result in T0, exit cleanly
+         LDX #OP_COUNT-1      ; 2 bytes (Starts at 5)
+OP_SCAN: CMP TOK_CHARS,X      ; 3 bytes
+         BEQ OP_HIT           ; 2 bytes
+         DEX                  ; 1 byte
+         BPL OP_SCAN          ; 2 bytes (Falls through to RTS when X drops to $FF)
+         RTS
 
 ; --- Multiplication & Division ---
 DIV_ENTRY:
@@ -610,10 +610,11 @@ MUL_ENTRY:
          PHA                  ; Save result sign
          LDA T1+1
          BPL E1_P1
-         JSR NEG_T1           ; Make T1 positive
+         LDX #T1
+         JSR NEG_X           ; Make T1 positive
 E1_P1:   LDA T0+1
          BPL E1_P2
-         JSR NEG16            ; Make T0 positive
+         JSR NEG_T0            ; Make T0 positive
 E1_P2:   STZ T2               ; Clear T2 (product/quotient accumulator)
          STZ T2+1
          TYA                   ; which operator? (Y set above, still intact)
@@ -621,7 +622,7 @@ E1_P2:   STZ T2               ; Clear T2 (product/quotient accumulator)
 
 MUL_LOOP:
          LDX #T2               ; Target X=4 (T2)
-         ;
+         ; Dec T0
          LDA T0               ; 16-bit decrement of T0 (multiplicand doubles as loop counter)
          BNE MLLP
          DEC T0+1
@@ -630,17 +631,20 @@ MLLP:    DEC T0
         ; --- SHARED INLINE ADDITION KERNEL ---
 DO_ADD_TAIL:                  
          LDY #T1               ; Source Addend = T1 for ADD and MUL 
-         JSR ADD_X_Y
+         JSR ADD_Y_X
          TXA                  ; 1-byte trick to check X
          BNE MUL_LOOP         ; If X=4, loop back to multiply
          BRA EXPR_LOOP        ; If X=0, addition is done 
 
+; E2 trampoline Located here for range
+E2_BAD:  BRA REL_F              ; return zero
+
+; Back to ALU ops
 DIV_LOOP:
-        JSR NEG16            ; T0 = -T0 (negated divisor)
-        LDY #T0               ; Source Addend = T0 (negated divisor)
+        JSR NEG_T0            ; T0 = -T0 (negated divisor)
 DV_LP:
          LDX #T1               ; Dest = T1 (running dividend)
-         JSR ADD_X_Y
+         JSR ADD_T0_X
          BCC MD_DONE          ; Stop once dividend < divisor
          ;
          INC T2               ; Quotient tally
@@ -653,21 +657,19 @@ MD_DONE: LDX #T2-VARS        ; Copy T2 to T0
          JSR X_TO_T0
          PLA                  ; Retrieve sign
          BPL E1_POS
-         JSR NEG16            ; Apply sign
+         JSR NEG_T0            ; Apply sign
 E1_POS:  BRA EXPR_LOOP         ; 
 
 E2_NEG:  JSR E2_POS           ; consume '-', evaluate atom
          ; drop through
 
 ; =============================================================================
-; NEG_T1 / NEG16  --  two's-complement negate
-; In:  T0 or T1 = value to negate. Selected dynamically by offset mapping.
+; NEG_T0/NEG_X  --  two's-complement negate
+; In:  T0 or X = value to negate. Selected dynamically by offset mapping.
 ; Clobbers: A X
 ; =============================================================================
-NEG16:   LDX #T0              ; in place negate
-         .DB $2C              ; BIT abs: skips next 2 bytes (the LDX #2)
-NEG_T1:  LDX #T1
-         SEC
+NEG_T0:  LDX #T0              ; in place negate
+NEG_X:   SEC
          LDA #0
          SBC 0,X
          STA 0,X
@@ -688,8 +690,6 @@ NEG_T1:  LDX #T1
 ;
 ;   Note: E2_BAD returns T0=0 for unrecognised atoms (no error raised).
 ; =============================================================================
-E2_BAD:  JMP REL_F              ; return zero
-
 E2_POS:  JSR GETCI            ; consume unary '+', then fall through
 EXPR2:
          JSR WPEEK
@@ -714,7 +714,6 @@ EXPR2:
 ;   Stops at the first non-digit without consuming it.
 ; =============================================================================
 PNUM:
-         LDY #T0               ; Source
          STZ T0                ; clear result lo
          STZ T0+1              ; clear result hi
 PN_LP:   LDA (IP)              ; peek without consuming
@@ -724,22 +723,21 @@ PN_LP:   LDA (IP)              ; peek without consuming
 
          STA T3                ; seed running sum lo with digit
          STZ T3+1               ; seed running sum hi with 0
-         LDX #T3               ; Destination T3:T3+1 = digit + 10*T0, via ADD_X_Y (X=T3
-                                ; dest, Y=0/T0 addend -- both fixed all loop,
-                                ; ADD_X_Y clobbers neither)
+         LDX #T3               ; Destination T3:T3+1 = digit + 10*T0, via ADD_Y_X (X=T3
+                                ; dest, Y=0/T0 addend
          LDA #10
          STA T1                ; loop counter (T1 free here: PNUM only runs
                                 ; while parsing an atom, before OP_HIT stashes
                                 ; anything there -- see OP_HIT's stack save)
 PN_ML:
-         JSR ADD_X_Y
+         JSR ADD_T0_X
          DEC T1
          BNE PN_ML
          ; Copy T3:T3+1 to T0
          LDX #T3-VARS         ; Copy T3 to T0
          JSR X_TO_T0
          JSR GETCI             ; consume digit, advances IP 16-bit
-         BRA PN_LP              ; guaranteed to branch since A != 0
+         BRA PN_LP             
 
 ; --------------------------------------------
 E2_VAR:  JSR PARSE_VAR               ; variable name (single letter A-Z)?
@@ -798,6 +796,12 @@ INIT:
          JSR DO_NEW           ; setup PE, PROG, RUN
         .ENDIF
 
+        ; Print Signon Banner - delete if UART setup code needed
+        STZ IP                  ; Banner must be at $xx00
+        LDA #>BANNER            ; High byte
+        STA IP+1
+        JSR DP_STR              ; Hijack DO_PRINT and print with CRLF
+
 ; =============================================================================
 ; MAIN  --  immediate-mode prompt / dispatch loop
 ;
@@ -818,10 +822,9 @@ MAIN:
          JSR WPEEK            ; skip spaces; peek first non-space char into A
          CMP #CR
          BEQ MAIN             ; blank line: restart prompt
-         SEC
-         SBC #'0'             ; map '0'..'9' to 0..9; anything outside -> not a digit
-         CMP #10
-         BCS MAIN_DIR         ; >= 10: not a digit -- treat as direct statement
+         EOR #'0'             ; 2 bytes (Maps '0'-'9' to 0-9; all other ASCII wraps >= 10)
+         CMP #10              ; 2 bytes
+         BCS MAIN_DIR
          JSR EDITLN           ; digit: store / delete numbered line
          BRA MAIN
 MAIN_DIR:
@@ -905,12 +908,12 @@ PARSE_VAR:
 ; DO_END  --  END  :  halt program execution and return to immediate mode
 ; =============================================================================
 DO_NEW:
-         LDX #4
+         LDX #PE-IP
          JSR PROG2X            ; PE = PROG
 DO_END:
 RUNEND:  STZ RUN
 GETCI_SK: 
-DL_DONE: RTS
+         RTS
 
 ; =============================================================================
 ; DO_INPUT  --  INPUT <var>
@@ -963,6 +966,7 @@ RUNLP:   LDA IP                ; IP == PE? (natural end of program --
          BNE RL_GO             ; deleted/replaced last line leaves old,
          LDA IP+1              ; well-formed data sitting past the new
          CMP PE+1               ; PE, which would otherwise look like
+         ;
          BEQ RUNEND             ; one more real line to execute)
 RL_GO:   TSX
          STX RUNSP            ; snapshot SP for GOTO / error recovery
@@ -1053,7 +1057,7 @@ PRT16:
          BPL PRT16GO          ; positive: skip sign handling
          LDA #'-'
          JSR PUTCH
-         JSR NEG16
+         JSR NEG_T0
 PRT16GO:
          LDY #16
          LDA #0
@@ -1176,7 +1180,7 @@ DP_STR:  JSR GETCI            ; read string body char by char
          CMP #CR+1
          BCC DP_NL            ; unterminated string -- print CR/LF and stop
          JSR PUTCH
-         BRA DP_STR           ; PUTCH always leaves A=VIA_TX=1 (Z=0): unconditional
+         BRA DP_STR           ; Loop
 
 DP_NORM: JSR EXPR             ; numeric expression
          JSR PRT16
@@ -1192,14 +1196,14 @@ DP_AFT:  JSR WPEEK
 ; =============================================================================
 ; HELPERS - All Helpers go at end as JSR not BRA/JMP - until they are...
 ; =============================================================================
-; ADD_X_Y  --  (T0,X) += (T0,Y), 16-bit
+; ADD_Y_X  --  (T0,X) += (T0,Y), 16-bit
 ;   In:  X = dest offset (0=T0, 4=T2); Y = addend offset (0=T0, 2=T1)
 ;   Out: (T0,X) = (T0,X) + (T0,Y); carry = result of high-byte ADC
 ;   Clobbers: A
 ; =============================================================================
-ADD_X_Y:
+ADD_T0_X: LDY #T0               ; 2 call sites
+ADD_Y_X:
          LDA 0,X             ; If X=0, this is T0. If X=4, this is T2.
-ADD_A_X_Y:
          CLC
          ADC 0,Y              ; Y picks the addend: T1 for ADD/MUL, T0 for DIV
          STA 0,X
@@ -1293,6 +1297,22 @@ LSK_LP:  LDA (LP)       ; Read current character
          CMP #CR        ; BUMP LP does not touch A - was it a ?
          BNE LSK_LP     ; No? Loop back and check the next byte
          RTS            ; Done, LP points to the next line
+
+; =============================================================================
+; CMP_PLP_X - Compare *LP with X
+;
+;   In:  X reg to compare with 
+;   Out: Flags Z if equal
+;   Clobbers: A Y 
+; =============================================================================
+CMP_PLP_X:
+         LDA (LP)             ; 65C02: implied Y=0 (Read line-number lo)
+         CMP 0,X
+         BNE CPX_DN
+         LDY #1
+         LDA (LP),Y
+         CMP 1,X             ; compare line-number hi
+CPX_DN:  RTS
 
 ROMEND: ; for auditing
 
