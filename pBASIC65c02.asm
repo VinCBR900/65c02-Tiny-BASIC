@@ -87,8 +87,9 @@ KOWALSKI        = 1
 ; CHANGE HISTORY
 ; =============================================================================
 ;
-; v1.1 — 8 bytes free before vectors
+; v1.1 — 11 bytes free before vectors
 ;   - DO_EQ: inlined T0_CMPX its only caller, only for T1.
+;   - Reordered for local BRA
 ;
 ; v1.0 — Headroom Pass ($FC00 Origin, 2 bytes free, +4 saved)
 ;   - Control Flow: Reordered code blocks to convert multiple JMPs to 2-byte BRAs
@@ -347,6 +348,79 @@ TOK_VECS:
           .DW DO_LET          ; index 15: fallback vector for LET/assignment
 
 ; =============================================================================
+; DO_LIST  --  LIST  :  print all program lines in source form
+;
+;   In:  PE = current program end
+;   Out: all lines printed as "<linenum> <body>"
+;   Clobbers: A X Y T0 LP
+; =============================================================================
+DO_LIST:
+         JSR PROG2LP
+LS_LN:   JSR PE_CMP_LP           ; PE == LP
+         BEQ LS_DONE          ; end of program: branches to shared RTS above
+         ; T0 = line number
+         LDY #1
+         LDA (LP)             ; read line number lo
+         STA T0
+         LDA (LP),Y           ; read line number hi
+         STA T0+1
+         ;
+         JSR PRT16            ; print line number
+         JSR PRTSPACE
+         JSR ADD2_LP
+LS_BODY: LDA (LP)
+         JSR BUMP_LP
+         CMP #CR                ; A still has char
+         BEQ LS_EOL
+         JSR PUTCH
+         BRA LS_BODY          ; always taken here (listing walks RAM pages, never wraps to $00)
+
+LS_EOL:  JSR PRNL              ; print CR+LF at end of each listed line
+         BRA LS_LN            ; always taken here
+
+; =============================================================================
+; GOTOL  --  find line by number in program store
+;
+;   In:  T0 = 16-bit target line number
+;   Out: C=0  found -- IP points to body (past 2-byte header); CURLN = T0
+;        C=1  not found -- IP = PE; CURLN unchanged
+;   Clobbers: A Y IP LP CURLN
+;
+;   Scans using LP (shared PE_CMP_LP/LSKIP routines with EDITLN, which also
+;   scan via LP); only converts to IP once, at the success point, since
+;   that's the only place the documented output contract needs it. Safe:
+;   GOTOL's only caller (DO_GO) explicitly doesn't need LP preserved across
+;   this call ("LP no longer needed" once EXPR has parsed the target line).
+; =============================================================================
+GOTOL:
+         JSR PROG2LP
+GT_SC:   JSR PE_CMP_LP        ; If LP == PE, Z=1 AND C=1
+         BEQ COPY_LP_IP       ; End of program? Exit immediately! (Carry is already 1!)
+         
+         LDA (LP)             ; 65C02: implied Y=0 (Read line-number lo)
+         CMP T0
+         BNE GT_NX
+         LDY #1
+         LDA (LP),Y
+         CMP T0+1             ; compare line-number hi
+         BEQ GT_OK            ; Found it!
+         
+GT_NX:   JSR LSKIP            ; advance LP to next line
+         BRA GT_SC            ; 65C02: Use BRA instead of BEQ (same size, more robust)
+
+GT_OK:   JSR T0_TO_CURLN
+         JSR ADD2_LP          ; LP += 2, past the 2-byte header
+         CLC                  ; C=0 means Success
+         
+COPY_LP_IP:
+         LDA LP               ; Carry flag passes through these unchanged
+         STA IP
+         LDA LP+1
+         STA IP+1
+LS_DONE:
+         RTS                  ; Exit. C=1 (Not Found) or C=0 (Found)
+
+; =============================================================================
 ; EDITLN  --  MINIMAL append-only line-store editor
 ;
 ;   In:  IP -> line-number digits (MAIN has already confirmed the line
@@ -366,7 +440,6 @@ TOK_VECS:
 ;   DO_LIST need no changes: they already walk storage order top to
 ;   bottom and never assumed sorted order themselves.
 ; =============================================================================
-EL_ERR:  JMP DO_ERROR           ; out of order / mid-store edit rejected
 EDITLN:
          JSR PNUM             ; parse line number -> T0; IP advances past digits
          JSR T0_TO_CURLN
@@ -427,81 +500,7 @@ EL_UPD:  TYA                   ; A = payload length (excluding CR)
          ADC #0
          STA PE+1
 EL_DN:
-LS_DONE: RTS                    ; shared with DO_LIST's end-of-program exit
-
-
-; =============================================================================
-; DO_LIST  --  LIST  :  print all program lines in source form
-;
-;   In:  PE = current program end
-;   Out: all lines printed as "<linenum> <body>"
-;   Clobbers: A X Y T0 LP
-; =============================================================================
-DO_LIST:
-         JSR PROG2LP
-LS_LN:   JSR PE_CMP_LP           ; PE == LP
-         BEQ LS_DONE          ; end of program: branches to shared RTS above
-         ; T0 = line number
-         LDY #1
-         LDA (LP)             ; read line number lo
-         STA T0
-         LDA (LP),Y           ; read line number hi
-         STA T0+1
-         ;
-         JSR PRT16            ; print line number
-         JSR PRTSPACE
-         JSR ADD2_LP
-LS_BODY: LDA (LP)
-         JSR BUMP_LP
-         CMP #CR                ; A still has char
-         BEQ LS_EOL
-         JSR PUTCH
-         BRA LS_BODY          ; always taken here (listing walks RAM pages, never wraps to $00)
-
-LS_EOL:  JSR PRNL              ; print CR+LF at end of each listed line
-         BRA LS_LN            ; always taken here
-
-
-; =============================================================================
-; GOTOL  --  find line by number in program store
-;
-;   In:  T0 = 16-bit target line number
-;   Out: C=0  found -- IP points to body (past 2-byte header); CURLN = T0
-;        C=1  not found -- IP = PE; CURLN unchanged
-;   Clobbers: A Y IP LP CURLN
-;
-;   Scans using LP (shared PE_CMP_LP/LSKIP routines with EDITLN, which also
-;   scan via LP); only converts to IP once, at the success point, since
-;   that's the only place the documented output contract needs it. Safe:
-;   GOTOL's only caller (DO_GO) explicitly doesn't need LP preserved across
-;   this call ("LP no longer needed" once EXPR has parsed the target line).
-; =============================================================================
-GOTOL:
-         JSR PROG2LP
-GT_SC:   JSR PE_CMP_LP        ; If LP == PE, Z=1 AND C=1
-         BEQ COPY_LP_IP       ; End of program? Exit immediately! (Carry is already 1!)
-         
-         LDA (LP)             ; 65C02: implied Y=0 (Read line-number lo)
-         CMP T0
-         BNE GT_NX
-         LDY #1
-         LDA (LP),Y
-         CMP T0+1             ; compare line-number hi
-         BEQ GT_OK            ; Found it!
-         
-GT_NX:   JSR LSKIP            ; advance LP to next line
-         BRA GT_SC            ; 65C02: Use BRA instead of BEQ (same size, more robust)
-
-GT_OK:   JSR T0_TO_CURLN
-         JSR ADD2_LP          ; LP += 2, past the 2-byte header
-         CLC                  ; C=0 means Success
-         
-COPY_LP_IP:
-         LDA LP               ; Carry flag passes through these unchanged
-         STA IP
-         LDA LP+1
-         STA IP+1
-         RTS                  ; Exit. C=1 (Not Found) or C=0 (Found)
+        RTS                    ; shared with DO_LIST's end-of-program exit
 
 ; =============================================================================
 ; EXPR  --  strictly left-to-right expression evaluator (no operator
@@ -516,7 +515,8 @@ COPY_LP_IP:
 ;   Out: T0 = result; IP advanced past expression
 ;   Clobbers: A X Y T0 T1 T2 T3 IP
 ; =============================================================================
-E1_OVFL:  JMP DO_ERR_OV
+E1_OVFL:  ;JMP DO_ERR_OV
+EL_ERR:  JMP DO_ERROR           ; out of order / mid-store edit rejected
 
 ; --- Relational: Equality ---
 DO_EQ:   LDA T0                ; equality is symmetric: T0 vs T1 == T1 vs T0
