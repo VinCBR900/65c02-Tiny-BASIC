@@ -1,5 +1,5 @@
 /*
- * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.20, Aug 2026)
+ * asm65c02.c  —  Two-pass Toy 65C02 assembler  (v1.21, Aug 2026)
  *
  * Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
  *
@@ -104,6 +104,29 @@
 
  /*
  *  VERSION HISTORY
+ * v1.21 (2026-08)
+ *   - Added a warning/error for JMP ($xxFF): on real NMOS 6502 hardware,
+ *     indirect JMP with an operand whose low byte is $FF fetches the
+ *     target's high byte from $xx00 (same page) instead of $(xx+1)00 --
+ *     a hardware bug fixed on 65C02. Fires when 6502 correctness is in
+ *     scope: '.opt proc6502'/'.setcpu "6502"' alone warns; -Strict6502
+ *     (with or without the directive) promotes it to a hard error.
+ *     Silent for cpu_mode==0 with neither (default target is 65C02,
+ *     where the bug doesn't exist) and for explicit 65C02.
+ *   - Added a [Kowalski] check for the immediate '#' prefix directly
+ *     followed by '(', e.g. '#(label+2)' -- the Kowalski simulator
+ *     rejects this and expects the bare form '#label+2' instead. Same
+ *     warn/--StrictKowalski-error behavior as the existing [Kowalski]
+ *     checks, via the same kowalski_flag() choke point.
+ *   - ERR_LEN raised from 128 to 256. Several message sites -- especially
+ *     [Kowalski] checks, which get double-stamped by kowalski_flag()'s
+ *     "[Kowalski] %s" snprintf and then add_warning()/add_error()'s
+ *     "Line N: %s" snprintf on top of that result -- could exceed 128
+ *     bytes and silently lose their tail; the pre-existing '<(' / '>('
+ *     message was already truncating in practice. This is a host-side
+ *     tool, not the embedded target code it emits, so there's no
+ *     memory-pressure reason to keep the buffer tight.
+ *
  * v1.20 (2026-08)
  *   - Added duplicate/redefinition checking for labels and constants, via a
  *     new sym_define() choke point that every label/equate/-D commit now
@@ -242,7 +265,18 @@
 #define MAX_WARNINGS 256
 #define SYM_NAME_LEN 64
 #define LINE_LEN     512
-#define ERR_LEN      128
+/* v1.21: ERR_LEN was 128, which several message sites (esp. [Kowalski]
+ * checks, which get double-stamped: kowalski_flag()'s "[Kowalski] %s"
+ * snprintf, then add_warning()/add_error()'s "Line N: %s" snprintf on top
+ * of THAT result) could exceed and silently lose their tail -- e.g. the
+ * '<(' / '>(' message truncated to "...after a lo/hi-b" before this fix.
+ * This assembler is a desktop/host-side tool (not the 65C02/8088/2650
+ * target code it emits), so there's no embedded-RAM reason to keep this
+ * tight; 256 gives comfortable headroom for the longest current message
+ * (~150 chars) plus both prefix layers plus an included-file line_tag
+ * ("myfile.asm:NN: ", which can run longer than the plain "Line N: "
+ * case) without truncating. */
+#define ERR_LEN      256
 
 /* ── addressing modes ────────────────────────────────────────────────────── */
 /*
@@ -1109,6 +1143,33 @@ static int kowalski_lohibyte_paren(const char *expr) {
         }
     }
     return 0;
+}
+
+/*
+ * kowalski_paren_immediate (NEW, v1.21)  --  detect the immediate '#'
+ *   marker directly followed by a parenthesized sub-expression, e.g.
+ *   "#(label+2)" or "# (label+2)". This assembler's parse_operand() (see
+ *   the M_IMM handling: `if (o[0] == '#')`) accepts this fine -- it just
+ *   strips the '#' and hands the rest, parens included, to eval_expr(),
+ *   which parses "(...)" as an ordinary grouped sub-expression -- but the
+ *   Kowalski simulator's assembler rejects a parenthesized expression
+ *   directly after '#', requiring the bare form instead ("#label+2").
+ *   Purely textual, operand-start-anchored: unlike the lo/hi-byte '<'/'>'
+ *   prefixes above (which can also appear as a sub-expression prefix
+ *   after a binary-operator split, so kowalski_lohibyte_paren() scans the
+ *   whole operand), '#' only ever means "immediate mode" at position 0 of
+ *   an operand and can never recur mid-expression, so there is no need to
+ *   scan past the first non-blank character.
+ *   In:  op -- operand text (raw, not pre-trimmed)
+ *   Out: return 1 if op is '#', optional whitespace, then '(' at the very
+ *        start (leading whitespace before the '#' is skipped), else 0
+ *   Clobbers: none
+ */
+static int kowalski_paren_immediate(const char *op) {
+    const char *p = skip_ws(op);
+    if (*p != '#') return 0;
+    p = skip_ws(p + 1);
+    return (*p == '(');
 }
 
 static int eval_expr(const char *raw, int pc, int pass2, int *err) {
@@ -2610,6 +2671,20 @@ static int assemble(const char *source) {
                                    "simulator (parenthesized sub-expression directly "
                                    "after a lo/hi-byte prefix operator)");
 
+        /* v1.21: [Kowalski] immediate-paren check -- same rationale as the
+           lo/hi-byte-paren check just above, run at the same per-line,
+           pre-dispatch point. '#' only ever appears meaningfully at the
+           start of an INSTRUCTION operand (directives never take a '#'
+           operand), but checking it here unconditionally is harmless and
+           keeps every "[Kowalski] paren after prefix" check in one place
+           rather than splitting this one out to the per-mnemonic dispatch
+           below. */
+        if (op[0] && kowalski_paren_immediate(op))
+            kowalski_flag(lineno, "'#(' is not accepted by the Kowalski simulator "
+                                   "(parenthesized sub-expression directly after the "
+                                   "immediate '#' prefix); use '#expr' without the "
+                                   "parens");
+
         if (!strcmp(mn, ".org")) { continue; }
         if (!strcmp(mn, ".res")) { continue; }
         if (!strcmp(mn, ".byte")) {
@@ -2931,6 +3006,41 @@ static int assemble(const char *source) {
         int val = oper.value;
         int sz  = mode_size[m];
 
+        /* v1.21: NMOS 6502 indirect-JMP page-wrap bug -- JMP ($xxFF) is a
+         * valid opcode/addressing-mode combination (unlike the
+         * is_65c02only() checks above/below, which flag opcodes that
+         * don't exist at all on the target), but on real NMOS 6502
+         * hardware it fetches the target's low byte from $xxFF as
+         * expected and its high byte from $xx00 (wrapping within the SAME
+         * page) instead of the intended $(xx+1)00 -- fixed on 65C02, so
+         * m==M_IND is the only mode this ever needs checking against
+         * (M_IND is JMP-exclusive; see OPTAB). Gated on cpu_mode==1
+         * (explicit '.opt proc6502'/'.setcpu "6502"') OR g_strict6502 (its
+         * own doc explains it is meant to apply "even in default CPU
+         * mode, without needing .opt proc6502 in the source") -- either
+         * one means 6502 correctness is in scope. Left silent for plain
+         * cpu_mode==0 with neither flag, since the assembler's default
+         * target is 65C02, where this bug does not exist, and for
+         * cpu_mode==2 (explicit 65C02) for the same reason -- g_strict6502
+         * can never be true there anyway (see the '.opt proc65c02'
+         * conflicts with -Strict6502' check in pass 1). Unlike
+         * is_65c02only(), selecting 6502 alone only warns here rather than
+         * erroring outright: the code is not broken on 6502, only risky,
+         * so -Strict6502 is what promotes it to a hard error, matching
+         * the same warn/error split used by the [Kowalski] checks and the
+         * other size/style advisories below. */
+        if ((cpu_mode == 1 || g_strict6502) && m == M_IND && (val & 0xFF) == 0xFF) {
+            char msg[ERR_LEN];
+            int wrong_hi_addr = val & 0xFF00;         /* wraps to page start */
+            int right_hi_addr = (val + 1) & 0xFFFF;   /* correct location */
+            snprintf(msg, ERR_LEN,
+                "JMP ($%04X): NMOS 6502 indirect-JMP page-wrap bug -- high byte is "
+                "fetched from $%04X instead of $%04X (fixed on 65C02)",
+                val, wrong_hi_addr, right_hi_addr);
+            if (g_strict6502) add_error(lineno, msg);
+            else              add_warning(lineno, msg);
+        }
+
         /* v1.16: no-op immediate advisory -- general 6502/65C02, not
          * gated by cpu_mode. AND #$FF, ORA #$00, and EOR #$00 are true
          * identity operations regardless of surrounding code (unlike
@@ -3159,7 +3269,7 @@ static int parse_hex_range(const char *s, int *start, int *end) {
 
 static void asm_usage(FILE *out) {
     fprintf(out,
-        "asm65c02 v1.20 - Toy 65C02/6502 two-pass assembler\n"
+        "asm65c02 v1.21 - Toy 65C02/6502 two-pass assembler\n"
         "\n"
         "Copyright Vincent Crabtree 2026, MIT License, See LICENSE file\n"
         "\n"
@@ -3183,7 +3293,9 @@ static void asm_usage(FILE *out) {
         "               proc6502/proc65c02 directive. without needing .opt proc6502\n"
         "               Same as .opt proc6502 (see below); Hard errors with a .opt\n"
         "               proc65c02 in the source, and cannot be combined with\n"
-        "               -NoWarn65c02.\n"
+        "               -NoWarn65c02. Also promotes the JMP ($xxFF) indirect\n"
+        "               page-wrap warning (see below) to a hard error, with or\n"
+        "               without .opt proc6502/.setcpu \"6502\" also present.\n"
         "  -NoWarnOptSize Suppress size-optimization advisories (65C02 JMP-could-\n"
         "               be-BRA, PHX/PHY/PLX/PLY/STZ peephole suggestions, plus the\n"
         "               general CMP/CPX/CPY #0 redundancy and no-op-immediate\n"
@@ -3210,6 +3322,8 @@ static void asm_usage(FILE *out) {
         "                   always fine and never flagged.\n"
         "                 - A lo/hi-byte prefix operator ('<' or '>') directly\n"
         "                   followed by '(', e.g. '<(label-1)'.\n"
+        "                 - The immediate '#' prefix directly followed by '(',\n"
+        "                   e.g. '#(label+2)' -- use '#label+2' instead.\n"
         "  -D NAME      Predefine NAME as 1, as if 'NAME = 1' appeared before the\n"
         "               start of the source file -- for use with .IF NAME. May be\n"
         "               repeated.\n"
@@ -3233,6 +3347,13 @@ static void asm_usage(FILE *out) {
         "                     Hard errors if -Strict6502 is on the command line.\n"
         "  .setcpu \"6502\"     Equivalent to .opt proc6502.\n"
         "  .setcpu \"65C02\"    Equivalent to .opt proc65c02.\n"
+        "  Either .opt proc6502/.setcpu \"6502\" or -Strict6502 also puts JMP\n"
+        "  ($xxFF) -- indirect JMP with an operand whose low byte is $FF -- in\n"
+        "  scope: on real NMOS 6502 hardware this fetches the target's high byte\n"
+        "  from $xx00 (same page) instead of $(xx+1)00, a hardware bug fixed on\n"
+        "  65C02. .opt proc6502/.setcpu \"6502\" alone warns; -Strict6502 (with or\n"
+        "  without the directive) makes it a hard error. Silent otherwise, since\n"
+        "  the default target is 65C02, where the bug does not exist.\n"
         "  With no directive at all, 65C02-only instructions are allowed and warn\n"
         "  by default (see -NoWarn65c02/-Strict6502 above).\n"
         "\n"
