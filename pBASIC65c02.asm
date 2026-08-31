@@ -1,5 +1,5 @@
 ; =============================================================================
-; PicoBASIC65c02 v1.0  --  Proof of Concept 1 KB Tiny BASIC for 65c02 
+; PicoBASIC65c02 v1.1  --  Proof of Concept 1 KB Tiny BASIC for 65c02 
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Note: Kowalski Memory Mapped IO for now.
@@ -86,6 +86,9 @@ KOWALSKI        = 1
 ; =============================================================================
 ; CHANGE HISTORY
 ; =============================================================================
+;
+; v1.1 — 8 bytes free before vectors
+;   - DO_EQ: inlined T0_CMPX its only caller, only for T1.
 ;
 ; v1.0 — Headroom Pass ($FC00 Origin, 2 bytes free, +4 saved)
 ;   - Control Flow: Reordered code blocks to convert multiple JMPs to 2-byte BRAs
@@ -516,8 +519,11 @@ COPY_LP_IP:
 E1_OVFL:  JMP DO_ERR_OV
 
 ; --- Relational: Equality ---
-DO_EQ:   LDX #T1
-         JSR T0_CMPX          ; equality is symmetric: T0 vs T1 == T1 vs T0
+DO_EQ:   LDA T0                ; equality is symmetric: T0 vs T1 == T1 vs T0
+         CMP T1                ; (inlined former T0_CMPX -- single caller,
+         BNE REL_F              ; no indexed ,X form needed once specialised
+         LDA T0+1                ; to T1)
+         CMP T1+1
          BEQ REL_T
          BRA REL_F            ; always taken (Z=0 here)
 
@@ -1287,21 +1293,6 @@ LSK_LP:  LDA (LP)       ; Read current character
          CMP #CR        ; BUMP LP does not touch A - was it a ?
          BNE LSK_LP     ; No? Loop back and check the next byte
          RTS            ; Done, LP points to the next line
-
-; =============================================================================
-; T0_CMPX  --  compare T0 against a 16-bit zero-page pair selected by X
-;
-;   In:  T0; X = zero-page address of the pair to compare against
-;   Out: Z=1 if T0 == (X,X+1), Z=0 otherwise
-;   Clobbers: A
-; =============================================================================
-T0_CMPX:
-         LDA T0
-         CMP 0,X
-         BNE TCX_NE
-         LDA T0+1
-         CMP 1,X
-TCX_NE:  RTS
 
 ROMEND: ; for auditing
 
