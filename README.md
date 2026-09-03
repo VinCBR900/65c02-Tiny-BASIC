@@ -104,7 +104,7 @@ Has bitwise operators and also CORDIC `SIN`/`COS` in degrees*1000.
   * `PRINT [TAB(n)] [;] CHR$(n)` `IF`/`THEN`/`ELSE` `GOTO` `GOSUB` `RETURN` `FOR`/`TO`/`STEP`/`NEXT` `LET` `INPUT` `REM` `END` `POKE` `DATA` `READ` `RESTORE` 
   * `RUN` `LIST [start,end]` `NEW` `FREE` `HELP`
  
-**Functions:** `ABS(n)` `SGN(n)` `ASC("c")` `PEEK(addr)` `USR(addr)` `RND` `SIN(deg)`  `COS(deg)`
+**Functions:** `ABS(n)` `SGN(n)` `PEEK(addr)` `USR(addr)` `RND` `SIN(deg)`  `COS(deg)`  `SHR(n)`   `SHL(n)`
 
 **Expressions:** 
   * `MOD` `+` `-` `*` `/` `%`(mod) `^` (power)
