@@ -29,7 +29,7 @@ https://vincbr900.github.io/65c02-Tiny-BASIC/
 A tiny but mostly complete integer Tiny BASIC. No tokeniser - BASIC program lines are stored as raw ASCII and re-parsed on every execution. 
 
 **Statements:** 
-  * `END` `GOTO <expr>`  `IF` `ASK (INPUT)`  `PRINT [;]` `WR char`     
+  * `END` `GOTO <expr>`  `IF` `ASK (INPUT)`  `PRINT [;]` `WR char` (Equivalent of `CHR$(char)` but statement form    
   * `LIST ` `NEW` `RUN`
 
 **Expressions:** 
