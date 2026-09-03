@@ -1,5 +1,5 @@
 ; =============================================================================
-; PicoBASIC65c02 v1.6  --  Proof of Concept 1 KB Tiny BASIC for 65c02 
+; PicoBASIC65c02 v1.7  --  Proof of Concept 1 KB Tiny BASIC for 65c02 
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Note: Kowalski Memory Mapped IO for now.
@@ -12,9 +12,7 @@ KOWALSKI        = 1
 ;   NMI/IRQ: Not used
 ;
 ; RAM layout for 1 KB target:
-;   $0000-$007F  zero-page (IP/CURLN/PE/LP/T0-T3/RUN/RUNSP/BANG/VARS/IBUF);
-;                ZPEND=$71, fits the $80-$FF/$180-$1FF hardware-stack RAM
-;                alias constraint. No GOSUB so no GS stack 
+;   $0000-$007F  zero-page (IP/CURLN/PE/LP/T0-T3/RUN/BANG/VARS/IBUF);
 ;   $0100-$017F  Hardware stack (page 1, mandatory)
 ;   $0180-$03FF  BASIC program store (RAM_TOP=$0400)
 ;
@@ -35,14 +33,14 @@ KOWALSKI        = 1
 ;
 ; GETLINE - no Backspace support or range limits - too many characters will crash.
 ;
-; DO_ERROR - "!X", where X is error code, but no line number. 
+; DO_ERROR - minimal error handling: "!X", where X is error code, but no line number. 
 ;
 ; EDITLN is append-only: a typed line is only accepted when greater than every line
 ;   currently stored (appends), or if it matches the current LAST stored line i.e.
 ;   in-place replace or delete if empty body. Editing/deleting mid-program lines
 ;   is rejected with "!5" 
 ;
-; No operator precedence: all six operators (+,-,*,/,=,<) evaluate left to right,
+; No operator precedence: all operators (+,-,*,/,=,<) evaluate left to right,
 ;   same tier. Use parentheses to group, e.g. "A*A/64-B*B/64+C" must be written
 ;   "(A*A/64)-(B*B/64)+C" for standard-math meaning; "1+2*3" evaluates
 ;   as (1+2)*3=9, not 7. Same-operator chain (all */ or all +-,
@@ -66,7 +64,9 @@ KOWALSKI        = 1
 ;
 ; To save Space, LET, REM and THEN keywords not used. 
 ;
-; DO_GO - "GO 10" as FIRST command of a session fails since RUNSP is 0 from NEW.
+; DO_GO - "GO 10" as FIRST/immediate command (no active RUN) fails since
+;   DO_GO discards caller's return address assuming RUNEND will eventually be
+;   reached via a RUN session's call.
 ;
 ; Numbers are signed 16-bit only (-32768..32767); arithmetic overflow
 ;   wraps silently (e.g. 32767+1 = -32768) -- it does not raise an error.
@@ -89,11 +89,19 @@ KOWALSKI        = 1
 ; CHANGE HISTORY
 ; =============================================================================
 ;
+; v1.7 - 0 bytes free before vectors - Golf Pass 
+;   - Restored banner (Yay!)
+;   - Dropped the blank-line CR check; STMT already returns on CR via WPEEK/BCC
+;   - 65c02 instruction BBR7 on MUL_ENTRY and PRT16 sign checks
+;   - Removed RUNSP stack-pointer in DO_GO/RL_GO - DO_GO now cleans up stack with 
+;     PLA/PLA instead of snapshotting/restoring SP.
+;   - DO_LIST refactored to save 2 byets by reordering CRLF at start 
+;
 ; v1.6 - 6 bytes free before vectors
 ;   - SKIP_KW overun bug - loop consumed-then-checked each character
 ;   - Deleted Banner (again), replaced with simple Error code reporting. 
 ;
-; v1.5 - 10 bytes free before vectors --bug fix on the v1.4 upload
+; v1.5 - 10 bytes free before vectors - bug fix on v1.4 
 ;   - SKIP_KW: restored a SEC before its inlined SBC #'A'.
 ;   - E2_PAR: removed a redundant JSR WSKIP after JSR EXPR
 
@@ -121,7 +129,7 @@ KOWALSKI        = 1
 ;   - Minor opcode tweaks here and there for a couple bytes.
 ;   - Restored Signon Banner (requires 21 bytes if you want to cut it)
 ;
-; v1.0 — Headroom Pass ($FC00 Origin, 2 bytes free)
+; v1.0 - 1st version <1kbyte ($FC00 Origin, 2 bytes free)
 ;   - Control Flow: Reordered code blocks to convert multiple JMPs to 2-byte BRAs
 ;     (e.g., EL_ERR, GOTOL not-found path, PARSE_VAR tail call).
 ;   - EL_CPY: Reordered copy loop to use pre-increment and fall-through (-2 bytes).
@@ -131,13 +139,13 @@ KOWALSKI        = 1
 ;     for PE/LP rewind to drop a redundant LDX.
 ;   - Docs: Cleaned Stale references to PUTSTR, INSLINE, DELINE, and updated
 ;     DO_ERROR limitations for append-only store, Fixed inverted CHK_CHAR carry flag.
-;     Deleted Banner to free 20 bytes.
 ;
-; v0.10 — Append-Only Line Store (7 bytes over) 
+; v0.10 — Append-Only Line Store ($FC00 Origin, 7 bytes over) 
 ;   - EDITLN Rewrite: Replaced arbitrary insertion with an append-only/tail-replace
 ;     model. New lines must be >= the last stored line.
-;   - DELINE and INSLINE removed entirely, dead code T0_CMP_LP LLEN variables.
+;   - DELINE and INSLINE removed entirely, dead code T0_CMP_LP & LLEN variables.
 ;   - Optimization: Replaced inline LDA/STA pairs with X_TO_T0/T0_TO_X helpers.
+;   - Deleted Banner to free 20 bytes.
 ;
 ; v0.9 — Size Optimization (954 bytes free, +2 saved)
 ;   - INSLINE: Simplified new PE calculation by adding gap length directly to PE
@@ -243,7 +251,6 @@ PE:         .RS 2              ; 16-bit: program end (one past last byte)
         .ENDIF
 LP:         .RS 2              ; 16-bit: line pointer / multi-purpose scratch
 RUN:        .RS 1              ; 8-bit:  run flag ($00 = immediate, $FF = running)
-RUNSP:      .RS 1              ; 8-bit:  stack-pointer snapshot for GOTO/BREAK unwind
 BANG:       .RS 1              ; 8-bit: relop invert flag ($00/$FF) -- see EXPR_LOOP/REL_T.
 VARS:       .RS 52             ; 52-byte variable store (A-Z, 2 bytes each)
 IBUF:       .RS 41             ; Nominal Input line buffer but unbounded 
@@ -348,7 +355,7 @@ SHOWCASE_END:	.DW 0
 ; =============================================================================
 ; ROM START  
          .ORG ORIGIN
-;BANNER: .DB "pBASIC v1.6",0           ; Signon 
+BANNER: .DB "pBASIC1.7",0                ; Signon 
 
 ; =============================================================================
 ; TOK_CHARS / TOK_VECS -- combined match-char + dispatch-vector tables.
@@ -399,8 +406,9 @@ TOK_VECS:
 ; =============================================================================
 DO_LIST:
          JSR PROG2LP
+LS_EOL:  JSR PRNL              ; print CR+LF at start then end of each listed line
 LS_LN:   JSR PE_CMP_LP           ; PE == LP (also sets Y=1, used below)
-         BEQ LS_DONE          ; end of program: branches to shared RTS above
+         BEQ LS_DONE          ; end of program: branches to shared RTS 
          ; T0 = line number
          LDA (LP)             ; read line number lo
          STA T0
@@ -414,10 +422,7 @@ LS_BODY: JSR BUMP_LP
          CMP #CR                ; A still has char
          BEQ LS_EOL
          JSR PUTCH
-         BRA LS_BODY          ; always taken here (listing walks RAM pages, never wraps to $00)
-
-LS_EOL:  JSR PRNL              ; print CR+LF at end of each listed line
-         BRA LS_LN            ; always taken here
+         BRA LS_BODY          ; 
 
 ; =============================================================================
 ; GOTOL  --  find line by number in program store
@@ -607,6 +612,7 @@ DO_LT:   LDA T1+1
          BVC NO_FLIP          ; N XOR V trick for signed comparison
          EOR #$80
 NO_FLIP: BMI REL_T            ; If N=1, condition is true
+
 REL_F:   LDA #0               ; False: Result = $0000
          .DB $2C              ; BIT abs trick: skips the next 2 bytes (LDA #$FF)
 REL_T:   LDA #$FF             ; True:  Result = $FFFF
@@ -649,12 +655,10 @@ MUL_ENTRY:
          LDA T1+1
          EOR T0+1
          PHA                  ; Save result sign
-         LDA T1+1
-         BPL E1_P1
+         BBR #7,T1+1,E1_P1    ; skip if T1 positive (bit-test, no LDA needed)
          LDX #T1
          JSR NEG_X           ; Make T1 positive
-E1_P1:   LDA T0+1
-         BPL E1_P2
+E1_P1:   BBR #7,T0+1,E1_P2    ; skip if T0 positive
          JSR NEG_T0            ; Make T0 positive
 E1_P2:   STZ T2               ; Clear T2 (product/quotient accumulator)
          STZ T2+1
@@ -721,7 +725,9 @@ NEG_X:   SEC
 ;
 ;   In:  IP -> atom text
 ;   Out: T0 = atom value; IP advanced past atom
-;   Clobbers: A X Y T0 T1 T2 T3 IP
+;   Clobbers: A X Y T0 T1 T2 IP
+;
+;   E2_POS: entry for unary '+' -- consumes the '+' then falls into EXPR2.
 ;   E2_NEG: entry for unary '-' -- consumes '-(via E2_POS) then negates result.
 ; =============================================================================
 E2_POS:  JSR GETCI            ; consume unary '+', then fall through
@@ -826,10 +832,11 @@ INIT:
          JSR DO_NEW           ; setup PE, PROG, RUN
         .ENDIF
 
-;        STZ IP                  ; Banner Low byte - banner must be at $xx00
-;        LDA #>BANNER
-;        STA IP+1
-;        JSR DP_STR
+        ; Print signon Banner - delete frees 19 bytes for UART init code
+         STZ IP                  ; Banner Low byte - banner must be at $xx00
+         LDA #>BANNER
+         STA IP+1
+         JSR DP_STR
 
 ; =============================================================================
 ; MAIN  --  immediate-mode prompt / dispatch loop
@@ -850,8 +857,9 @@ MAIN:
          JSR GETLINE_M        ; print "> "; read line
 
          JSR WPEEK            ; skip spaces; peek first non-space char into A
-         CMP #CR
-         BEQ MAIN             ; blank line: restart prompt
+                               ; blank line (CR) falls through: EOR/CMP below
+                               ; sends it to MAIN_DIR -> STMT, which returns
+                               ; immediately on CR via its own WPEEK/BCC check
          EOR #'0'             ; 2 bytes (Maps '0'-'9' to 0-9; all other ASCII wraps >= 10)
          CMP #10              ; 2 bytes
          BCS MAIN_DIR
@@ -971,7 +979,8 @@ STMT_RTS:
 ;
 ;   In:  IP -> line number digits
 ;        NOTE: IP and CURLN must be sequential in Zero Page.
-;   Out: IP = body of target line; stack unwound to RUNSP; RUNGO
+;   Out: IP = body of target line; pending JSR STMT return address
+;        discarded (RUNGO's own JSR STMT replaces it); RUNGO
 ;   Clobbers: A X Y T0 T1 T2 T3 IP SP CURLN  (T1-T3 via EXPR; CURLN via GOTOL
 ;             on a successful lookup)
 ;
@@ -980,19 +989,22 @@ DO_GO:
          JSR EXPR             ; Parse target line number -> T0 (LP no longer needed)
          JSR GOTOL            ; find line: C=0 found, C=1 not found
          BCS DO_ERR_UL        ; Line not found error 
-         LDX RUNSP
-         TXS                  ; restore SP to pre-statement state
-         BRA RUNGO            ; Always taken jump into run loop
+         PLA                  ; discard the pending JSR STMT return address --
+         PLA                  ; RUNGO's own JSR STMT always returns to the
+                              ; same place, so there's always exactly one
+         BRA RUNGO            ; frame to drop, no snapshot needed
 
 ; =============================================================================
 ; DO_RUN  --  RUN  :  execute program starting from the first line
 ;
 ;   In:  PE = current program end
 ;   Out: program executes; returns to MAIN on END/error/STOP
-;   Clobbers: A X Y T0 T1 T2 T3 IP SP RUN CURLN RUNSP
+;   Clobbers: A X Y T0 T1 T2 T3 IP SP RUN CURLN
 ;
-;   RUNLP: top of the per-line execution loop.  Saves SP so GOTO can unwind.
-;   RUNGO: mid-loop entry used by GOTO (after IP is already set to body).
+;   RUNLP: top of the per-line execution loop, reads the next line header.
+;   RUNGO: mid-loop entry used by GOTO (after IP is already set to body) --
+;          also the return point its own JSR STMT unwinds back to, which is
+;          what lets DO_GO discard exactly one frame with a bare PLA/PLA.
 ; =============================================================================
 DO_RUN:
          LDX #0
@@ -1005,9 +1017,7 @@ RUNLP:   LDA IP                ; IP == PE? (natural end of program --
          CMP PE+1               ; PE, which would otherwise look like
          ;
          BEQ RUNEND             ; one more real line to execute)
-RL_GO:   TSX
-         STX RUNSP            ; snapshot SP for GOTO / error recovery
-         JSR GETCI            ; read line-number lo
+RL_GO:   JSR GETCI            ; read line-number lo
          STA CURLN
          JSR GETCI            ; read line-number hi
          STA CURLN+1
@@ -1105,8 +1115,7 @@ SK_DONE: JMP DO_DISP            ; stopped on a non-letter, still unconsumed
 ;   Clobbers: A Y T0
 ; =============================================================================
 PRT16:
-         LDA T0+1
-         BPL PRT16GO          ; positive: skip sign handling
+         BBR #7,T0+1,PRT16GO  ; positive: skip sign handling (bit-test, no LDA)
          LDA #'-'
          JSR PUTCH
          JSR NEG_T0
@@ -1356,6 +1365,7 @@ ROMEND: ; for auditing
 ; =============================================================================
 ; Reset / IRQ / NMI vectors
 ; =============================================================================
-         .ORG $FFFC
+         .ORG $FFFA
+         .DW INIT         ; $FFFA: NMI vector (no NMI)
          .DW INIT         ; $FFFC: reset vector
-         .DW INIT      ; $FFFE: IRQ vector   (No IRQ)
+         .DW INIT         ; $FFFE: IRQ/BRK vector (No IRQ)
