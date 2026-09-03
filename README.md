@@ -71,7 +71,7 @@ This interpreter has also been ported to the John Bell 80-153 single board compu
   * Math: `+` `-` `*` `/` `%`(mod)
   * Relops: `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)`
   * Variables: `A`–`Z`, signed 16-bit integers
-  * Number reresentation: decimal −32768 to 32767, Hex $0000-$FFFF 
+  * Number representation: decimal −32768 to 32767, Hex $0000-$FFFF 
   * Functions: `ABS(val)`   `FREE`   `PEEK(addr)`  `RND`   `USR(addr)`  
   * Bitwise: `XOR(a,b)`   `AND(a,b)`   `OR(a,b)`  `NOT(a)`
 
@@ -102,7 +102,7 @@ A more capable integer BASIC. Keywords are tokenised on entry and numbers conver
 Has bitwise operators and also CORDIC `SIN`/`COS` in degrees*1000.
 
 **Statements:** 
-  * `PRINT [TAB(n)] [;] CHR$(n)` `IF`/`THEN`/`ELSE` `GOTO` `GOSUB` `RETURN` `FOR`/`TO`/`STEP`/`NEXT` `LET` `INPUT` `REM` `END` `POKE` `DATA` `READ` `RESTORE` 
+  * `PRINT [TAB(n)] [;] [CHR$(n)] [HEX$(val)]`  `IF`/`THEN`/`ELSE` `GOTO` `GOSUB` `RETURN` `FOR`/`TO`/`STEP`/`NEXT` `LET` `INPUT` `REM` `END` `POKE` `DATA` `READ` `RESTORE` 
   * `RUN` `LIST [start,end]` `NEW` `FREE` `HELP`
  
 **Functions:** `ABS(n)` `SGN(n)` `PEEK(addr)` `USR(addr)` `RND` `SIN(deg)`  `COS(deg)`  `SHR(n)`   `SHL(n)`
@@ -110,7 +110,8 @@ Has bitwise operators and also CORDIC `SIN`/`COS` in degrees*1000.
 **Expressions:** 
   * `MOD` `+` `-` `*` `/` `%`(mod) `^` (power)
   * `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)`
-  * variables `A`–`Z` signed 16-bit integers, −32768 to 32767
+  * variables `A`–`Z` signed 16-bit integers
+  * Number representation: decimal −32768 to 32767, Hex $0000-$FFFF 
   * Bitwise - `AND` `OR` `XOR` `NOT` 
 
 **Numbers:** signed 16-bit integers, −32768 to 32767. Relational operators return −1 (true) or 0 (false). `AND`/`OR`/`XOR`/`NOT` are bitwise.
