@@ -33,7 +33,8 @@ A tiny but mostly complete integer Tiny BASIC. No tokeniser - BASIC program line
   * `LIST ` `NEW` `RUN`
 
 **Expressions:** 
-  * `+` `-` `*` `/` 
+  * `+` `-` `*` `/`
+  * `<` and `=` supported - use flipped operands for `>`, e.g. `A>B` as `B<A`. A leading `!` inverts following relop: `A!=B` equivalent to `A<>B`, `A!<B` equivalent to  `A>=B`, and `B!<A` equivalent to `A<=B`.
   * Variables `A`–`Z` signed 16-bit integers, −32768 to 32767
   * Functions: **None**  
 
@@ -41,9 +42,18 @@ A tiny but mostly complete integer Tiny BASIC. No tokeniser - BASIC program line
 - Uses **2 character testing where only 1st letter is matched** - e.g. `PRINT`, `PR`, `PX` all executes `DO_PRINT`.  So spaces are important e.g. `PRINT A;"=Test"` prints "5=Test" if A is 5, whereas `PRINTA;"=Test"` prints `=Test`.
 - **Expressions supported in GOTO** - `GOTO`, `GOTO X`, `GOTO 10*I` all work.  
 - **Left to Right Operator Precidence** — up to you to use Parenthesis to get the right order
-- **BASIC Line Handling** - to save space in-place insertion/deletion not supported.  This means you can only change the last line - either update or delete.  So if you enter 10 lines and notice an error on line 2, you must delete lines 10, 9, 8, 7, 6, 5, 4, 3 in sequence. Sorry. 
+- **BASIC Line Handling** - to save space in-place insertion/deletion not supported.  This means you can only change the last line - either update or delete.  So if you enter 10 lines and notice an error on line 2, you must delete lines 10, 9, 8, 7, 6, 5, 4, 3 in sequence.  
 
-**Errors** Minimal error handling, just printed as `!'
+**Errors** printed as `!N`, no line number shown:
+
+| Code | Meaning |
+|------|---------|
+| !0 | Syntax / bad expression |
+| !1 | Undefined line number |
+| !2 | Division by zero |
+| !3 | Out of memory |
+| !4 | Bad variable assignment |
+| !5 | Line Entry Error |
 
 ### Micro-BASIC `uBASIC6502.ASM` — fits in a 2716 EPROM (<2 KByte)
 
@@ -70,7 +80,7 @@ This interpreter has also been ported to the John Bell 80-153 single board compu
 - **`RND`** — 16-bit Galois LFSR pseudo-random number, returns 1–32767; seeded at startup; useful as `RND % 6 + 1` for a die roll
 - **`:` Not Supported** - Multi-statement operator `:` is not supported and input buffer is 40 characters only. 
 
-**Errors** (printed as `?N [IN line]`):
+**Errors** printed as `?N [IN line]`:
 
 | Code | Meaning |
 |------|---------|
