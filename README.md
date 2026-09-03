@@ -33,7 +33,7 @@ A tiny but mostly complete integer Tiny BASIC. No tokeniser - BASIC program line
   * `LIST ` `NEW` `RUN`
 
 **Expressions:** 
-  * Math: `+` `-` `*` `/` `(` `)`
+  * Math: `+` `-` `*` `/` unary `-` `(` `)`
   * Relops: `<` and `=` supported - use flipped operands for `>`, e.g. `A>B` as `B<A`. A leading `!` inverts following relop: `A!=B` equivalent to `A<>B`, `A!<B` equivalent to  `A>=B`, and `B!<A` equivalent to `A<=B`.
   * Variables: `A`–`Z` signed 16-bit integers, −32768 to 32767
   * Functions: **None**  
@@ -76,7 +76,7 @@ This interpreter has also been ported to the John Bell 80-153 single board compu
   * Bitwise: `XOR(a,b)`   `AND(a,b)`   `OR(a,b)`  `NOT(a)`
 
 **Notes**
-- Uses **2 character matching** - with 3rd char match for `GOSUB`/`GOTO` and `RETURN`/`REM`.  Matches anything after e.g. PROCEED matches PRINT.  Therefore  spaces are important e.g. `PRINT TAB(5);"hello"` prints 5 spaces then `Hello` and works, whereas `PRINTTAB(5);"HELLO"` prints `5Hello` and does not.
+- Uses **2 character matching** - with 3rd char match for `GOSUB`/`GOTO` and `RETURN`/`REM`.  Matches anything after e.g. `PROCEED` matches `PRINT`.  Therefore spaces are important e.g. `PRINT TAB(5);"hello"` prints 5 spaces then `Hello` and works, whereas `PRINTTAB(5);"HELLO"` prints `5Hello` and does not.
 - **`GOTO`/`GOSUB` accepts expressions** — `GOTO X`, `GOSUB BASE+N`, `GOTO 10*I` all work.  But Don't have `GOSUB`/`RETURN` on same line.
 - **`RND`** — 16-bit Galois LFSR pseudo-random number, returns 1–32767; seeded at startup; useful as `RND % 6 + 1` for a die roll
 - **`:` Not Supported** - Multi-statement operator `:` is not supported and input buffer is 40 characters only. 
