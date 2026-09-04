@@ -1,5 +1,5 @@
 ; =============================================================================
-; 4K Integer BASIC v15.30 for the 65C02
+; 4K Integer BASIC v15.29 for the 65C02
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -15,8 +15,9 @@
 ;            ';' between items suppresses newline; trailing ';' suppresses final CR
 ;   IF expr THEN stmt [ELSE stmt2]   single-line; ELSE is optional
 ;   FOR var = start TO end [STEP n]  ...  NEXT var
-;   GOTO lineno        branch unconditionally
-;   GOSUB lineno       call subroutine; RETURN to resume
+;   GOTO expr          branch to line (expr may be a literal, variable, or
+;                      any other expression)
+;   GOSUB expr         call subroutine at line (same); RETURN to resume
 ;   INPUT var          read from keyboard
 ;   LET var = expr     explicit assignment (LET keyword optional)
 ;   POKE addr, val     write byte to memory
@@ -30,8 +31,6 @@
 ;   END                stop execution
 ;   RETURN             return from GOSUB
 ;   FREE               print bytes of program RAM remaining
-;   GOTO expr          branch to line (expr may be variable or expression)
-;   GOSUB expr         call subroutine at line (expr may be variable or expression)
 ;
 ;   Multi-statement:   ':' separates statements on one line.
 ;
@@ -53,6 +52,7 @@
 ;                    CHR$(n)             character with ASCII code n  (PRINT only)
 ;                    HEX$(n)             n as 4-digit hex, MSB first  (PRINT only)
 ;                    PEEK(addr)          read byte from memory address
+;                    DPEEK(addr)         Read a word from memory address
 ;                    USR(addr)           call machine-code subroutine, A=lo T0
 ;                    RND                 pseudo-random 1..32767 (no argument)
 ; Numbers:     signed 16-bit integers  -32768 .. 32767
@@ -80,18 +80,7 @@
 ;   echoed, buffer position does not advance.
 ;
 ; GOTO/GOSUB executed directly from the prompt (not from a running program)
-;   corrupt execution once the target line finishes -- RUNSP (used to unwind
-;   the hardware stack for GOTO/GOSUB/NEXT) is only meaningful inside an
-;   active RUN loop. Confirmed pre-existing, not introduced by any change in
-;   this file's history; safe from inside RUN, GOSUB, or a FOR loop.
-;
-; SKIPEOL (used after every statement to find the next ':' or end-of-line)
-;   does not validate what it skips over -- any statement may be followed by
-;   unrecognized text with no syntax error, silently discarded up to the
-;   next ':' or CR. Two visible examples: PRINT only recognizes ';' as an
-;   item separator (',' is not part of its grammar at all, so PRINT 1,2,3
-;   prints just "1" then stops -- not a broken ',' separator, ',' was never
-;   valid here); GOSUB 30XYZ silently jumps to line 30, discarding "XYZ".
+;   corrupt execution once the target line finishes 
 ;
 ; NEXT's variable name is not checked against the FOR it closes -- any
 ;   variable name (or none) is accepted; NEXT does not verify it matches
@@ -115,334 +104,68 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ;
-; v15.30 (Aug 2026) - 61 bytes free (confirmed by build) - DOCS ONLY, no code
-;   changed (byte count identical to v15.29). Showcase edit is RAM data,
-;   outside the ROM budget above, and doesn't move this number either.
-;   - CORRECTION to v15.29's own changelog entry below: it describes a
-;     "PRINT's ',' separator only evaluates and prints the first item"
-;     limitation as if ',' were a recognized-but-broken PRINT separator.
-;     That's wrong -- checked DO_PRINT's actual source this time instead
-;     of going from test output alone: DP_aft only ever checks for ';';
-;     anything else (','  included) falls straight through to print a
-;     newline and return. ',' was never part of PRINT's grammar to begin
-;     with, so there's nothing "not printing the remaining items" -- there
-;     are no remaining items to print, PRINT already ended. The real
-;     mechanism, traced properly this time: SKIPEOL (called after every
-;     statement to find the next ':' or CR) does not validate what it
-;     skips over, so leftover text like ",2,3" is silently discarded with
-;     no error, the same root cause as the already-documented GOSUB
-;     30XYZ note directly below it. KNOWN LIMITATIONS corrected to merge
-;     these into one accurate entry describing the shared mechanism
-;     instead of two entries, one of them wrong. v15.29's own entry text
-;     left as-is (historical record of what I thought at the time) rather
-;     than silently rewritten.
-;   - Recovered v15.22 through v15.28's changelog entries, which the very
-;     first version-bump edit in this file's session (v15.23) had silently
-;     dropped, and every version bump after it repeated: each edit's
-;     old_str targeted only the single previous "; v15.XX (Aug 2026) - ..."
-;     header line, and new_str didn't re-include it, so the header line
-;     was deleted while that version's actual bullet content below it was
-;     untouched and left orphaned with no line identifying which version
-;     it belonged to. Confirmed via the archived intermediate file for
-;     each version (v15.23.asm through v15.28.asm, all still on disk) --
-;     the content was never lost, just unlabeled; recovered by pulling
-;     each version's real header line back from its own archive and
-;     reinserting it at the point where that version's orphaned content
-;     begins. All 7 headers restored; content itself required no changes.
-;   - Showcase (RAM, not ROM): added line 65, "SGN(-5)=";SGN(-5);"  1 SHL
-;     4=";1 SHL 4 -- the two functions/operators added in v15.25 had no
-;     demo coverage. Hand-encoded directly into the tokenized byte stream
-;     (same as every other showcase line), matching the existing style of
-;     lines 40/50/60. Verified: prints "SGN(-5)=-1  1 SHL 4=16" exactly,
-;     and the rest of the showcase (including the Spiral Vortex render)
-;     still completes without error afterward.
-;
-
-;   changed (byte count identical to v15.28).
-;   File header brought up to date with everything changed since it was last
-;   accurate:
-;   - Tier 4 expression line now lists SHL/SHR alongside * / % MOD, with a
-;     one-line note that SHR is arithmetic (sign-preserving).
-;   - Tier 5 atom list: removed ASC("c") (v15.25, no longer exists), added
-;     SGN(n) (v15.25, restored).
-;   - KNOWN LIMITATIONS gained 4 entries for behavior found and confirmed by
-;     testing during this session's work, none of them regressions from
-;     anything in this file's history:
-;       . GOTO/GOSUB from the immediate prompt (not from a running program)
-;         corrupt execution once the target line finishes -- RUNSP is only
-;         meaningful inside an active RUN loop. Confirmed identical on the
-;         untouched v15.22 original while regression-testing PROG2X (v15.26).
-;       . PRINT's ',' separator only evaluates and prints the first item --
-;         PRINT 1,2,3 prints just "1". Found while regression-testing the
-;         AND/OR/XOR rewrite (v15.27).
-;       . GOTO/GOSUB don't flag trailing text after the target line-number
-;         expression -- GOSUB 30XYZ silently jumps to 30. Found during the
-;         missing-syntax-error audit (v15.28).
-;       . NEXT's variable name isn't checked against the FOR it closes.
-;         Found during the same audit; not changed, flagged as a design
-;         question rather than assumed to be a bug.
-;   Also normalized line endings: a run of str_replace/create_file edits
-;   across v15.23-v15.28 had left 238 lines with a bare LF instead of the
-;   file's own CRLF convention (all in comments/changelog text, so it never
-;   affected assembly -- caught by a full-file scan while proofreading this
-;   pass, not by the assembler). Whole file normalized to CRLF throughout;
-;   reassembled and confirmed byte-identical output before and after.
-;
+; v15.29 (Sep 2026) - 52 bytes free (confirmed by build) - Golf Pass
+;   - BBR instruction deployed
+;   - Showcase: added lines 66-68 (SHR, HEX$, and all remaining relational
+;     operators <, <=, >=, <> -- only = and > had coverage before).
+;   - Showcase: added line 65 (SGN, SHL demo). 
+;   Added DPEEK(addr) 16 bit peek
+;   Header brought current: Tier 4 lists SHL/SHR; Tier 5 atoms drop ASC,
+;   add SGN; 
 
 ; v15.28 (Aug 2026) - 61 bytes free (confirmed by build) - FUNCTIONALITY FIX
 ;   Replaced EAT_EXPR with EXPECT_EQ/EXPECT_TO/EXPECT_COMMA/EXPECT_LPAREN +
-;   shared EXPECT, closing a real gap found by testing: EAT_EXPR consumed
-;   the next byte via WEAT unconditionally and never checked it was the
-;   delimiter the caller actually wanted. Confirmed with malformed input
-;   at all 4 call sites before fixing anything -- none raised any error:
-;     FOR I=1 10        (missing TO)      looped once instead of ten times
-;     POKE 100 42       (missing comma)   write silently lost
-;     PRINT ABS 5       (missing '(')     printed 0
-;     PRINT PEEK 100    (missing '(')     printed 134 (garbage)
-;     PRINT SIN 30      (missing '(')     printed 0
-;     LIST 10 20        (missing comma)   silently did nothing
-;   The last one also covers PEEK/USR/SIN/COS/ASIN/ACOS/SGN, which all
-;   share E2_ARG1's opening-paren consumption; LIST shares GET_TWO_ARGS'
-;   comma consumption with POKE.
-;   Checked and NOT changed: DO_LET's own '=' check already validates
-;   correctly (raises UK ERR) -- my first test of it looked clean only
-;   because piping through `tail` cut the error line off, not because
-;   nothing was wrong; DO_READ's comma handling already peeks before
-;   consuming, so a missing comma ends the variable list gracefully
-;   rather than corrupting anything; DATA's parser doesn't need comma
-;   validation at all since digit-scanning naturally stops at any
-;   non-digit separator. NEXT's variable name isn't checked against the
-;   active loop (ran fine with the wrong variable) -- flagged, not
-;   changed, since this looks like a deliberate simplification rather
-;   than an oversight; GOSUB/GOTO don't flag trailing garbage after the
-;   target expression -- different mechanism, not chased further.
-;   EXPECT peeks (WPEEK) rather than blind-consuming (WEAT): on a
-;   mismatch IP is left AT the offending character, not past it, then
-;   raises ERR_SN via the existing RD_sn stub. The 4 entry points chain
-;   via the same BIT-trick ($2C) fallthrough as AND/OR/XOR's entry chain,
-;   each loading its own expected character before falling into the one
-;   shared validator. +25 bytes net (EAT_EXPR's old unconditional-consume
-;   shape was 15 bytes total across the system; validating properly costs
-;   more, expected and accepted for a functionality fix).
-;   Regression-tested exhaustively: full script + showcase + EDITLN stress
-;   diff clean against v15.27 except the version banner; well-formed
-;   FOR/STEP loops, POKE/PEEK round-trips, and all of ABS/PEEK/SIN/COS/
-;   ASIN/ACOS/SGN verified directly, not assumed safe from the shared code
-;   path.
-;
+;   shared EXPECT. EAT_EXPR consumed the next byte via WEAT unconditionally,
+;   never checking it matched the expected delimiter
 
 ; v15.27 (Aug 2026) - 86 bytes free (confirmed by build)
-;   SHL/SHR refactor (on request) + asmdup.py pass over the file, both
-;   built and regression-tested individually. Includes one real mistake,
-;   caught by testing rather than missed: see the PUSH_T0 note below.
-;   - E1_shl/E1_shr/SHIFT_L16_T0 restructured: the two now share one
-;     prologue, E1_sh_pre (token consume + hardware-stack operand hold
-;     across the recursive JSR EXPR_POW), instead of each duplicating it.
-;     SHIFT_L16_T0 is gone entirely -- it had exactly one caller (E1_shl),
-;     so the JSR/RTS pair around its 4-instruction body was pure overhead;
-;     inlined directly into E1_shl instead. SHR still calls the untouched
-;     ASR16. +24 bytes (55 -> 79 after this + a couple of BEQ/BRA sites
-;     that fell back into short range once the code shrank).
-;   - DBL_CURLN: shared "double CURLN" (ASL/ROL pair), replacing 3
-;     occurrences in TKPNUM (x*10 via x*2+x*8) and 4 in TKPHEX (x*16).
-;     +2 bytes.
-;   - EMIT_CURLN: shared "emit CURLN's two bytes via TKEMIT", replacing
-;     one occurrence each in TOKENIZE's hex-literal and decimal-literal
-;     paths. +4 bytes (tail-calls into TKEMIT rather than JSR+RTS).
-;   - PUSH_T0: attempted and reverted. asmdup.py's top-ranked match (by a
-;     wide margin) was the 4-instruction "push T0 onto the hardware stack
-;     before a recursive parse call" idiom, hand-duplicated identically in
-;     5 places (EB_rel, REL_SETUP, E1_md, E1_sh_pre, EXPR_POW's EP_have).
-;     Extracting it as a normal JSR-called subroutine is not just buggy but
-;     structurally impossible on this architecture: when the subroutine
-;     pushes T0's two bytes and then hits its own RTS, RTS pops whatever
-;     is CURRENTLY on top of the stack as its return address -- which by
-;     then is T0's high byte, not the real return address JSR pushed
-;     underneath it. Every call site crashed immediately (confirmed by
-;     testing all 5, not assumed from one) with execution landing inside
-;     PROG's own token data as the bogus "return address." A subroutine
-;     cannot use plain JSR/RTS to leave extra data behind on the stack for
-;     its caller -- reverted in full, all 5 sites back to their original
-;     inline form. No net size change from this item; the mistake was
-;     caught before being kept, not shipped and left as a regression.
-;
+;   - E1_shl/E1_shr share one prologue (E1_sh_pre); SHIFT_L16_T0 inlined
+;     into E1_shl (its only caller). +24 bytes.
+;   - DBL_CURLN: shared "double CURLN", replacing 3+4 occurrences in
+;     TKPNUM/TKPHEX. +2 bytes.
+;   - EMIT_CURLN: shared "emit CURLN's 2 bytes", replacing 1+1 occurrences
+;     in TOKENIZE. +4 bytes.
 
 ; v15.26 (Aug 2026) - 55 bytes free (confirmed by build)
-;   Two changes reviewed against uBASIC6502's line-store code (on request),
-;   built and regression-tested individually. Also reviewed and declined:
-;   uBASIC6502's GETLINE (its own header calls it "MINIMAL" -- no backspace
-;   editing, no buffer-full guard, no echo; porting it would be a feature
-;   cut, not a size trick) and its PRCR/PRLF (uBASIC's own dedicated CR/LF
-;   routine vs. this file's PUTSTR/STR_CRLF, which is already shared with
-;   every other string constant in the program -- nothing to gain by
-;   duplicating what's already free). INSLINE's backward-copy core is
-;   already the same pointer-comparison technique uBASIC uses (a prior
-;   comment on INSLINE already notes it was ported from an early uBASIC6502
-;   and improved past it); the one real difference -- uBASIC computes
-;   insert length via LLEN subtraction instead of a scan -- doesn't
-;   transfer here: this file tokenizes in TOKENIZE before EDITLN/INSLINE
-;   ever run (no LLEN exists in this file at all, and IP points into the
-;   already-tokenized buffer by that point), so a raw-input length
-;   wouldn't match the tokenized payload actually being copied.
-;   - PROG2IP/PROG2P: new shared helper resetting a ZP pointer pair to
-;     PROG, replacing 5 duplicate inline "STZ ptr/LDA #>PROG/STA ptr+1"
-;     sites (DO_RUN, DO_NEW, DO_LIST's LS_scan, GOTOL, EDITLN) -- mirrors
-;     uBASIC6502's own PROG2LP/PROG2X. Byte-neutral as built (51 free
-;     before and after): call-site savings and the new routine's own cost
-;     came out equal, not a hand-count coincidence -- confirmed by
-;     assembling both ways. Kept anyway for the single source of truth on
-;     PROG's address and the reduced duplication; regression-tested since
-;     it touches every core program-storage entry point (found the
-;     immediate-mode-GOTO crash while testing this -- confirmed identical
-;     on the untouched v15.22 original, pre-existing, not a regression).
-;   - EDITLN's line-number comparison: reworked to match uBASIC6502's
-;     technique of reusing one CMP's flags across two branch decisions
-;     (hi-byte-unequal falls straight into the same BCC/BNE pair the
-;     lo-byte compare also uses) and reaching the exact-match/replace case
-;     by fall-through instead of an explicit BEQ. Needed EL_skip's block
-;     moved ahead of the scan loop (with its own skip-on-first-pass
-;     branch) to make the fall-through land correctly, same restructuring
-;     uBASIC6502's own layout uses -- hand-estimated at ~2 bytes once that
-;     reordering cost is included, measured at +4. Regression-tested
-;     exhaustively (insert at start/middle/end, out-of-order entry,
-;     replace at every position, delete, single-line and empty-program
-;     edge cases) against the untouched v15.22 original: output identical
-;     in every case.
-;
+;   - PROG2IP/PROG2P: shared "reset ZP pointer pair to PROG", replacing 5
+;     duplicate sites (DO_RUN, DO_NEW, LS_scan, GOTOL, EDITLN). Byte-
+;     neutral as built; kept for the single source of truth.
+;   - EDITLN's line-number comparison reworked to reuse one CMP's flags
+;     across both branch decisions, reaching exact-match by fall-through.
 
 ; v15.25 (Aug 2026) - 51 bytes free (confirmed by build)
-;   Traded ASC for SGN + SHL/SHR, on request. All three changes below were
-;   built and regression-tested individually, in this order.
-;   - Removed ASC("str")/ASC(n): its only real use was ASC() of a string
-;     LITERAL (there are no string variables in this dialect, so nothing
-;     could pass a *runtime* string to it) -- CHR$ covers the character
-;     side, so this wasn't pulling its own weight. TOK_ASC's KW_TABLE slot
-;     ($99) is now a placeholder byte (.DB $80), same pattern already used
-;     for the historical CLS/HELP/ON/SGN removals -- NOT a plain deletion:
-;     token values in this file are assigned by KW_TABLE position during
-;     tokenizing (TRYKW increments TKTOK once per entry), so an outright
-;     delete would have silently shifted every token after it. Confirmed
-;     the hard way: a first attempt that just deleted the row broke
-;     OR/NOT/ABS/TAB (everything positioned after ASC) before the
-;     placeholder fix was applied. Also trimmed the pre-loaded showcase's
-;     line 30, which demonstrated ASC("A") -- 51 bytes freed (2 KW_TABLE,
-;     7 EXPR2 dispatch, 42 the routine body), plus a few RAM bytes back
-;     from the showcase edit (unrelated to the ROM total above).
-;   - Added SGN(n): restored into its own historical placeholder slot
-;     (TOK_SGN = $A3, removed v15.0 "for space for CORDIC" -- the KW_TABLE
-;     placeholder comment there literally said "SGN removed", so this
-;     undoes that trade rather than adding a new one). Branchless on the
-;     nonzero path: arithmetic-shifts T0 right 15 places via the existing
-;     ASR16 (untouched, reused exactly as SIN/COS/CORDIC already call it)
-;     to sign-extend to all-0s or all-1s, then ORs the low byte with 1 --
-;     0|1=1, $FF|1=$FF -- giving +1/-1 with no branch on the sign itself;
-;     a zero-check up front handles SGN(0)=0 as its own case. 27 bytes.
-;   - Added SHL/SHR (n SHL c / n SHR c, c = shift count): new TOK_SHL/
-;     TOK_SHR appended after TOK_ACOS ($AC/$AD) -- new sequential values,
-;     nothing renumbered. Placed in EXPR1 (the */,/,%/MOD tier) but
-;     deliberately NOT folded into E1_md's shared path: that tier
-;     sign-normalizes both operands and reapplies an XOR'd result sign,
-;     which is the wrong operation for a shift entirely. Each op is its
-;     own small routine, using the same hardware-stack operand hold across
-;     the recursive JSR EXPR_POW that E1_md's own v15.24 fix uses, for the
-;     same reason (EXPR_POW can recurse back into this tier for a
-;     parenthesized right operand, e.g. "2 SHL (1+1)") -- verified
-;     directly rather than assumed, including chained/nested cases on
-;     both operators. SHR reuses ASR16 unchanged (arithmetic, sign-
-;     preserving: -16 SHR 2 = -4). SHL uses a new SHIFT_L16_T0, mirroring
-;     the existing (unguarded) SHIFT_R16_T0's shape but with its own
-;     TXA/BEQ zero-count guard matching ASR16's -- SHIFT_R16_T0 itself is
-;     untouched, its existing SIN/COS callers already guarantee a nonzero
-;     count, but SHL's caller (a user expression) can't make that promise.
-;     83 bytes (a few over hand-estimate: three BEQ/BRA sites landed out
-;     of range once the new code was in place and needed the standard
-;     invert-and-JMP / plain-JMP fix, all caught by the assembler, not
-;     missed by inspection).
-;   Full regression suite (showcase + targeted script) diffs clean
-;   throughout except the intended output changes (ASC gone, SGN/SHL/SHR
-;   present); boundary-tested SGN at -32768/32767, SHL/SHR at 0 and 15-bit
-;   shift counts, negative operands, and overflow (1 SHL 20 -> 0).
+;   Traded ASC for SGN + SHL/SHR.
+;   - Removed ASC: only real use was ASC() of a string literal (no string
+;     variables exist). KW_TABLE slot ($99) is a placeholder byte, not a
+;     deletion -- token values are assigned by table position. +51 bytes.
+;   - Added SGN(n): restored into its old placeholder slot (TOK_SGN=$A3,
+;     removed v15.0). Branchless via existing ASR16 sign-extension.
+;   - Added SHL/SHR: new tokens TOK_SHL/TOK_SHR ($AC/$AD). Not folded into
+;     E1_md's shared path (wrong semantics for a shift). SHR reuses ASR16;
+;     SHL used a new SHIFT_L16_T0 (later inlined, v15.27). +83 bytes.
 ;
 
 ; v15.24 (Aug 2026) - 110 bytes free (confirmed by build) - CORRECTNESS FIX
-;   EXPR1's E1_md (the */,/,%/MOD operator tier) stashed the operator in a
-;   fixed zero-page byte (OP) BEFORE its recursive JSR EXPR_POW call for the
-;   right operand. EXPR_POW can recurse all the way back into EXPR1 for a
-;   parenthesized right operand (EXPR2 -> E2_grp -> EXPR -> EXPR_ADD ->
-;   EXPR1); if that inner expression also contained a */,/,%/MOD, its own
-;   E1_md overwrote the same OP byte before the outer call read it back,
-;   so e.g. PRINT 2*(10/5) evaluated as division and printed 1, not 4.
-;   Flagged during the uBASIC6502 comparison review (see chat/report) --
-;   uBASIC6502 hit and fixed the identical bug in its own v1.11, by moving
-;   the operator onto the hardware stack across the recursive call instead
-;   of a fixed byte. Same fix applied here: E1_md now PHAs the operator
-;   before JSR EXPR_POW and PLAs it back into OP only after the call
-;   returns (once no further recursion into this routine is possible from
-;   the current call). Byte-neutral (PHA/PLA cost exactly what the STA/LDA
-;   OP they replaced did).
-;   Verified by simulation: 2*(10/5), 2*(4/2), (2+3)*(10/5), 6*(4/2)*(2+2),
-;   (2*3)/(6/3) now all correct; full regression suite otherwise unchanged.
-;
+;   E1_md stashed the */,/,%/MOD operator in a fixed ZP byte (OP) across
+;   its own recursive JSR EXPR_POW -- a parenthesized right operand with
+;   another */,/,%/MOD clobbered it before the outer op was read back,
+;   e.g. PRINT 2*(10/5) printed 1, not 4. Fixed by holding the operator
+;   on the hardware stack across the recursive call instead. Byte-neutral.
 
 ; v15.23 (Aug 2026) - 110 bytes free (confirmed by build)
-;   Size-reduction pass, ported/adapted from techniques found in uBASIC6502
-;   (a related NMOS-6502 Tiny BASIC) during a static comparison. Each item
-;   below was assembled and regression-tested individually before the next.
-;   - E2_not (unary NOT): was a standalone EOR #$FF pair on each byte.
-;     NOT x == -(x+1), so it now increments T0 and tail-calls into the
-;     existing NEG16 trampoline instead of duplicating negate logic.
-;     ~4-5 bytes.
-;   - ERR_SN and ERR_OV each had two independent "LDA #ERR_xx / JMP
-;     DO_ERROR" raise sites. Pooled each pair the same way ERR_NR/ERR_UL
-;     already were: DO_FOR's syntax check now jumps into RD_sn (DO_READ)
-;     instead of duplicating it -- RD_sn's own LDA #ERR_SN couldn't be
-;     removed, it's load-bearing for RD_od's existing BIT-trick fallthrough
-;     right above it, so RD_sn stayed the anchor. Likewise EXPR1's
-;     E1_divchk_ovfl now jumps into EP_ovfl (EXPR_POW), which was already
-;     a shared stub with two other internal callers. ~4 bytes.
-;   - DO_RUN's RUNLP and DO_NEXT's DN_runbody contained a byte-for-byte
-;     identical 6-instruction sequence (read the 2-byte CURLN header at
-;     IP, advancing IP by 2). Extracted to a new shared routine, RD_CURLN.
-;     ~8 bytes.
-;   - EB_and/EB_or/EB_xor (the AND/OR/XOR combine) each did their own
-;     JSR REL_SETUP followed by a straight-line hi-byte/lo-byte AND/ORA/EOR
-;     pair. Rewritten to mirror uBASIC6502's BITOP2_PREFIX/BITOP_LP: the
-;     three entries now set an operator selector (Y) via a BIT-trick
-;     ($2C) fallthrough chain instead of three separate REL_SETUP calls,
-;     REL_SETUP carries Y across the recursive JSR EXPR_ADD on the
-;     hardware stack (PHY/PLY) instead of resolving the left operand into
-;     T1, and one shared 2-iteration loop (indexed by X into T0) combines
-;     both bytes via a second BIT-trick chain choosing AND/ORA/EOR --
-;     same technique uBASIC6502 uses, adapted for chained infix operators
-;     rather than 2-arg functions. REL_SETUP's old exit was shared with
-;     EXPR_ADD's own (EA_rts); EXPR_ADD now has its own dedicated exit
-;     since REL_SETUP no longer returns by RTS. ~17 bytes (~19 after also
-;     taking the assembler's own PHY/PLY-instead-of-TYA+PHA/PLA+TAY
-;     advisory on this same code).
-;   Known but NOT fixed in this pass (flagged during the review, out of
-;   scope for a size-only change -- see chat): EXPR1's E1_md stashes the
-;   */,/,%/MOD operator in a fixed zero-page byte (OP) across a recursive
-;   JSR EXPR_POW call; a parenthesized sub-expression containing another
-;   */,/,%/MOD clobbers it before the outer operator is read back, e.g.
-;   PRINT 2*(10/5) evaluates as division and prints 1, not 4. Confirmed
-;   present in this file by simulation. uBASIC6502 hit and fixed the
-;   identical bug in its own v1.11 (operator held on the hardware stack
-;   across the recursive call instead of a fixed byte); the same fix
-;   shape applies here.
-;
+;   Size-reduction pass, ported/adapted from uBASIC6502 techniques.
+;   - E2_not: reuses NEG16 via -(x+1) instead of its own EOR #$FF pair.
+;   - Pooled ERR_SN (DO_FOR -> RD_sn) and ERR_OV (E1_divchk_ovfl ->
+;     EP_ovfl), same pattern as the existing ERR_NR/ERR_UL pooling.
+;   - RD_CURLN: shared CURLN-header read, replacing identical code in
+;     DO_RUN and DO_NEXT.
+;   - EB_and/EB_or/EB_xor rewritten to share one combine loop via a
+;     BIT-trick ($2C) entry chain and REL_SETUP, mirroring uBASIC6502's
+;     BITOP2_PREFIX/BITOP_LP.
 
 ; v15.22 (Aug 2026) - 73 bytes free (confirmed by build)
 ;   - EXPR_POW (EP_mul, EP_sign): two inline 16-bit copies into T0 (from CX,
 ;     from CY) converted to the shared TO_T0 helper.
-;   - Showcase (RAM at $0200, not part of the $F000 ROM budget above): line
-;     880 (Spiral Vortex) changed from X*X+Y*Y to X^2+Y^2 to exercise the
-;     `^` operator.
-;   - Showcase lines 660/680 (Mandelbrot escape test) were tried as
-;     A^2/B^2 but REVERTED back to A*A/B*B: the escape-time algorithm
-;     relies on A/B growing past +-181 (sqrt(32767)) once a point starts
-;     diverging, which `^`'s explicit 16-bit overflow guard correctly
-;     rejects (OV ERR IN 680) where `*`'s silent mod-65536 wraparound
-;     did not. The demo depends on `*`'s wraparound behaviour here.
 ;
 ; v15.21 (Aug 2026) - 67 bytes free
 ;   - Cleaned up file header to match house style.
@@ -680,8 +403,9 @@ TOK_SIN     = $A8            ; SIN(deg) -> deg*1000 (0-360)
 TOK_COS     = $A9            ; COS(deg) -> deg*1000 (0-360)
 TOK_ASIN    = $AA            ; ASIN(v)  v in -1000..1000 -> degrees -90..90 (v15.19)
 TOK_ACOS    = $AB            ; ACOS(v)  v in -1000..1000 -> degrees 0..180  (v15.19)
-TOK_SHL     = $AC            ; n SHL c  bitwise left shift   (v15.25)
-TOK_SHR     = $AD            ; n SHR c  arithmetic right shift, sign-preserving (v15.25)
+TOK_DPEEK   = $AC            ; DPEEK(addr)  16-bit read  (v15.31)
+TOK_SHL     = $AD            ; n SHL c  bitwise left shift  (v15.25, renumbered v15.31)
+TOK_SHR     = $AE            ; n SHR c  arithmetic right shift, sign-preserving (v15.25, renumbered v15.31)
 TOK_HEX     = $FE            ; inline 16-bit unsigned hex literal follows, e.g. $1234 (v15.20)
 TOK_NUM     = $FF            ; inline 16-bit number follows
 
@@ -788,7 +512,10 @@ ZPEND    = *                    ; audit
         .DB $28, $00, $80, $22, $31, $37, $20, $4D, $4F, $44, $20, $35, $3D, $22, $3B, $FF, $11, $00, $A1, $FF, $05, $00, $3B, $22, $20, $20, $41, $42, $53, $20, $6E, $65, $67, $37, $3D, $22, $3B, $A5, $28, $2D, $FF, $07, $00, $29, $0D  ; 40 PRINT "17 MOD 5=";17 MOD 5 ;"  ABS neg7=";ABS (-7 )
         .DB $32, $00, $80, $22, $4E, $4F, $54, $20, $30, $3D, $22, $3B, $9C, $FF, $00, $00, $3B, $22, $20, $20, $36, $20, $41, $4E, $44, $20, $33, $3D, $22, $3B, $FF, $06, $00, $9A, $FF, $03, $00, $0D  ; 50 PRINT "NOT 0=";NOT 0 ;"  6 AND 3=";6 AND 3 
         .DB $3C, $00, $80, $22, $35, $20, $4F, $52, $20, $32, $3D, $22, $3B, $FF, $05, $00, $9B, $FF, $02, $00, $3B, $22, $20, $20, $37, $20, $58, $4F, $52, $20, $33, $3D, $22, $3B, $FF, $07, $00, $9D, $FF, $03, $00, $0D  ; 60 PRINT "5 OR 2=";5 OR 2 ;"  7 XOR 3=";7 XOR 3 
-        .DB $41, $00, $80, $22, $53, $47, $4E, $28, $2D, $35, $29, $3D, $22, $3B, $A3, $28, $2D, $FF, $05, $00, $29, $3B, $22, $20, $20, $31, $20, $53, $48, $4C, $20, $34, $3D, $22, $3B, $FF, $01, $00, $AC, $FF, $04, $00, $0D  ; 65 PRINT "SGN(-5)=";SGN (-5 );"  1 SHL 4=";1 SHL 4
+        .DB $41, $00, $80, $22, $53, $47, $4E, $28, $2D, $35, $29, $3D, $22, $3B, $A3, $28, $2D, $FF, $05, $00, $29, $3B, $22, $20, $20, $31, $20, $53, $48, $4C, $20, $34, $3D, $22, $3B, $FF, $01, $00, $AD, $FF, $04, $00, $0D  ; 65 PRINT "SGN(-5)=";SGN (-5 );"  1 SHL 4=";1 SHL 4
+        .DB $42, $00, $80, $22, $2D, $31, $36, $20, $53, $48, $52, $20, $32, $3D, $22, $3B, $2D, $FF, $10, $00, $AE, $FF, $02, $00, $3B, $22, $20, $20, $48, $45, $58, $24, $28, $32, $35, $35, $29, $3D, $22, $3B, $A2, $28, $FF, $FF, $00, $29, $0D  ; 66 PRINT "-16 SHR 2=";-16 SHR 2;"  HEX$(255)=";HEX$ (255 )
+        .DB $43, $00, $80, $22, $35, $3C, $31, $30, $3D, $22, $3B, $FF, $05, $00, $3C, $FF, $0A, $00, $3B, $22, $20, $20, $35, $3C, $3E, $33, $3D, $22, $3B, $FF, $05, $00, $3C, $3E, $FF, $03, $00, $0D  ; 67 PRINT "5<10=";5<10;"  5<>3=";5<>3
+        .DB $44, $00, $80, $22, $33, $3C, $3D, $33, $3D, $22, $3B, $FF, $03, $00, $3C, $3D, $FF, $03, $00, $3B, $22, $20, $20, $35, $3E, $3D, $36, $3D, $22, $3B, $FF, $05, $00, $3E, $3D, $FF, $06, $00, $0D  ; 68 PRINT "3<=3=";3<=3;"  5>=6=";5>=6
         .DB $46, $00, $80, $22, $52, $4E, $44, $20, $4D, $4F, $44, $20, $31, $30, $3D, $22, $3B, $A4, $A1, $FF, $0A, $00, $0D  ; 70 PRINT "RND MOD 10=";RND MOD 10 
         .DB $50, $00, $8E, $FE, $FF, $00, $2C, $FF, $2A, $00, $3A, $80, $22, $50, $4F, $4B, $45, $3D, $22, $3B, $A6, $28, $FE, $FF, $00, $29, $0D  ; 80 POKE $00FF ,42 :PRINT "POKE=";PEEK ($00FF )
         .DB $5A, $00, $93, $41, $2C, $42, $2C, $43, $3A, $80, $22, $44, $41, $54, $41, $20, $20, $22, $3B, $41, $3B, $22, $20, $20, $22, $3B, $42, $3B, $22, $20, $20, $22, $3B, $43, $0D  ; 90 READ A,B,C:PRINT "DATA  ";A;"  ";B;"  ";C
@@ -875,7 +602,7 @@ SHOWCASE_END = *               ; v15.20: extended with Integer Spiral Vortex dem
 ; STRING TABLE (all strings on same page)
 ; =============================================================================
 STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string/kw addresses
-STR_BANNER: .DB "4K BASIC v15.30"       ; same length as v15.16/v15.20/v15.21/v15.22/v15.23/v15.24/v15.25/v15.26/v15.27/v15.28/v15.29
+STR_BANNER: .DB "4K BASIC v15.29"
 STR_CRLF:   .DB $0D,$8A             ; CR, LF|$80 = $8A
 STR_BYTES:  .DB " BYTES FREE",$0D,$8A  ; last LF has high-bit
 STR_ERROR:  .DB " ER",$D2           ; 'R'|$80 = $D2
@@ -948,8 +675,9 @@ KW_TABLE:
         .DB "CO",$D3          ; $A9 TOK_COS     ('S'|$80=$D3)  Group A: FUNC_JT[4]
         .DB "ASI",$CE         ; $AA TOK_ASIN    ('N'|$80=$CE)  Group A: FUNC_JT[5]  (v15.19)
         .DB "ACO",$D3         ; $AB TOK_ACOS    ('S'|$80=$D3)  Group A: FUNC_JT[6]  (v15.19)
-        .DB "SH",$CC          ; $AC TOK_SHL     ('L'|$80=$CC)  v15.25
-        .DB "SH",$D2          ; $AD TOK_SHR     ('R'|$80=$D2)  v15.25
+        .DB "DPEE",$CB        ; $AC TOK_DPEEK   ('K'|$80=$CB)  Group A: FUNC_JT[7]  (v15.31)
+        .DB "SH",$CC          ; $AD TOK_SHL     ('L'|$80=$CC)  v15.25, renumbered v15.31
+        .DB "SH",$D2          ; $AE TOK_SHR     ('R'|$80=$D2)  v15.25, renumbered v15.31
         .DB 0                 ; end-of-table sentinel
 
 ; Statement dispatch table (used by STMT via JMP (STMT_JT,X))
@@ -974,8 +702,6 @@ STMT_JT:
 ;   Clobbers: A X
 ; =============================================================================
 INIT:
-        LDX #HWSTACK
-        TXS                  ; initialise stack pointer
         CLD                  ; clear decimal mode
         CLI                  ; enable maskable IRQs (for IRQ Break key)
 
@@ -1000,6 +726,9 @@ INIT:
 ;   Clobbers: everything (re-initialises per iteration)
 ; =============================================================================
 MAIN:
+        LDX #HWSTACK
+        TXS                  ; reset SP every trip through -- unwinds any debris left
+                              ; by DO_ERROR or IRQ_HANDLER (see their own comments)
         STZ RUN
         STZ FSTK
         JSR GETLINE_M          ; fills IBUF, tokenises into TBUF
@@ -1007,8 +736,6 @@ MAIN:
         STA IP
         STZ IP+1
         JSR WPEEK
-        CMP #$0D             ; empty line?
-        BEQ MAIN
         CMP #TOK_NUM         ; starts with a number -> line edit
         BNE MAIN_direct
         JSR EDITLN
@@ -1044,12 +771,11 @@ DO_ERROR:
         JSR PUTCH
         LDA #<STR_ERROR
         JSR PUTSTR           ; " ERR"
-        LDA RUN
-        BEQ DO_err_noline
+        BBR #0,RUN,DO_err_noline
 DO_break_in:                  ; IRQ handler jumps here to share " IN line\r\n" exit
         LDA #<STR_IN
         JSR PUTSTR           ; " IN "
-        LDX #CURLN-T0
+        LDX #(CURLN-T0)
         JSR TO_T0
         JSR PRT16            ; line number
 DO_err_noline:
@@ -1290,6 +1016,8 @@ EMIT_CURLN:
 ;   Out: CURLN doubled
 ;   Clobbers: A (flags)
 ; =============================================================================
+CURLNX4:
+        JSR DBL_CURLN
 DBL_CURLN:
         ASL CURLN
         ROL CURLN+1
@@ -1319,8 +1047,9 @@ TKPN_lp:
         LDA CURLN+1
         TAY                  ; X,Y = x*2
         
-        JSR DBL_CURLN
-        JSR DBL_CURLN          ; CURLN = x*8
+     ;   JSR DBL_CURLN
+      ;  JSR DBL_CURLN          ; CURLN = x*8
+        JSR CURLNX4          ; CURLN = x*8
         
         TXA
         CLC
@@ -1369,10 +1098,12 @@ TKPH_dec:
 TKPH_dig:
         PHA                    ; save the binary digit (0-15)
         JSR INC_T0
-        JSR DBL_CURLN          ; CURLN <<= 4
-        JSR DBL_CURLN
-        JSR DBL_CURLN
-        JSR DBL_CURLN
+;        JSR DBL_CURLN          ; CURLN <<= 4
+;        JSR DBL_CURLN
+;        JSR DBL_CURLN
+;        JSR DBL_CURLN
+        JSR CURLNX4          ; CURLN = x*8
+        JSR CURLNX4          ; CURLN = x*8
         PLA
         ORA CURLN
         STA CURLN
@@ -1448,7 +1179,7 @@ TRY_raw_done:
         CLC
         RTS
 TRY_miss:                    ; this keyword doesn't match: restore T0, try next
-        LDX #CURLN-T0
+        LDX #(CURLN-T0)
         JSR TO_T0
         JSR KW_NEXT          ; advance T2 past current entry
         INC TKTOK
@@ -1491,7 +1222,7 @@ EL_done:
 EDITLN:
         JSR PNUM             ; consume $FF lo hi, place value in T0
         JSR T0_TO_CURLN
-        LDX #LP-IP
+        LDX #(LP-IP)
         JSR PROG2P
         BRA EL_fl             ; skip EL_skip's own body on the first pass
 EL_skip:                     ; advance LP past current line  (scan body for $0D)
@@ -1560,7 +1291,7 @@ INSLINE:
         BCC IN_ok            ;  exact since RAM_TOP is page-aligned)
         LDA #ERR_OM
         JMP DO_ERROR
-IN_ok:  LDX #PE-T0          ; T0 = old PE
+IN_ok:  LDX #(PE-T0)          ; T0 = old PE
         JSR TO_T0
         LDA T1                ; commit new PE now (OOM check already passed)
         STA PE
@@ -1703,8 +1434,7 @@ ST_tok: JSR GETCI            ; consume token
         PHA
         LDA #<ST_sep_m1
         PHA
-        .DB $7C              ; JMP (STMT_JT,X)  -- 65C02 absolute indexed indirect
-        .DW STMT_JT
+        JMP (STMT_JT,X)      ; 65C02 absolute indexed indirect
 ST_let: JSR DO_LET           ; LET varname = expr (or implicit assignment)
         BRA ST_sep
 ST_colon:
@@ -1966,8 +1696,8 @@ DO_RUN:
         STZ DATA_PTR         ; reset DATA pointer (sentinel 0 = rescan from PROG)
         STZ DATA_PTR+1
         STZ FSTK
-        LDA #$FF
-        STA RUN
+        SMB #0,RUN           ; RUN only ever needs to be nonzero (every reader
+                              ; zero-tests it) -- SMB sets bit0, cheaper than LDA#$FF/STA
 ; --- inner run loop  (also entered from DO_GOTO / DO_GOSUB / DO_NEXT) ---
 RUNLP:
         TSX                  ; save SP so GOTO / NEXT can unwind
@@ -1978,8 +1708,7 @@ RUNLP:
         BEQ RUNEND
         JSR RD_CURLN          ; read 2-byte line-number header, advance IP by 2
 RUNGO:  JSR STMT
-        LDA RUN
-        BEQ RUNEND
+        BBR #0,RUN,RUNEND
         JSR SKIPEOL
         BRA RUNLP
 
@@ -2029,7 +1758,7 @@ INIT_z: STZ 0,x              ; 65C02 STZ zp,x  (no LDA #0 needed)
         BNE INIT_z           
         ; DATA_PTR ($BC-$BD) is zeroed by INIT_z above ? sentinel 0 = rescan from PROG  
         ; reset program store
-        LDX #PE-IP
+        LDX #(PE-IP)
         JSR PROG2P
 
         ; Seed RND
@@ -2079,7 +1808,7 @@ DO_LIST:
         LDA T0+1
         STA CY+1
 LS_scan:
-        LDX #LP-IP
+        LDX #(LP-IP)
         JSR PROG2P
 
 LS_ln:  LDX #LP               ; end of program?
@@ -2893,7 +2622,7 @@ EA_do:  PHA                  ; save operator  ('+' or '-')
         BNE EA_sum
         JSR NEG16            ; subtraction: negate right then add
 EA_sum: 
-        LDX #T1-T0    ; 2
+        LDX #(T1-T0)    ; 2
         JSR ADDT0_TO    ; 3
         JSR TO_T0       ; 3 = 8
         BRA EA_lp
@@ -2948,7 +2677,7 @@ E1_divchk_ovfl:              ; shared ERR_OV stub: EP_ovfl in EXPR_POW, below
         JMP EP_ovfl
 
 E1_mod_result:
-        LDX #T2-T0          ; remainder -> T0
+        LDX #(T2-T0)          ; remainder -> T0
         JSR TO_T0
         ; *** FALL THROUGH to E1_SIGN ***
         ; ---- shared sign postamble ----
@@ -2962,11 +2691,9 @@ E1_nochk:
         LDA T1+1
         EOR T0+1
         PHA                  ; push result sign  (XOR of sign bits)
-        LDA T1+1             ; make T1 (left) positive
-        BPL E1_p1
+        BBR #7,T1+1,E1_p1    ; make T1 (left) positive
         JSR NEG_T1
-E1_p1:  LDA T0+1             ; make T0 (right) positive
-        BPL E1_p2
+E1_p1:  BBR #7,T0+1,E1_p2    ; make T0 (right) positive
         JSR NEG16
 E1_p2:  LDA OP
         CMP #'*'
@@ -2976,13 +2703,13 @@ E1_p2:  LDA OP
         LDA OP               ; MOD: result is remainder (T2), not quotient (T1)
         CMP #'%'
         BEQ E1_mod_result
-        LDX #T1-T0          ; quotient -> T0
+        LDX #(T1-T0)          ; quotient -> T0
         JSR TO_T0
         BRA E1_sign
 
 E1_mul_go:
         JSR MUL16_u           ; T2 = |T1| * |T0|
-        LDX #T2-T0          ; result -> T0
+        LDX #(T2-T0)          ; result -> T0
         JSR TO_T0
         BRA E1_sign
 
@@ -3052,7 +2779,7 @@ MUL16_u:
 MU_lp:  LSR T1+1
         ROR T1
         BCC MU_ms
-        LDX #T2-T0
+        LDX #(T2-T0)
         JSR ADDT0_TO
 MU_ms:  ASL T0
         ROL T0+1
@@ -3205,8 +2932,7 @@ EP_pos: STA CZ+1                ; A still holds T0+1 (exponent hi) from above
         LDA T0+1
         STA ATEMP                ; exponent odd: ATEMP = base's original sign
 
-EP_abs: LDA T0+1
-        BPL EP_base_set
+EP_abs: BBR #7,T0+1,EP_base_set
         JSR NEG16                ; T0 = |base|
 
 EP_base_set:
@@ -3250,7 +2976,7 @@ EP_loop:
         LDA CX_SAV
         CMP CY
         BCC EP_ovfl
-EP_mul: LDX #CX-T0             ; CY *= CX  (safe: checked above)
+EP_mul: LDX #(CX-T0)             ; CY *= CX  (safe: checked above)
         JSR TO_T0
         LDA CY
         STA T1
@@ -3271,11 +2997,10 @@ EP_dlo: DEC                      ; 65C02 DEC A -- A still holds CZ's old low byt
         BNE EP_loop
 
 EP_sign:
-        LDX #CY-T0
+        LDX #(CY-T0)
         JSR TO_T0
 
-        BIT ATEMP                ; base was negative and exponent was odd?
-        BPL EP_done
+        BBR #7,ATEMP,EP_done  ; base was negative and exponent was odd?
         JSR NEG16                ; negate the result
 EP_done:
         JMP EP_lp                ; loop back for chained ^ (left-associative)
@@ -3287,28 +3012,39 @@ EXPR2:
         JMP E2_grp
 EXPR2_ng:
         CMP #'-'
-        BEQ E2_neg
+        BNE EXPR2_ng2
+        JMP E2_neg
+EXPR2_ng2:
         CMP #'+'
         BNE EXPR2_np
         JMP E2_pos
 EXPR2_np:
         CMP #TOK_NOT
-        BEQ E2_not
+        BNE EXPR2_np2
+        BRA E2_not
+EXPR2_np2:
         CMP #TOK_SGN
-        BEQ E2_sgn
+        BNE EXPR2_np3
+        JMP E2_sgn
+EXPR2_np3:
         CMP #TOK_HEX          ; dec or hex literal, v15.20
-        BCS PNUM
+        BCC EXPR2_t1
+        BRA PNUM
 
 ; =============================================================================
 ; EXPR2_t1 -- Group A/B function tokens: table-dispatched (v15.17, extended v15.19)
-;   TOK_RND..TOK_ACOS ($A4-$AB) are contiguous by design (see TOK_* block).
+;   TOK_RND..TOK_DPEEK ($A4-$AC) are contiguous by design (see TOK_* block).
 ;   RND (Group B: 0-arg, no parens) sits at FUNC_LO; ABS/PEEK/USR/SIN/COS/
-;   ASIN/ACOS (Group A: uniform 1-arg, paren-wrapped) sit immediately above
-;   it and are indexed into FUNC_JT. Replaces the old per-token CMP/BEQ chain.
-;   Anything below FUNC_LO here is not a function token -> try as variable.
-;   No upper-bound check: relies on TOK_NUM ($FF) being intercepted earlier
-;   in EXPR2 and nothing else valid sitting above TOK_ACOS. HEX$ was moved
-;   below FUNC_LO (v15.19) specifically to preserve this invariant.
+;   ASIN/ACOS/DPEEK (Group A: uniform 1-arg, paren-wrapped) sit immediately
+;   above it and are indexed into FUNC_JT. Replaces the old per-token CMP/BEQ
+;   chain. Anything below FUNC_LO here is not a function token -> try as
+;   variable. Explicit upper-bound check below (TOK_SHL and anything above):
+;   this used to be a documented invariant instead ("nothing valid sits
+;   above the last function token") relying on HEX$ having been moved out
+;   of the way in v15.19 -- true until v15.25 added SHL/SHR right above this
+;   range without adding the check back. PRINT SHL(5) reached the
+;   unconditional JMP (FUNC_JT,X) below with an out-of-range index and
+;   crashed (confirmed by testing, not just inspection) before this fix.
 ; =============================================================================
 EXPR2_t1:
         CMP #TOK_RND          ; FUNC_LO
@@ -3318,7 +3054,11 @@ EXPR2_t1a:
         BNE EXPR2_t1b          ; != FUNC_LO: not RND, continue below
         JMP E2_rnd              ; == FUNC_LO: RND (0-arg, no parens)
 EXPR2_t1b:
-        ; else: TOK_ABS..TOK_COS -- consume token + eat '(' expr ')' into T0
+        CMP #TOK_SHL           ; upper bound: TOK_SHL/TOK_SHR are not function
+        BCC EXPR2_t1c            ; tokens -- reject before the table jump below
+        JMP RD_sn
+EXPR2_t1c:
+        ; else: TOK_ABS..TOK_DPEEK -- consume token + eat '(' expr ')' into T0
         ; centrally (was done per-handler via each's own JSR E2_chrs), then
         ; index into FUNC_JT (word index = (token - TOK_ABS) * 2).
         SEC
@@ -3327,11 +3067,10 @@ EXPR2_t1b:
         PHA                   ; stash word-index across the recursive JSR E2_chrs below
         JSR E2_chrs            ; consume token, eat '(' expr ')' -> T0
         PLX
-        .DB $7C                ; JMP (FUNC_JT,X)  -- 65C02 absolute indexed indirect
-        .DW FUNC_JT
+        JMP (FUNC_JT,X)        ; 65C02 absolute indexed indirect
 
 FUNC_JT:
-        .DW E2_abs, E2_peek, E2_usr, E2_sin, E2_cos, E2_asin, E2_acos  ; TOK_ABS..TOK_ACOS ($A5-$AB)
+        .DW E2_abs, E2_peek, E2_usr, E2_sin, E2_cos, E2_asin, E2_acos, E2_dpeek  ; TOK_ABS..TOK_DPEEK ($A5-$AC)
 
 ; =============================================================================
 ; E2_PEEK ? PEEK(addr): read one byte from memory address  ?  0..255
@@ -3342,6 +3081,20 @@ E2_peek:
         LDA (T0)             ; 65C02 zp-indirect: read memory at addr
         STA T0
         STZ T0+1
+        RTS
+
+; =============================================================================
+; E2_DPEEK ? DPEEK(addr): read a 16-bit value from memory address (lo,hi)
+;   In:  T0 = address (consumed centrally by EXPR2_t1 dispatcher)
+;   Clobbers: A X Y T0
+; =============================================================================
+E2_dpeek:
+        LDY #1
+        LDA (T0),Y            ; hi byte at addr+1
+        TAX
+        LDA (T0)              ; lo byte at addr
+        STA T0
+        STX T0+1
         RTS
 
 ; =============================================================================
@@ -3428,8 +3181,7 @@ E2_abs_pos:
 ;   In:  T0 = n (consumed centrally by EXPR2_t1 dispatcher)
 ;   Clobbers: A T0
 ; =============================================================================
-E2_abs: LDA T0+1
-        BPL E2_abs_pos
+E2_abs: BBR #7,T0+1,E2_abs_pos
 N16TRAMP:
         JMP NEG16            ; tail call: negate if negative
 
@@ -3490,25 +3242,23 @@ CK_IT:  STX CIDX
         STA CX_SAV+1
 
         ; 1) CX = CX -/+ (CY >> i)
-        LDX #CY-T0
+        LDX #(CY-T0)
         JSR TO_T0
         LDX CIDX
         JSR ASR16
-        LDA CZ+1
-        BMI CK_P1            ; CZ<0: want ADD, skip negate
+        BBS #7,CZ+1,CK_P1    ; CZ<0: want ADD, skip negate
         JSR NEG16            ; CZ>=0: want SUB, negate T0 then add
-CK_P1:  LDX #CX-T0
+CK_P1:  LDX #(CX-T0)
         JSR ADDT0_TO
 
         ; 2) CY = CY +/- (CX_SAV >> i)
-        LDX #CX_SAV-T0
+        LDX #(CX_SAV-T0)
         JSR TO_T0
         LDX CIDX
         JSR ASR16
-        LDA CZ+1
-        BPL CK_P2            ; CZ>=0: want ADD, skip negate
+        BBR #7,CZ+1,CK_P2    ; CZ>=0: want ADD, skip negate
         JSR NEG16            ; CZ<0: want SUB, negate T0 then add
-CK_P2:  LDX #CY-T0
+CK_P2:  LDX #(CY-T0)
         JSR ADDT0_TO
 
         ; 3) CZ = CZ -/+ ATAN_TBL[i]
@@ -3520,10 +3270,9 @@ CK_P2:  LDX #CY-T0
         STA T0
         LDA ATAN_TBL+1,x
         STA T0+1
-        LDA CZ+1
-        BMI CK_P3            ; CZ<0: want ADD, skip negate
+        BBS #7,CZ+1,CK_P3    ; CZ<0: want ADD, skip negate
         JSR NEG16            ; CZ>=0: want SUB, negate T0 then add
-CK_P3:  LDX #CZ-T0
+CK_P3:  LDX #(CZ-T0)
         JSR ADDT0_TO
 
         LDX CIDX
@@ -3580,7 +3329,7 @@ SC_ABS: LDA T0               ; angle -> T1 (dividend for DIV_KERN)
         AND #3               ; Y = Q mod 4  (quadrant)
         TAY
 
-        LDX #T2-T0
+        LDX #(T2-T0)
         JSR TO_T0            ; T0 = R (0..89)
 
         TYA
@@ -3608,7 +3357,7 @@ SC_FLAGS:
         LDX #8
 SC_ML:  LSR T2              ; bit -> C
         BCC SC_MN
-        LDX #CZ-T0
+        LDX #(CZ-T0)
         JSR ADDT0_TO
 SC_MN:  ASL T0
         ROL T0+1
@@ -3633,10 +3382,10 @@ SC_NCX: LSR T1              ; bit1 -> C: negate CY?
         JSR NEG_X
 SC_NCY:
         ; Result select: ATEMP=0->SIN(CY), ATEMP=$80->COS(CX)
-        LDX #CY-T0        ; default: SIN
+        LDX #(CY-T0)        ; default: SIN
         LDA ATEMP
         BEQ SC_SEL
-        LDX #CX-T0        ; switch to COS
+        LDX #(CX-T0)        ; switch to COS
 SC_SEL: JSR TO_T0
 SC_SCALE:
         ; Absolute value (preserve sign on stack to avoid clobbering ATEMP)
@@ -3655,14 +3404,14 @@ SC_SDO: ; >>4 (logical; val positive here)
         LDX #8
 SC_SML: LSR T1
         BCC SC_SMN
-        LDX #T2-T0
+        LDX #(T2-T0)
         JSR ADDT0_TO
 SC_SMN: ASL T0
         ROL T0+1
         DEX
         BNE SC_SML
         ; >>6: T0 = T2>>6
-        LDX #T2-T0
+        LDX #(T2-T0)
         JSR TO_T0
         LDX #6
         JSR SHIFT_R16_T0
@@ -3722,8 +3471,7 @@ E2_acos:
         STA AMODE
 EA_body:
         ; Extract sign, reduce T0 to |v|
-        LDA T0+1
-        BPL EA_nonneg
+        BBR #7,T0+1,EA_nonneg
         LDA #$80
         TSB AMODE           ; 65C02 TSB: sets bit 7 if input was negative
         JSR NEG16           ; T0 = |v|
@@ -3996,9 +3744,7 @@ DO_let_pop:
 ;   Negative values: prints '-' then negates T0 before proceeding.
 ; =============================================================================
 PRT16:
-         ; BBR7 T0+1, PRT16GO  -- branch if bit 7 of T0+1 is clear (positive)
-         ; Kowalski does not assemble BBR natively, so encoded as raw bytes:
-         .DB $7F, T0+1, PRT16GO-*-1
+         BBR #7,T0+1,PRT16GO  ; positive: skip sign handling
          LDA #'-'
          JSR PUTCH
          JSR NEG16
@@ -4234,13 +3980,14 @@ GETCH:  JSR RND_SHUFFLE
 ;   Clobbers: A X  (stack is being deliberately abandoned when running)
 ; =============================================================================
 IRQ_HANDLER:
-        LDA RUN              ; running?
-        BEQ IRQ_idle         ; no: ignore
+        BBR #0,RUN,IRQ_idle  ; running? (RUN is 0/nonzero only, bit0 tracks it exactly)
         CLD
         STZ GRET             ; clear GOSUB nesting depth
         STZ FSTK             ; clear FOR nesting depth
-        LDX RUNSP            ; restore stack pointer (unwinds all call frames)
-        TXS
+        ; SP restore removed: MAIN unconditionally resets S on every entry now,
+        ; so the stack debris left by this abandoned call chain is reclaimed
+        ; there instead. RUN_LINE's own RUNSP restore (GOTO/GOSUB/NEXT) is a
+        ; different mechanism -- still needed, untouched.
         LDA #<STR_BREAK
         JSR PUTSTR           ; "\r\nBREAK" (no trailing CRLF -- shared exit provides it)
         JMP DO_break_in      ; -> print " IN line\r\n", re-enable IRQs, back to MAIN
@@ -4259,4 +4006,5 @@ ROMEND = *                   ; first byte after executable ROM code
 ; =============================================================================
 ; Vector page notes:
         .ORG $FFFC
+        .DW INIT             ; RESET vector
         .DW INIT             ; RESET vector
