@@ -28,7 +28,7 @@ KOWALSKI   = 1
 ;
 ; Expressions:
 ;   + - * / %   = < > <= >= <>   unary -
-;   ABS(val)   FREE   PEEK(addr)   RND   USR(addr)   A-Z variables
+;   ABS(val)   FREE   PEEK(addr)   DPEEK(addr)   RND   USR(addr)   A-Z variables
 ;   XOR(a,b)   AND(a,b)   OR(a,b)  NOT(a)
 ;
 ; Numbers : signed 16-bit  (-32768 .. 32767)
@@ -95,43 +95,15 @@ KOWALSKI   = 1
 ;   No tokenisation; body bytes are stored exactly as typed.
 ;
 ; ---- version lineage --------------------------------------------------------
-;   V1.15 (Sep 2026)  Free ROM before vectors: Bitbang 39bytes, Kowalski 80bytes
-;                     Ported several size-golf techniques from the pBASIC65c02
-;                     side project, adapted for NMOS (no BRA/STZ/PHX/index-free
-;                     indirect); every change here re-tested against baseline
-;                     with asm65c02/sim65c02 (EDITLN insert/replace/delete/
-;                     range-LIST, nested GOSUB/RETURN, BREAK-via-IRQ mid-run,
-;                     a real GOTO-driven loop, and deep-recursion div-by-zero
-;                     all match baseline output byte-for-byte):
-;                      - RUNSP removed entirely (RUNLP snapshot, IRQ_HANDLER
-;                        restore, and the ZP byte itself all gone). GO_DO and
-;                        DO_RETURN now unwind with a fixed PLA/PLA instead of
-;                        LDX RUNSP/TXS: STMT is always exactly one JSR deep
-;                        regardless of caller (RUNGO or MAIN_DIR) or GOSUB
-;                        nesting level, so a fixed 2-byte discard is exact,
-;                        not an approximation. Incidentally fixes cold
-;                        GOTO/GOSUB (typed before any RUN has ever executed):
-;                        the old RUNSP was stale-zero at that point and
-;                        wrapped the hardware stack into PROG on the very
-;                        next JSR; the fixed discard has no cached state to
-;                        go stale. GOTO/GOSUB issued directly at the
-;                        immediate prompt is a separate, already-known
-;                        limitation (see below), unchanged by this.
-;                      - PE_CMP now leaves Y=1 as a free side effect (its
-;                        three callers -- GOTOL, EDITLN, DO_LIST -- all
-;                        needed Y=1 right after anyway), and GOTOL/EDITLN
-;                        share a new CMP_PLP_X for the *(LP)-vs-ZP-pair
-;                        compare instead of each hand-rolling it.
-;                      - BUMP_LP now fetches *LP before advancing (like
-;                        GETCI), so LSKIP and DO_LIST's LS_BODY stop
-;                        manually re-fetching before calling it.
-;                      - STORE_VAR and the twice-inlined T0->CURLN copy
-;                        (EDITLN, GOTOL) merged into one shared tail via a
-;                        BIT-trick fallthrough, parameterized by X the same
-;                        way CMP_PLP_X is.
-;                      - MAIN's blank-line CR check removed: STMT's own
-;                        leading WPEEK/CMP/BCC guard already no-ops on a
-;                        blank line, so the dedicated check was redundant.
+;   V1.15 (Sep 2026)  Free ROM before vectors: Bitbang 22bytes, Kowalski 63bytes
+;                     Code Golf: 
+;                     RUNSP removed entirely, GO_DO and DO_RETURN unwind with
+;                     PLA/PLA.
+;                     PE_CMP leaves Y=1 as a free side effect
+;                     BUMP_LP now fetches *LP before advancing
+;                     T0->CURLN merged into one shared tail via a BIT-trick
+;                     MAIN's blank-line CR check removed as STMT's handles it
+;                     DPEEK(addr) added: 16-bit PEEK.
 ;   V1.14 (Aug 2026)  Free ROM before vectors: Bitbang 10bytes, Kowalski 51bytes
 ;                     Removed Uppercase checks to reduce assembly size.
 ;                     Line-handling golf pass on DELINE/EDITLN/INSLINE.
@@ -456,6 +428,8 @@ KW_POKE:  .DB "PO"
 FUNC_TAB: ; -- function section --
 KW_PEEK:  .DB "P",$C5           ; "PE" bit7 set on 'E' -- 1-arg
           .DW DO_PEEK-1
+KW_DPEEK: .DB "D",$D0           ; "DP" bit7 set on 'P' -- 1-arg
+          .DW DO_DPEEK-1
 KW_USR:   .DB "U",$D3           ; "US" bit7 set on 'S' -- 1-arg
           .DW DO_USR-1
 KW_ABS:   .DB "A",$C2           ; "AB" bit7 set on 'B' -- 1-arg
@@ -1688,16 +1662,38 @@ DO_ERR_NL:
          JSR PRNL             ; CR+LF after error message
          JMP MAIN
          
-; --- DO_PEEK/DO_USR/DO_RND/DO_FREE/DO_ABS -- UNI_TAB function-section
-;     handlers. Paren-eating for the 1-arg ones (PEEK/USR/ABS) is done by
-;     MATCH_DISPATCH's EAT_PAREN before entry -- T0 already holds the
-;     parsed argument on entry, and the handler does NOT re-consume it.
+; --- DO_PEEK/DO_DPEEK/DO_USR/DO_RND/DO_FREE/DO_ABS -- UNI_TAB function-
+;     section handlers. Paren-eating for the 1-arg ones (PEEK/DPEEK/USR/ABS)
+;     is done by MATCH_DISPATCH's EAT_PAREN before entry -- T0 already holds
+;     the parsed argument on entry, and the handler does NOT re-consume it.
 ;     DO_RND falls through into RND_SHUFFLE (also JSR'd directly by GETCH);
 ;     DO_FREE is also JSR'd directly by INIT.
 DO_PEEK: LDY #0                  ; T0 = *T0 (byte at address in T0)
          LDA (T0),Y
          STA T0
          STY T0+1                ; clear high byte
+         RTS
+
+; =============================================================================
+; DO_DPEEK  --  DPEEK(addr)  :  read a 16-bit value from memory
+;
+;   In:  T0 = address (parsed by MATCH_DISPATCH's EAT_PAREN, same 1-arg
+;        convention as DO_PEEK above -- T0 already holds the argument)
+;   Out: T0 = 16-bit value at [addr] (lo byte), [addr+1] (hi byte)
+;   Clobbers: A X Y
+;
+;   NMOS has no index-free (zp) mode, so unlike a 65C02 version this can't
+;   read the lo byte with a bare LDA (T0) -- do the hi byte first into X
+;   while Y=1, then DEY for the lo byte, matching GETCI/BUMP_LP's existing
+;   "hi read, then lo" convention elsewhere in this file.
+; =============================================================================
+DO_DPEEK: LDY #1
+         LDA (T0),Y              ; hi byte
+         TAX
+         DEY
+         LDA (T0),Y              ; lo byte
+         STA T0
+         STX T0+1
          RTS
 
 DO_USR:  JMP (T0)                ; jump to address in T0; fingers crossed
