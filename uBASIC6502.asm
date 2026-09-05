@@ -23,7 +23,7 @@ KOWALSKI   = 1
 ;   $0180-$03FF  BASIC program store (RAM_TOP=$0400)
 ;
 ; Statements accepted (full or 2-letter prefix):
-;   END  GOSUB  GOTO  IF..THEN  INPUT  LET  POKE  PRINT  REM  RETURN    
+;   END  GOSUB  GOTO  IF..THEN  INPUT  LET  DPOKE  POKE  PRINT  REM  RETURN    
 ;   LIST [n,m]  NEW  RUN
 ;
 ; Expressions:
@@ -96,14 +96,12 @@ KOWALSKI   = 1
 ;
 ; ---- version lineage --------------------------------------------------------
 ;   V1.15 (Sep 2026)  Free ROM before vectors: Bitbang 22bytes, Kowalski 63bytes
-;                     Code Golf: 
-;                     RUNSP removed entirely, GO_DO and DO_RETURN unwind with
-;                     PLA/PLA.
-;                     PE_CMP leaves Y=1 as a free side effect
+;                     Code Golf: PE_CMP leaves Y=1 as a free side effect
+;                     RUNSP removed, GO_DO and DO_RETURN unwind with PLA/PLA.
 ;                     BUMP_LP now fetches *LP before advancing
 ;                     T0->CURLN merged into one shared tail via a BIT-trick
 ;                     MAIN's blank-line CR check removed as STMT's handles it
-;                     DPEEK(addr) added: 16-bit PEEK.
+;                     DPEEK(addr)/`DPOKE addr, val` added: 16-bit PEEK/POKE.
 ;   V1.14 (Aug 2026)  Free ROM before vectors: Bitbang 10bytes, Kowalski 51bytes
 ;                     Removed Uppercase checks to reduce assembly size.
 ;                     Line-handling golf pass on DELINE/EDITLN/INSLINE.
@@ -422,6 +420,8 @@ KW_LET:   .DB "LE"
           .DW DO_LET-1
 KW_POKE:  .DB "PO"
           .DW DO_POKE-1
+KW_DPOKE:  .DB "DP"
+          .DW DO_DPOKE-1
           .DB $FF               ; sentinel: no-match -> DO_LET
           .DW DO_LET-1
 
@@ -2129,6 +2129,21 @@ WPEEK:   LDY #0
          JSR GETCI            ; consume space and loop
          BNE WSKIP            ; always taken (' ' = $20, nonzero)
 RTS_1:   RTS
+
+; =============================================================================
+; DO_DPOKE ? DPOKE addr, value: write a 16-bit value to memory (lo,hi) -- sister
+;   of E2_dpeek/DPEEK(addr).
+;   Clobbers: A Y T0 T1
+; =============================================================================
+DO_DPOKE:
+        JSR GET_TWO_ARGS      ; T4 = addr, T0 = value
+        LDY #0
+        LDA T0
+        STA (T4),Y             ; lo byte at addr
+        INY
+        LDA T0+1
+        STA (T4),Y            ; hi byte at addr+1
+        RTS
 
 ; =============================================================================
 ; PRT_HEX / PRT16 - Unified Variable-Width Printer
