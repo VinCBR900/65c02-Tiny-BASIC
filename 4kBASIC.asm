@@ -21,6 +21,7 @@
 ;   INPUT var          read from keyboard
 ;   LET var = expr     explicit assignment (LET keyword optional)
 ;   POKE addr, val     write byte to memory
+;   DPOKE addr, val    write word (16-bit) to memory  (sister of DPEEK)
 ;   READ var [, var ...]   read next value from DATA sequence
 ;   DATA val [, val ...]   literal values in program (consumed by READ)
 ;   RESTORE            reset DATA pointer to start of program
@@ -104,12 +105,13 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ;
-; v15.29 (Sep 2026) - 52 bytes free (confirmed by build) - Golf Pass
+; v15.29 (Sep 2026) - 34 bytes free (confirmed by build) - Golf Pass
 ;   - BBR instruction deployed
 ;   - Showcase: added lines 66-68 (SHR, HEX$, and all remaining relational
 ;     operators <, <=, >=, <> -- only = and > had coverage before).
 ;   - Showcase: added line 65 (SGN, SHL demo). 
 ;   Added DPEEK(addr) 16 bit peek
+;   Added DPOKE addr,val 16 bit poke 
 ;   Header brought current: Tier 4 lists SHL/SHR; Tier 5 atoms drop ASC,
 ;   add SGN; 
 
@@ -361,7 +363,7 @@ TOK_FOR     = $8B            ; FOR var = start TO end [STEP n]
 TOK_NEXT    = $8C            ; NEXT [var]
 TOK_FREE    = $8D            ; FREE  (print free bytes)
 TOK_POKE    = $8E            ; POKE addr, val
-TOK_CLS     = $8F            ; CLS  
+TOK_DPOKE   = $8F            ; DPOKE addr, val  16-bit write (sister of DPEEK)
 TOK_HELP    = $90            ; HELP  
 ; TOK_ON ($91) removed v15.0 -- slot is now a KW_TABLE placeholder
 TOK_DATA    = $92            ; DATA val, val, ...  
@@ -621,8 +623,9 @@ STR_BREAK:  .DB $0D,$0A,"BREA",$CB  ; 'K'|$80 = $CB
 ; Order MUST match token values: entry[0] = TOK_PRINT ($80), entry[1] = TOK_IF ($81) ...
 KW_TABLE:
 ; ---- statement tokens $80..$95 (must appear first in this order) ------------
-; NOTE: $8F (CLS) and $90 (HELP) removed. Placeholder $80 bytes keep TKTOK
+; NOTE: $90 (HELP) and $91 (ON) removed. Placeholder $80 bytes keep TKTOK
 ; in sync. STMT_JT entries for those slots point to DO_DATA (RTS stub).
+; $8F (former CLS slot) reused for DPOKE (v15.29).
         .DB "PRIN",$D4        ; $80 TOK_PRINT   ('T'|$80=$D4)
         .DB "I",$C6           ; $81 TOK_IF      ('F'|$80=$C6)
         .DB "GOT",$CF         ; $82 TOK_GOTO    ('O'|$80=$CF)
@@ -638,7 +641,7 @@ KW_TABLE:
         .DB "NEX",$D4         ; $8C TOK_NEXT    ('T'|$80=$D4)
         .DB "FRE",$C5         ; $8D TOK_FREE    ('E'|$80=$C5)
         .DB "POK",$C5         ; $8E TOK_POKE    ('E'|$80=$C5)
-        .DB $80               ; $8F placeholder (CLS removed, STMT_JT -> RTS stub)
+        .DB "DPOK",$C5        ; $8F TOK_DPOKE   ('E'|$80=$C5)
         .DB $80               ; $90 placeholder (HELP removed, STMT_JT -> RTS stub)
         .DB $80               ; $91 placeholder (ON removed, STMT_JT -> RTS stub)
         .DB "DAT",$C1         ; $92 TOK_DATA    ('A'|$80=$C1)  was $A1
@@ -688,7 +691,7 @@ STMT_JT:
         .DW DO_PRINT,   DO_IF,      DO_GOTO,    DO_GOSUB,  DO_RETURN  ; $80-$84
         .DW DO_RUN,     DO_LIST,    DO_NEW,     DO_INPUT,  DO_REM     ; $85-$89
         .DW DO_END,     DO_FOR,     DO_NEXT,    DO_FREE,   DO_POKE    ; $8A-$8E
-        .DW DO_DATA,    DO_DATA,    DO_DATA,    DO_DATA,   DO_READ    ; $8F(nop),$90(nop),$91(nop),$92-$93
+        .DW DO_DPOKE,   DO_DATA,    DO_DATA,    DO_DATA,   DO_READ    ; $8F(DPOKE),$90(nop),$91(nop),$92-$93
         .DW DO_RESTORE, DO_ELSE_SK                                     ; $94-$95
 ;   v15.20: DATA is now tokenized normally (no more raw-copy special case);
 ;   at runtime we still just return -- RUNLP's own SKIPEOL call advances
@@ -2163,8 +2166,8 @@ DN_end: DEC FSTK
         RTS
 
 ; =============================================================================
-; GET_TWO_ARGS ? parse two comma-separated expressions; shared by DO_POKE
-; and DO_LIST
+; GET_TWO_ARGS ? parse two comma-separated expressions; shared by DO_POKE,
+; DO_DPOKE, and DO_LIST
 ;   Syntax: <expr> , <expr>
 ;   In:  IP -> first expression
 ;   Out: T1 = first argument (16-bit); T0 = second argument (16-bit)
@@ -2195,6 +2198,20 @@ DO_POKE:
         JSR GET_TWO_ARGS      ; T1 = addr, T0 = value
         LDA T0
         STA (T1)            ; POKE the value
+        RTS
+
+; =============================================================================
+; DO_DPOKE ? DPOKE addr, value: write a 16-bit value to memory (lo,hi) -- sister
+;   of E2_dpeek/DPEEK(addr).
+;   Clobbers: A Y T0 T1
+; =============================================================================
+DO_DPOKE:
+        JSR GET_TWO_ARGS      ; T1 = addr, T0 = value
+        LDA T0
+        STA (T1)             ; lo byte at addr
+        LDY #1
+        LDA T0+1
+        STA (T1),Y            ; hi byte at addr+1
         RTS
 
 ; =============================================================================
