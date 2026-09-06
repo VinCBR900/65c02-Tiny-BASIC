@@ -14,9 +14,9 @@ Here we have several Tiny BASIC for 6502/65c02
   * **4kBASIC - FAST** - Targeted at 65c02, this is a Tokenized, Extended 16bit signed in Tiny BASIC with `FOR`/`NEXT`, CORDIC `SIN`/`COS` degree functions and Bitwise operators.  Fits in a 4kbyte EPROM.
   * **mini-BASIC - TRIG** - Targeted at 65c02, 4 byte floating point with radian based TRIG: `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`, and Transcendental `LN`/`EXP`, that also fits in a 4kbyte EPROM.   
 
-You can see the development progression - first came uBASIC, then extended 4k BASIC with some trig support, then mini-BASIC with 4byte floats, full trig, and transcendental.
+You can see the development progression - first came uBASIC, then extended 4k BASIC with some trig support, then mini-BASIC with 4byte floats, full trig, and transcendental; the came pBASIC as a stress test to see if it could be done.
 
-You can play with these online at the link below - all three versions include a showcase BASIC demo - type `RUN` to execute, and `LIST` to view.   
+You can play with these online at the link below - all versions include a showcase BASIC demo - type `RUN` to execute, and `LIST` to view.   
 https://vincbr900.github.io/65c02-Tiny-BASIC/
 
 > If you've found these Tiny BASIC interpreters useful for learning, retrocomputing, or your own projects, you can buy me a coffee.  Donations are entirely optional but greatly appreciated.
@@ -39,10 +39,11 @@ A tiny but mostly complete integer Tiny BASIC. No tokeniser - BASIC program line
   * Functions: **None**  
 
 **Notes**
-- Uses **2 character testing where only 1st letter is matched** - e.g. `PRINT`, `PR`, `PX` all executes `DO_PRINT`.  So spaces are important e.g. `PRINT A;"=Test"` prints "5=Test" if A is 5, whereas `PRINTA;"=Test"` prints `=Test`.
+- Uses **2 character testing but only 1st letter is matched** - e.g. `PRINT`, `PR`, `PX` all executes `DO_PRINT`.  So spaces are important e.g. `PRINT A;"=Test"` prints "5=Test" if A is 5, whereas `PRINTA;"=Test"` prints `=Test`. 1 letter matches woudl collide with Var recognition.
 - **Expressions supported in GOTO** - `GOTO`, `GOTO X`, `GOTO 10*I` all work.  
 - **Left to Right Operator Precidence** — up to you to use Parenthesis to get the right order
-- **BASIC Line Handling** - to save space in-place insertion/deletion not supported.  This means you can only change the last line - either update or delete.  So if you enter 10 lines and notice an error on line 2, you must delete lines 10, 9, 8, 7, 6, 5, 4, 3 in sequence.  
+- **BASIC Line Handling** - to save space in-place insertion/deletion not supported.  This means you can only change the last line - either update or delete.  So if you enter 10 lines and notice an error on line 2, you must delete lines 10, 9, 8, 7, 6, 5, 4, 3 in sequence.
+- **WDC 65c02** - to save space, WDC opcoces used like `BBR`.  To port to NMOS 6502 would tak est 75 bytes, with only Banner and Relop inversion quick wins at ~40 bytes.  
 
 **Errors** printed as `!N`, no line number shown:
 
