@@ -1,5 +1,5 @@
 ; =============================================================================
-; PicoBASIC65c02 v1.7  --  Proof of Concept 1 KB Tiny BASIC for 65c02 
+; PicoBASIC65c02 v1.8  --  Proof of Concept 1 KB Tiny BASIC for 65c02 
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Note: Kowalski Memory Mapped IO for now.
@@ -89,13 +89,17 @@ KOWALSKI        = 1
 ; CHANGE HISTORY
 ; =============================================================================
 ;
+; v1.8 - 2 bytes free before vectors 
+;   - Changed BANG's arm from "DEC BANG" to "LDA #$FF / STA BANG" (+2 bytes).
+;   - Deleted Redundant CMP in STMT:
+;
 ; v1.7 - 0 bytes free before vectors - Golf Pass 
 ;   - Restored banner (Yay!)
-;   - Dropped the blank-line CR check; STMT already returns on CR via WPEEK/BCC
+;   - Dropped MAINs blank-line CR check; STMT alreayd returns on CR via WPEEK
 ;   - 65c02 instruction BBR7 on MUL_ENTRY and PRT16 sign checks
 ;   - Removed RUNSP stack-pointer in DO_GO/RL_GO - DO_GO now cleans up stack with 
 ;     PLA/PLA instead of snapshotting/restoring SP.
-;   - DO_LIST refactored to save 2 byets by reordering CRLF at start 
+;   - DO_LIST refactored to save 2 bytes by reordering CRLF at start 
 ;
 ; v1.6 - 6 bytes free before vectors
 ;   - SKIP_KW overun bug - loop consumed-then-checked each character
@@ -251,7 +255,11 @@ PE:         .RS 2              ; 16-bit: program end (one past last byte)
         .ENDIF
 LP:         .RS 2              ; 16-bit: line pointer / multi-purpose scratch
 RUN:        .RS 1              ; 8-bit:  run flag ($00 = immediate, $FF = running)
-BANG:       .RS 1              ; 8-bit: relop invert flag ($00/$FF) -- see EXPR_LOOP/REL_T.
+BANG:       .RS 1              ; 8-bit: relop invert flag ($00/$FF) -- see OP_SCAN/REL_T.
+                               ; v1.8: cleared ONLY by CLR_BANG (relop consumed)
+                               ; or MAIN's top-of-loop reset -- never on a plain
+                               ; EXPR_LOOP exhaustion (EL_RTS), so a parenthesized
+                               ; right operand can't wipe an outer armed '!'.
 VARS:       .RS 52             ; 52-byte variable store (A-Z, 2 bytes each)
 IBUF:       .RS 41             ; Nominal Input line buffer but unbounded 
 
@@ -270,12 +278,17 @@ ZPEND:		               ; End of zero page audit
 ;          LSKIP, PE_CMP_LP; each call fully consumes LP before any
 ;          nested call that might also use it
 ;   BANG : relop invert flag ($00/$FF) -- set by a leading '!' before a
-;          relop, consumed and cleared at REL_T/REL_F (covers chaining,
-;          e.g. "3!<2!<1") and at EL_RTS (every expression's normal end,
-;          which also covers a trailing '!' with nothing after it). Also
-;          cleared once at the top of MAIN as a backstop. The only gap is
-;          a '!' stolen by an arithmetic op leaking into a later relop
-;          within the SAME expression -- see KNOWN LIMITATIONS.
+;          relop, consumed and cleared ONLY at REL_T/REL_F's CLR_BANG
+;          (covers chaining, e.g. "3!<2!<1") or once at the top of MAIN as
+;          a backstop. v1.8: EL_RTS (EXPR_LOOP's plain exhaustion exit) no
+;          longer clears it -- it used to, which broke "A!=(B+C)" (see
+;          CHANGE HISTORY) since parens recurse through this same exit at
+;          every nesting level. Two gaps remain (both architectural,
+;          shared with pBASIC2650): a trailing '!' with nothing relop-
+;          shaped after it stays armed until MAIN's next reset, not
+;          guarded against; and an arithmetic op can still steal a '!'
+;          meant for a later relop in the same expression -- see KNOWN
+;          LIMITATIONS.
 ; -------------------------------------------------------------------------
 
         .IF KOWALSKI
@@ -355,7 +368,7 @@ SHOWCASE_END:	.DW 0
 ; =============================================================================
 ; ROM START  
          .ORG ORIGIN
-BANNER: .DB "pBASIC1.7",0                ; Signon 
+BANNER: .DB "pBASIC1.8",0                ; Signon 
 
 ; =============================================================================
 ; TOK_CHARS / TOK_VECS -- combined match-char + dispatch-vector tables.
@@ -537,8 +550,9 @@ EL_UPD:  TYA                   ; A = payload length (excluding CR)
          LDA LP+1
          ADC #0
          STA PE+1
-EL_RTS:  STZ BANG              ; Expression Loop out of tokens (harmless
-         RTS                   ; here too, on EDITLN's line-store fallthrough)
+EL_RTS:  RTS                   ; Expression Loop out of tokens / EDITLN's line-
+                               ; store fallthrough. v1.8: no longer clears BANG
+                               ; here -- see BANG lifetime note below.
 
 ; =============================================================================
 ; EXPR  --  strictly left-to-right expression evaluator (no operator
@@ -639,7 +653,8 @@ OP_SCAN: CMP TOK_CHARS,X      ; 3 bytes
          BPL OP_SCAN          ; 2 bytes (Falls through here when X drops to $FF)
          CMP #'!'             ; not an operator char -- check for relop invert
          BNE EL_RTS           ; not relop invert
-         DEC BANG             ; INVERT - set BANG to $FF  
+         LDA #$FF             ; INVERT - set BANG to $FF (v1.8: absolute store,
+         STA BANG             ; not DEC -- idempotent under a repeated '!')
          JSR BUMP_IP          ; consume `!`
          BRA EXPR_LOOP        ; loop
 
@@ -1054,7 +1069,6 @@ DO_IF:
 ; =============================================================================
 STMT:
          JSR WPEEK
-         CMP #' '             ; anything below space (CR, NUL) means empty line
          BCC STMT_RTS         ; return via nearest preceding RTS
         ; drop through
 ; =============================================================================
