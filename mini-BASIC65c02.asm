@@ -1,5 +1,5 @@
 ; =============================================================================
-; miniBASIC 65C02 v3.6
+; miniBASIC 65C02 v3.7
 ; Copyright (c) 2026 Vincent Crabtree, MIT License
 ;
 ; 4KB Float BASIC (MBF4) for the 65C02.
@@ -83,6 +83,21 @@
 
 ; =============================================================================
 ; CHANGE HISTORY
+;
+; v3.7 (2026-10) - 33 bytes free
+;   - FIXED: FLT_ADD/FLT_SUB effective subtraction (exponent diff 1..24):
+;     B's bits shifted out into FLT_DB were ADDED to the result by
+;     NORM_PACK instead of subtracted.  Now FLT_DB := 0 - FLT_DB before the
+;     mantissa subtract, and SUB_A_B no longer sets carry itself, so the
+;     guard borrow propagates into the 24-bit subtraction (+6 bytes).
+;     e.g. 1.0 - 0.99999994 now 69000000 (was 6A400000).
+;   - FIXED: FLT_DIV dropped the dividend's low bit when the dividend
+;     mantissa >= divisor mantissa (pre-shift right by 1).  The first
+;     quotient step is now done unshifted via FDFORCE, then 31 more
+;     iterations (-4 bytes).  e.g. 0.1/1.0 now 7D4CCCCD.
+;   - Verified with golden vectors (mbf4_vectors_rn_away.csv, 6,531 add/
+;     sub/mul/div rows): 6,527 exact, 4 at 1 ULP (add/sub with exponent
+;     difference > 8, bits beyond the 8-bit guard); was 5,923 exact.
 ;
 ; v3.6 (2026-07) - 35 bytes free
 ;   - FIXED: RMB7/SMB7 (native bit-suffixed spelling) -> RMB#7,/SMB#7,
@@ -571,7 +586,7 @@ SHOWCASE_END: ; audit
 
          .ORG $F000
 STR_PAGE = >STR_BANNER
-STR_BANNER: .DB "miniBASIC 65C02 v3.6"
+STR_BANNER: .DB "miniBASIC 65C02 v3.7"
 STR_CRLF:   .DB $0D,$8A
 STR_IN:     .DB " IN",$A0
 STR_BREAK:  .DB $0D,$0A,"BREA",$CB
@@ -2481,11 +2496,11 @@ ADDLP:   LDA FLT_A+1,X
          RTS
 
 ; SUB_A_B -- 24-bit subtraction: FLT_A = FLT_A - FLT_B
-;   In:  FLT_A, FLT_B
+;   In:  FLT_A, FLT_B; carry = borrow-in from the caller (set = no borrow;
+;        FLT_ADD sets it via the guard-byte negate just before the call)
 ;   Out: FLT_A = FLT_A - FLT_B; carry clear = borrow occurred
 ;   Clobbers: A, X
-SUB_A_B: SEC
-         LDX #2
+SUB_A_B: LDX #2
 SUBLP:   LDA FLT_A+1,X
          SBC FLT_B+1,X
          STA FLT_A+1,X
@@ -2681,6 +2696,10 @@ FABT:    LSR FLT_B+1             ; shift B right
 FAOP:    LDA FLT_SA
          CMP FLT_SB
          BEQ FASM
+         SEC                    ; effective subtraction: B's shifted-out bits must be
+         LDA #0                 ; SUBTRACTED too: guard := 0 - guard, borrow carried
+         SBC FLT_DB             ; into the mantissa subtraction (SUB_A_B sets no carry)
+         STA FLT_DB
          JSR SUB_A_B            ; 24-bit subtraction
          BCS FANM
          SEC                    ; borrow occurred: negate result
@@ -3073,10 +3092,13 @@ DIV_BY_TEN:
          JSR FLT_TEN_B
         ; drop through
 
-; FLT_DIV: FLT_A = FLT_A / FLT_B  (32-iter shift-subtract)
+; FLT_DIV: FLT_A = FLT_A / FLT_B  (32-bit quotient, shift-subtract)
 ; =============================================================================
-; FLT_DIV  --  FLT_A = FLT_A / FLT_B  (32-iteration restoring division)
+; FLT_DIV  --  FLT_A = FLT_A / FLT_B  (32-bit-quotient restoring division)
 ;
+;   If dividend mantissa >= divisor mantissa the first quotient bit is taken
+;   unshifted (FDPS -> FDFORCE, ER+1) and 31 iterations follow; otherwise 32.
+;   No dividend bit is discarded.
 ;   In:  FLT_A = dividend, FLT_B = divisor
 ;   Out: FLT_A = quotient.  ?2 (division by zero) if FLT_B is 0.0
 ;   Clobbers: A, X, Y, FLT_B, FLT_DVH, FLT_DVM, FLT_DVL, FLT_SA, FLT_ER, FLT_DB
@@ -3102,26 +3124,24 @@ FD_CPY:  LDA FLT_B+1,X         ;              FLT_A+1..+3 -> T0/T0+1/T1
          STA T0,X
          DEX
          BPL FD_CPY
-         LDA T0
-         CMP FLT_DVH
-         BCC FDPD
-         BNE FDPS
-         LDA T0+1
-         CMP FLT_DVM
-         BCC FDPD
-         BNE FDPS
-         LDA T1
-         CMP FLT_DVL
-         BCC FDPD
-FDPS:    LSR T0
-         ROR T0+1
-         ROR T1
-         INC FLT_ER
-FDPD:    STZ FLT_A+1
+         STZ FLT_A+1
          STZ FLT_A+2
          STZ FLT_A+3
          STZ FLT_DB
          LDY #32
+         LDA T0
+         CMP FLT_DVH
+         BCC FDL
+         BNE FDPS
+         LDA T0+1
+         CMP FLT_DVM
+         BCC FDL
+         BNE FDPS
+         LDA T1
+         CMP FLT_DVL
+         BCC FDL
+FDPS:    INC FLT_ER
+         BRA FDFORCE         ; dividend >= divisor: first quotient step unshifted
 FDL:     JSR SHL_MANTISSA
          ASL T1
          ROL T0+1
