@@ -508,7 +508,6 @@ LS_DONE:
 ;   Out: T0 = result; IP advanced past expression
 ;   Clobbers: A X Y T0 T1 T2 T3 IP
 ; =============================================================================
-E1_OVFL:  JMP DO_ERR_OV
 
 ; --- Relational: Equality ---
 ; LDA T1/ CMP T0 already done
@@ -601,9 +600,6 @@ OP_SCAN: CMP TOK_CHARS,X      ; 3 bytes
 
 ; --- Multiplication & Division ---
 DIV_ENTRY:
-         LDA T0
-         ORA T0+1
-         BEQ E1_OVFL          ; T0 == 0 -> Division by zero error
          LDY #1                ; remember: divide (Y survives the shared
          .DB $2C               ; sign-prep below untouched -- checked)
 MUL_ENTRY:
@@ -639,7 +635,8 @@ DO_ADD_TAIL:
 
 ; Back to ALU ops
 DIV_LOOP:
-        JSR NEG_T0            ; T0 = -T0 (negated divisor)
+        JSR NEG_T0            ; T0 = -T0 (negated divisor); C=1 only if T0 was 0
+        BCS E1_OVFL           ; -> Division by zero error
 DV_LP:
          LDX #T1               ; Dest = T1 (running dividend)
          JSR ADD_T0_X
@@ -657,6 +654,7 @@ MD_DONE: LDX #T2-VARS        ; Copy T2 to T0
          BPL E1_POS
          JSR NEG_T0            ; Apply sign
 E1_POS:  BRA EXPR_LOOP         ; 
+E1_OVFL: JMP DO_ERR_OV
 
 E2_NEG:  JSR E2_POS           ; consume '-', evaluate atom
          ; drop through
@@ -937,8 +935,7 @@ DO_INPUT:
          JSR PARSE_VAR         ; skip spaces; peek var name uppercased
          PHA                  ; [S: var_offset]
          JSR GETLINE          ; Read user input; IP = IBUF
-         JSR EXPR             ; evaluate expression -> T0
-         BRA STORE_VAR         ; tail call: pop var_offset, store T0, RTS
+         BRA DL_EXPR           ; shared with DO_LET: EXPR -> T0, then STORE_VAR
 
 ; =============================================================================
 ; PARSE_VAR  --  parse a single-letter variable name at IP
@@ -984,7 +981,7 @@ DO_LET:
          CMP #'='
          BNE DO_ERR_UK           ; no '=': bad assignment
          JSR GETCI            ; consume '='
-         JSR EXPR             ; evaluate RHS -> T0
+DL_EXPR: JSR EXPR             ; evaluate RHS -> T0
          ; falls through into STORE_VAR 
 ; =============================================================================
 ; STORE_VAR  --  shared tail: pop var_offset pushed by caller, store T0 there
@@ -1039,13 +1036,9 @@ DO_RUN:
          LDX #0
          JSR PROG2X           ; PROG to IP
          SMB #0,RUN           ; set run flag (only bit0 is ever tested --
-RUNLP:   LDA IP                ; IP == PE? (natural end of program --
-         CMP PE                ; may not be a hard stop otherwise: a
-         BNE RL_GO             ; deleted/replaced last line leaves old,
-         LDA IP+1              ; well-formed data sitting past the new
-         CMP PE+1               ; PE, which would otherwise look like
-         ;
-         BEQ RUNEND             ; one more real line to execute)
+RUNLP:   LDX #IP               ; IP == PE? (natural end of program)
+         JSR PE_CMP_X
+         BEQ RUNEND
 RL_GO:   JSR GETCI            ; skip line-number lo
          JSR GETCI            ; skip line-number hi
 RUNGO:   JSR STMT               ; execute the statement on this line
@@ -1224,13 +1217,11 @@ GETLINE:
          JSR PRTSPACE        ; (3) Print trailing space
          ; Initialize IP to point at IBUF
          STZ IP+1            ; (2) >IBUF 0 as ZP
-         LDA #IBUF           ; (2)
-         STA IP              ; (2)
-         ; Clear char counter
-         LDX #0
+         LDX #IBUF           ; (2) X = absolute zp index (IBUF is in zero page)
+         STX IP              ; (2)
 GL_LOOP:
          JSR GETCH      ; (3) Wait for and get keystroke in A
-         STA IBUF,X     ; (2) Store raw character into buffer
+         STA 0,X        ; (2) Store raw character into buffer
          INX            ; (1) Advance index
          CMP #CR        ; (2) Was it a carriage return?
          BNE GL_LOOP    ; (2) If not, keep reading
@@ -1347,11 +1338,13 @@ PROG2X:  LDA #<PROG
 ;   Clobbers: A Y
 ; =============================================================================
 PE_CMP_LP:  
+         LDX #LP
          LDY #1                ; also satisfies the Y=1 that EDITLN/DO_LIST
-         LDA LP                ; need right after -- see call sites
+PE_CMP_X:                      ; need right after -- see call sites
+         LDA 0,X               ; (X) == PE ?  (X = zp offset of a pointer)
          CMP PE
          BNE PC_NE
-         LDA LP+1
+         LDA 1,X
          CMP PE+1
 PC_NE:   RTS
 
