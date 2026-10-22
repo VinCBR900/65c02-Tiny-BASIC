@@ -1,24 +1,20 @@
 ; =============================================================================
-; PicoBASIC6502 v2.0 -- Proof of Concept 1 KB Tiny BASIC for NMOS 6502
+; PicoBASIC6502 v2.1 -- Proof of Concept 1 KB Tiny BASIC for NMOS 6502
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
-; NMOS port of PicoBASIC65c02 v1.10: same language, same showcase output.
-; Assembled with .opt proc6502, so any 65C02-only opcode is a hard error.
-;
-;   CPU    : NMOS 6502 (no 65C02 opcodes but will also run on a 65C02)
+;   CPU    : NMOS 6502 (no 65C02 opcodes; also runs on a 65C02)
 ;   ROM    : 1 KB  $FC00-$FFFF - use 2kbyte for development, see ORIGIN label
 ;   RAM    : 1 KB  $0000-$03FF
 ;   I/O    : Kowalski emulation $E001 PUTCH, $E004 GETCH (memory mapped)
 ;   NMI/IRQ: Not used (all three vectors point at INIT)
 ;
 ; KOWALSKI build switch:
-;   1 = Kowalski simulator: execution starts at $0000 (a JMP INIT trampoline that
-;       T0/T1 then overwrite) and PE preloads the showcase program at PROG.
+;   1 = Kowalski simulator and PE preloads the showcase program at PROG.
 ;   0 = real hardware: Reset vector -> INIT, empty program store.
 KOWALSKI        = 1
 ;
 ; RAM layout for 1 KB target:
-;   $0000-$006B  zero-page in use (T0-T3/IP/PE/LP/RUN/VARS/IBUF, see ZPEND)
+;   $0000-$006A  zero-page in use (T0-T3/IP/PE/LP/VARS/IBUF, see ZPEND)
 ;   $0100-$017F  Hardware stack (page 1, mandatory)
 ;   $0180-$03FF  BASIC program store (RAM_TOP=$0400)
 ;
@@ -34,16 +30,16 @@ KOWALSKI        = 1
 ; Numbers   : signed 16-bit  (-32768 .. 32767)
 ; Print     : "literals", `;` - no string vars
 ;
-; NMOS CONVENTIONS -- the always-taken branches (BNE/BEQ/BCS/BMI used as BRA) and the
+; NMOS CONVENTIONS -- the always-taken branches (BNE/BEQ/BCS used as BRA) and the
 ; (zp),Y accesses depend on these.  Keep them true when editing:
 ;   - WPEEK, GETCI and BUMP_LP return with Y=0 (BUMP_IP leaves Y alone).  PNUM and
 ;     SKIP_KW rely on it; EL_CHK_CR's header store follows WPEEK with INY.
 ;     PE_CMP_LP and MATCH_DISPATCH set Y=1 for the hi-byte read, then DEY.
 ;   - PUTCH preserves flags (STA/RTS only).  LS_BODY, DP_STR, DO_ERROR and DO_INPUT
-;     branch on flags set before a PUTCH.  A polling UART PUTCH must save/restore
-;     the flags, or those four branches become JMPs (+4 bytes).
+;     (plus INIT's BNE in the Kowalski build) branch on flags set before a PUTCH.
+;     A polling UART PUTCH must save/restore the flags, or those four branches
+;     become JMPs (+4 bytes).
 ;   - GETCI and BUMP_IP return Z=0 (IP never points into page $FF).
-;   - ROM is at $8000 or above (DO_GO's BMI tests a return-address high byte).
 ;   - T0 is zero-page $00 (LDX #T0 gives Z=1, LDY #T0 gives Y=0); >PROG is non-zero.
 ;
 ; KNOWN LIMITATIONS
@@ -78,9 +74,8 @@ KOWALSKI        = 1
 ;
 ; To save space, LET, REM and THEN keywords are not used.
 ;
-; DO_GO - "GO 10" as FIRST/immediate command (no active RUN) fails since
-;   DO_GO discards caller's return address assuming RUNEND will eventually be
-;   reached via a RUN session's call.
+; GOTO at the prompt ("GO 10") runs the program from that line (there is no run
+;   flag; the run ends in MAIN).
 ;
 ; Arithmetic overflow wraps silently (e.g. 32767+1 = -32768) - no error is raised.
 ;
@@ -101,29 +96,39 @@ KOWALSKI        = 1
 ; CHANGE HISTORY
 ; =============================================================================
 ;
-; v2.0 - NMOS 6502 port of v1.10, 25 bytes free before vectors.
-;   - No 65C02 opcodes (.opt proc6502).  Output identical to v1.10
+; v2.1 - 37 bytes free before vectors - RUN flag removed
+;   - Deleted RUNFLG: INX/STX in DO_RUN, LDA/BEQ in RUNGO, LDA #0/STA in DO_END.
+;     END, NEW, errors land in MAIN, where stack reset abandons RUN loop.
+;   - INIT -> DO_NEW -> MAIN is a fall-through chain: banner first, then PE = PROG
+;   - DO_RUN laid out before INIT so BEQ RUNEND reaches MAIN; DO_GO moved beside
+;     error stubs and ends in JMP RL_GO (+1)
+;   - GOTO at the prompt now works: the run ends in MAIN instead of RTSing through the
+;     frame DO_GO discarded.  Removed from KNOWN LIMITATIONS.
+;
+; v2.0 - 29 bytes free before vectors - NMOS 6502 port of v1.10 (989 bytes, +33)
+;   - No 65C02 opcodes (.opt proc6502).  Output identical to v1.10 ,
 ;   - BRA (20): 15 are now always-taken 2-byte conditionals, each commented with the
-;     flag guarantee it relies on; 5 stay JMP (REL_T, E1_POS, MAIN, EL_EXIT, DO_WR).
+;     flag guarantee it relies on; 5 stay JMP (REL_T, E1_POS, MAIN, EL_EXIT, DO_WR) (+5).
 ;   - LDA/STA (zp) (8 sites) -> (zp),Y.  WPEEK/GETCI/BUMP_LP leave Y=0, so PNUM,
-;     SKIP_KW, CMP_PLP_X, MATCH_DISPATCH and EL_CHK_CR need at most a DEY/INY 
+;     SKIP_KW, CMP_PLP_X, MATCH_DISPATCH and EL_CHK_CR need at most a DEY/INY (+9).
 ;   - STZ (8) -> LDA #0/STA, or STY where Y=0 is guaranteed (PNUM) (+8).
-;   - BBR/SMB (5) -> BIT or LDA + BPL; RUN flag is INX/STX, tested with LDA 
-;   - PHX/PLX (3) -> TXA,PHA / PLA,TAX 
+;   - BBR/SMB (5) -> BIT or LDA + BPL; RUN flag is INX/STX, tested with LDA (+5).
+;   - PHX/PLX (3) -> TXA,PHA / PLA,TAX (+3).
 ;   - JMP (TOK_VECS,X) -> RTS dispatch: TOK_VECS split into TOK_LO/TOK_HI holding
 ;     handler-1.  LDA T1/CMP T0 now follow the pushes so their flags reach the
-;     handler; X is the unscaled index, so TXA/ASL/TAX is gone 
-;   - CLD added to INIT: NMOS reset leaves D undefined
-;   - File Header updates rewritten.
+;     handler; X is the unscaled index, so TXA/ASL/TAX is gone (+3).
+;   - CLD added to INIT: NMOS reset leaves D undefined (+1).
+;   - Header updates 
 ;
 ; v1.10 - 62 bytes free before vectors - Golf Pass, features cut
-;   - Relop '!' modifier removed, Showcase updated to -2<1 and 2*3=6.
-;   - Unary '+' removed from EXPR2 (-4); E2_POS now only serves unary '-'.
+;   - Relop invert '!' removed: BANG, OP_SCAN's '!' arm (OP_SCAN now exits on its
+;     own RTS; EL_RTS label gone), REL_T's EOR, both STZ BANGs 
+;   - Unary '+' removed from EXPR2 ; E2_POS now only serves unary '-'.
 ;   - DIV by zero detected from NEG_T0's carry (C=1 only if operand was 0):
-;     DIV_ENTRY zero test gone, BCS E1_OVFL in DIV_LOOP, E1_OVFL moved in range (-4).
-;   - PE_CMP_LP split: PE_CMP_X (X = ZP pointer offset) also used by RUNLP (-3).
-;   - GETLINE: X = absolute IBUF index, no LDA #IBUF / LDX #0 (-2).
-;   - DO_INPUT joins DO_LET at DL_EXPR instead of own JSR EXPR / BRA STORE_VAR (-3).
+;     DIV_ENTRY zero test gone, BCS E1_OVFL in DIV_LOOP, E1_OVFL moved in range 
+;   - PE_CMP_LP split: PE_CMP_X (X = ZP pointer offset) also used by RUNLP 
+;   - GETLINE: X = absolute IBUF index, no LDA #IBUF / LDX #0 .
+;   - DO_INPUT joins DO_LET at DL_EXPR instead of own JSR EXPR / BRA STORE_VAR 
 ;
 ; v1.9 - 25 bytes free before vectors - Golf Pass 
 ;   - CURLN deleted as RUN/GOTOL wrote it but nothing but EDITLN read it.
@@ -141,11 +146,8 @@ KOWALSKI        = 1
 ;   - GOTOL leaves IP at the line *header*; DO_GO enters RL_GO (which skips it)
 ;     instead of RUNGO, dropping GT_OK's ADD2_LP.
 ;   - DO_LIST reads the line number with two BUMP_LPs (drops LDA/LDA,Y/ADD2_LP).
-;   - MAIN no longer clears RUN: only DO_RUN reads it, after setting it (a stale 1
-;     after an error mid-RUN is harmless).
-;   - INIT: dropped CLD (65C02 reset clears D).  TXS stays: needed so early JSRs don't
-;     push into the Kowalski preloaded showcase at PROG.
-;   - Banner bumped to pBASIC1.9.
+;   - MAIN no longer clears RUN: only DO_RUN reads it, after setting it 
+;   - INIT: dropped CLD (65C02 reset clears D).  
 ;
 ; v1.8 - 2 bytes free before vectors 
 ;   - Changed BANG's arm from "DEC BANG" to "LDA #$FF / STA BANG" (+2 bytes).
@@ -311,8 +313,6 @@ PE:         .DW SHOWCASE_END   ; Preload Showcase for testing
 PE:         .RS 2              ; 16-bit: program end (one past last byte)
         .ENDIF
 LP:         .RS 2              ; 16-bit: line pointer / multi-purpose scratch
-RUN:        .RS 1              ; 8-bit:  run flag, bit0=1 while RUN loop active; set by
-                               ;         DO_RUN, cleared by END; read only in DO_RUN
 VARS:       .RS 52             ; 52-byte variable store (A-Z, 2 bytes each)
 IBUF:       .RS 41             ; Nominal Input line buffer but unbounded 
 
@@ -341,7 +341,6 @@ ZPEND:		               ; End of zero page audit
 ;   Runs of plain characters are quoted strings; a literal `"` or `;` in the
 ;   BASIC text is emitted as a raw byte ($22 / $3B) instead of inside.
 ;   One statement per line throughout
-; 
 ; =============================================================================
 
          .DB $14,$00,"PRINT ",$22,"-- Pico-BASIC SHOWCASE --",$22,CR ;
@@ -409,7 +408,7 @@ SHOWCASE_END:	.DW 0
 ; =============================================================================
 ; ROM START  
          .ORG ORIGIN
-BANNER: .DB "pBASIC2.0",0                    ; Signon 
+BANNER: .DB "pBASIC2.1",0                    ; Signon 
 
 ; =============================================================================
 ; TOK_CHARS / TOK_LO / TOK_HI -- match-char table + RTS-dispatch address tables.
@@ -819,37 +818,74 @@ GETCI_RTS:
          RTS
 
 ; =============================================================================
+; DO_RUN  --  RUN  :  execute program starting from the first line
+;
+;   In:  PE = current program end
+;   Out: program executes; returns to MAIN on END/error/STOP
+;   Clobbers: A X Y T0 T1 T2 T3 IP SP
+;
+;   RUNLP: top of the per-line execution loop, reads the next line header.
+;   RL_GO: mid-loop entry used by GOTO (IP already at the target's header).
+;   There is no run flag: END, NEW, an error and the natural end of the program
+;   all land in MAIN, whose stack reset abandons the loop (RUNEND = MAIN).
+; =============================================================================
+DO_RUN:
+         LDX #0
+         JSR PROG2X           ; PROG to IP
+RUNLP:   LDX #IP               ; IP == PE? (natural end of program)
+         JSR PE_CMP_X
+         BEQ RUNEND           ; end of program -> MAIN (RUNEND is MAIN's alias)
+RL_GO:   JSR GETCI            ; skip line-number lo
+         JSR GETCI            ; skip line-number hi
+RUNGO:   JSR STMT               ; execute the statement on this line
+SK_LP:   JSR GETCI            ; advance IP past CR (SKIPEOL inlined)
+         CMP #CR
+         BNE SK_LP
+         BEQ RUNLP            ; always taken: BNE SK_LP fell through, so Z=1
+
+; =============================================================================
 ; INIT  --  cold start
 ;
 ;   In:  -- (entered via reset vector at $FFFC, or Kowalski JMP trampoline)
 ;   Out: never returns; falls through into MAIN
 ;   Clobbers: everything
 ;
-;   Sets the stack, initialises PE, then falls into MAIN. 
+;   Sets the stack, prints the banner, then falls into DO_NEW (PE = PROG) and
+;   on into MAIN.  The Kowalski build skips DO_NEW with BNE MAIN so the
+;   preloaded showcase survives.
 ; =============================================================================
 INIT:
          LDX #HWSTACK
          TXS                  ; set stack (also keeps early JSRs out of the preloaded
                               ; showcase at PROG)
          CLD                  ; NMOS reset leaves D undefined (65C02 clears it)
-        .IF KOWALSKI     
-         JSR DO_END           ; setup RUN
-        .ELSE
-         JSR DO_NEW           ; setup PE, PROG, RUN
-        .ENDIF
-
-        ; Print signon Banner - delete frees 16 bytes for UART init code
+        ; Print signon Banner - delete frees 17 bytes for UART init code
          LDA #0               ; Banner Low byte - banner must be at $xx00
          STA IP
          LDA #>BANNER
          STA IP+1
          JSR DP_STR
-
+        .IF KOWALSKI
+         BNE MAIN             ; always taken: DP_STR ends in PRNL (LDA #LF, Z=0)
+        .ENDIF
+        ; drop through
+; =============================================================================
+; DO_NEW  --  NEW  :  Set default program store
+; DO_END  --  END  :  halt program execution and return to immediate mode
+; =============================================================================
+DO_NEW:
+         LDX #PE-IP
+         JSR PROG2X            ; PE = PROG
+DO_END:                        ; no code: END, NEW and the natural end of a RUN just
+RUNEND:                        ; fall into MAIN, whose stack reset abandons the run
+        ; drop through
 ; =============================================================================
 ; MAIN  --  immediate-mode prompt / dispatch loop
 ;
-;   In:  -- (entered by fall-through from INIT, or by JMP MAIN from its own loop
-;        bottom and from EDITLN's EL_EXIT, which is also DO_ERROR's relay)
+;   In:  -- (entered by fall-through from DO_NEW (INIT in the hardware build), by
+;        INIT's BNE (Kowalski), by BEQ RUNEND (end of program), as DO_END, and by
+;        JMP MAIN from its own loop bottom and from EDITLN's EL_EXIT, which is
+;        also DO_ERROR's relay)
 ;   Out: never returns (loops back to itself indefinitely)
 ;   Clobbers: everything
 ;
@@ -949,8 +985,7 @@ EL_UPD:  TYA                   ; A = payload length (excluding CR)
          LDA LP+1
          ADC #0
          STA PE+1
-EL_EXIT: JMP MAIN             ; done -- back to the prompt (also DO_ERROR's relay: MAIN is
-                              ; out of its branch range)
+EL_EXIT: JMP MAIN             ; back to the prompt and DO_ERROR relay
 
 ; =============================================================================
 ; DO_ERROR  --  Essential Errors Stub, no line numbers, restarts MAIN
@@ -973,6 +1008,24 @@ DO_ERROR:
          JSR PUTCH            ; print code
          JSR PRNL             ; CR+LF after error message
          BNE EL_EXIT          ; always taken: PRNL ends LDA #LF (Z=0) and PUTCH preserves flags
+
+; =============================================================================
+; DO_GO  --  GOTO <linenum>
+;
+;   In:  IP -> line number digits
+;        NOTE: IP, PE and LP must be sequential in Zero Page (PROG2X).
+;   Out: IP = header of target line; pending JSR STMT return address
+;        discarded (RL_GO's JSR STMT replaces it); continues at RL_GO.
+;        Works from the prompt too: the program then runs from that line.
+;   Clobbers: A X Y T0 T1 T2 T3 IP LP SP  (T1-T3 via EXPR)
+; =============================================================================
+DO_GO:
+         JSR EXPR             ; Parse target line number -> T0 (LP no longer needed)
+         JSR GOTOL            ; find line: C=0 found, C=1 not found
+         BCS DO_ERR_UL        ; Line not found error 
+         PLA                  ; discard the pending JSR STMT return address
+         PLA                  ; (RUNGO's, or MAIN's when GO is typed at the prompt)
+         JMP RL_GO            ; IP -> line header; RL_GO skips it
 
 ; =============================================================================
 ; DO_INPUT  --  ASK <var>  (routine name is historical; ASK is the actual
@@ -1009,18 +1062,6 @@ PARSE_VAR:
          JMP BUMP_IP     ; (3) increments IP, leaves Carry clear (C=0)
 
 ; =============================================================================
-; DO_NEW  --  NEW  :  Set default program store
-; DO_END  --  END  :  halt program execution and return to immediate mode
-; =============================================================================
-DO_NEW:
-         LDX #PE-IP
-         JSR PROG2X            ; PE = PROG
-DO_END:
-RUNEND:  LDA #0
-         STA RUN
-         RTS
-
-; =============================================================================
 ; DO_LET  --  LET <var> = <expr>  or implicit  <var> = <expr>
 ;
 ;   In:  IP -> variable name (with optional leading spaces)
@@ -1055,57 +1096,6 @@ STMT_RTS:
         RTS            
 
 ; =============================================================================
-; DO_GO  --  GOTO <linenum>
-;
-;   In:  IP -> line number digits
-;        NOTE: IP, PE and LP must be sequential in Zero Page (PROG2X).
-;   Out: IP = header of target line; pending JSR STMT return address
-;        discarded (RL_GO's JSR STMT replaces it); continues at RL_GO
-;   Clobbers: A X Y T0 T1 T2 T3 IP LP SP  (T1-T3 via EXPR)
-;
-; =============================================================================
-DO_GO:
-         JSR EXPR             ; Parse target line number -> T0 (LP no longer needed)
-         JSR GOTOL            ; find line: C=0 found, C=1 not found
-         BCS DO_ERR_UL        ; Line not found error 
-         PLA                  ; discard the pending JSR STMT return address --
-         PLA                  ; RUNGO's own JSR STMT always returns to the
-                              ; same place, so there's always exactly one
-         BMI RL_GO            ; always taken: 2nd PLA left PCH of a ROM return address
-                              ; (>= $FC) in A, so N=1; IP -> line header, RL_GO skips it
-                              ; header; RL_GO skips it
-
-; =============================================================================
-; DO_RUN  --  RUN  :  execute program starting from the first line
-;
-;   In:  PE = current program end
-;   Out: program executes; returns to MAIN on END/error/STOP
-;   Clobbers: A X Y T0 T1 T2 T3 IP SP RUN
-;
-;   RUNLP: top of the per-line execution loop, reads the next line header.
-;   RL_GO: mid-loop entry used by GOTO (IP already at the target's header) --
-;          the JSR STMT at RUNGO is also the return point DO_GO's PLA/PLA
-;          unwinds back to, which is what lets DO_GO discard exactly one frame.
-; =============================================================================
-DO_RUN:
-         LDX #0
-         JSR PROG2X           ; PROG to IP
-         INX                  ; X=0 here (LDX #0 / PROG2X leaves it) -> 1
-         STX RUN              ; set run flag (RUN is only ever 0 or 1)
-RUNLP:   LDX #IP               ; IP == PE? (natural end of program)
-         JSR PE_CMP_X
-         BEQ RUNEND
-RL_GO:   JSR GETCI            ; skip line-number lo
-         JSR GETCI            ; skip line-number hi
-RUNGO:   JSR STMT               ; execute the statement on this line
-         LDA RUN              ; RUN cleared by END -- stop
-         BEQ RUNEND
-SK_LP:   JSR GETCI            ; advance IP past CR (SKIPEOL inlined)
-         CMP #CR
-         BNE SK_LP
-         BEQ RUNLP            ; always taken: BNE SK_LP fell through, so Z=1
-
-; =============================================================================
 ; DO_IF  --  IF <expr> <stmt>  (no THEN keyword -- see top-of-file spec)
 ;
 ;   In:  IP -> expression text
@@ -1127,7 +1117,6 @@ DO_IF:
 ;   In:  IP -> statement text (spaces will be skipped)
 ;   Out: statement executed; IP advanced
 ;   Clobbers: A X Y T0 T1 T2 T3 IP
-;
 ; =============================================================================
 STMT:
          JSR WPEEK
@@ -1318,7 +1307,6 @@ DP_STR:  JSR GETCI            ; read string body char by char
          BCC DP_NL            ; unterminated string -- print CR/LF and stop
          JSR PUTCH
          BCS DP_STR           ; always taken: C=1 from CMP #CR+1 (BCC above fell through);
-                              ; PUTCH preserves flags
 
 DP_NORM: JSR EXPR             ; numeric expression
          JSR PRT16
