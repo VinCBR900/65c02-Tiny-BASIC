@@ -9,7 +9,7 @@
 > To be frank, without these agents this work would not have been possible.
 
 Here we have several Tiny BASIC for 6502/65c02
-  * **pBASIC - TINY** - Proof of Concept 1kbyte Tiny BASIC interpreter for 65c02 - 16 bit signed INTs, `+`,`-`,`*`,`/`,`<`,`=`,`(`,`)` math.
+  * **pBASIC - TINY** - Proof of Concept 1kbyte Tiny BASIC interpreter for original NMOS 6502 - 16 bit signed INTs, `+`,`-`,`*`,`/`,`<`,`=`,`(`,`)` math.
   * **uBASIC - SMALL** - Targeted at original NMOS 6502, meets 1976 Tiny BASIC spec for 16 bit signed ints, fits in 2kbyte with multiple features including bitbang serial IO on a VIA 6522.
   * **4kBASIC - FAST** - Targeted at 65c02, this is a Tokenized, Extended 16bit signed in Tiny BASIC with `FOR`/`NEXT`, CORDIC `SIN`/`COS` degree functions and Bitwise operators.  Fits in a 4kbyte EPROM.
   * **mini-BASIC - TRIG** - Targeted at 65c02, 4 byte floating point with radian based TRIG: `SIN`/`COS`/`TAN`/`ASIN`/`ACOS`/`ATAN`, and Transcendental `LN`/`EXP`, that also fits in a 4kbyte EPROM.   
@@ -22,7 +22,7 @@ https://vincbr900.github.io/65c02-Tiny-BASIC/
 > If you've found these Tiny BASIC interpreters useful for learning, retrocomputing, or your own projects, you can buy me a coffee.  Donations are entirely optional but greatly appreciated.
 > [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/vpcrabtreeZ)
 
-### Pico-BASIC `pBASIC65c02.ASM` — fits in a 2708/2758 EPROM (<1 KByte)
+### Pico-BASIC `pBASIC6502.ASM` — fits in a 2708/2758 EPROM (<1 KByte)
 
 **<1024 bytes assembled. ROM at $FC00–$FFFF**
 
@@ -34,7 +34,7 @@ A tiny but mostly complete integer Tiny BASIC. No tokeniser - BASIC program line
 
 **Expressions:** 
   * Math: `+` `-` `*` `/` unary `-` `(` `)`
-  * Relops: `<` and `=` supported - use flipped operands for `>`, e.g. `A>B` as `B<A`. A leading `!` inverts following relop: `A!=B` equivalent to `A<>B`, `A!<B` equivalent to  `A>=B`, and `B!<A` equivalent to `A<=B`.
+  * Relops: `<` and `=` supported - use flipped operands for `>`, e.g. `A>B` as `B<A`. 
   * Variables: `A`–`Z` signed 16-bit integers, −32768 to 32767
   * Functions: **None**  
 
@@ -43,7 +43,8 @@ A tiny but mostly complete integer Tiny BASIC. No tokeniser - BASIC program line
 - **Expressions supported in GOTO** - `GOTO`, `GOTO X`, `GOTO 10*I` all work.  
 - **Left to Right Operator Precidence** — up to you to use Parenthesis to get the right order
 - **BASIC Line Handling** - to save space in-place insertion/deletion not supported.  This means you can only change the last line - either update or delete.  So if you enter 10 lines and notice an error on line 2, you must delete lines 10, 9, 8, 7, 6, 5, 4, 3 in sequence.
-- **WDC 65c02** - to save space, WDC opcoces used like `BBR`.  To port to NMOS 6502 would tak est 75 bytes, with only Banner and Relop inversion quick wins at ~40 bytes.  
+
+There is about 25bytes slack for UART init code, potentially another 20bytes by removing signon Banner.
 
 **Errors** printed as `!N`, no line number shown:
 
