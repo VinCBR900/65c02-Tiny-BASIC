@@ -2300,7 +2300,8 @@ DN_loop:                     ; branch back to body: restore IP and CURLN from th
         JSR RD_CURLN          ; read line-number header, advance IP past it
         JMP RUN_LINE         ; restore S and jump to target
 DN_samel:                    ; colon-chained: resume right after ':' on same line
-        JSR INC_IP            ; consume the ':'  (CURLN already restored above)
+        JSR INC_IP            ; consume the ':'
+        JSR T0_TO_CURLN      ; T0 still holds loop_line (GOTOL doesn't clobber it) (thx to SOCI)
         JMP RUNGO             ; re-enter statement dispatch mid-line (no header)
 
 ; DN_end must stay separate from RUNEND: RUNEND only clears RUN, it does
