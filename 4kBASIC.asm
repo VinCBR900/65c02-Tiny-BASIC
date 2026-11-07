@@ -1,5 +1,5 @@
 ; =============================================================================
-; 4K Integer BASIC v15.29 for the 65C02
+; 4K Integer BASIC v15.30 for the 65C02
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -8,6 +8,13 @@
 ; LIST to view, NEW to clear and enter your own program).
 ;
 ; Credit to Oscar Toledo for his x86 BootBASIC inspiration.
+;
+; USAGE
+;   Assemble : asm65c02 4kBASIC65c02.asm       (ROM $F000-$FFFF, showcase image at $0200)
+;   Simulate : sim65c02 4kBASIC65c02.asm       (terminal I/O at $E000/$E001/$E004, see below)
+;   At the '>' prompt: type a numbered line to store it, or a bare statement to run it
+;   immediately. RUN starts the program, LIST shows it, NEW clears it, FREE shows the
+;   RAM left. The pre-loaded showcase starts out as the stored program.
 ; =============================================================================
 ; Statements:
 ;   PRINT [item [; item ...]]
@@ -21,7 +28,6 @@
 ;   INPUT var          read from keyboard
 ;   LET var = expr     explicit assignment (LET keyword optional)
 ;   POKE addr, val     write byte to memory
-;   DPOKE addr, val    write word (16-bit) to memory  (sister of DPEEK)
 ;   READ var [, var ...]   read next value from DATA sequence
 ;   DATA val [, val ...]   literal values in program (consumed by READ)
 ;   RESTORE            reset DATA pointer to start of program
@@ -53,8 +59,7 @@
 ;                    CHR$(n)             character with ASCII code n  (PRINT only)
 ;                    HEX$(n)             n as 4-digit hex, MSB first  (PRINT only)
 ;                    PEEK(addr)          read byte from memory address
-;                    DPEEK(addr)         Read a word from memory address
-;                    USR(addr)           call machine-code subroutine, A=lo T0
+;                    USR(addr)          call machine-code subroutine, A=lo T0
 ;                    RND                 pseudo-random 1..32767 (no argument)
 ; Numbers:     signed 16-bit integers  -32768 .. 32767
 ;              decimal, or hex literal $HHHH (1-4 hex digits)
@@ -73,8 +78,22 @@
 ; DATA must be the sole statement on its line (the line's first token is the
 ;   only one checked when scanning for DATA lines).
 ;
-; Multi-FOR headers sharing a single colon-chained line are not supported --
-;   each FOR must be alone on its line (matching NEXT/GOSUB/RETURN).
+; FOR nesting is limited to 4 levels and GOSUB nesting to 8; one more raises NR ERR.
+;   (v15.30: a FOR may now share a line with other statements and FORs may be
+;   chained, e.g. FOR I=1 TO 2: FOR J=1 TO 3 -- NEXT resumes at the saved clause
+;   address instead of re-searching the line.)
+;
+; RETURN does not restore the line number: after a GOSUB returns, an error later
+;   on the SAME line is reported "IN" the subroutine's last line. GOTO/GOSUB cope
+;   (a stale line number only costs a slower, from-the-start search).
+;
+; A backward GOTO/GOSUB (target line <= the current line) still searches from the
+;   start of the program; forward targets search ahead from the current line.
+;
+; PRINT; (semicolon immediately after PRINT, no item) evaluates an empty expression
+;   and prints 0; bare PRINT, PRINT: and PRINT ELSE print a blank line.
+;
+; DPEEK/DPOKE (v15.29) were removed in v15.30 to make room for the speed paths.
 ;
 ; Input buffer is 41 bytes (40 usable chars + CR terminator). Each keypress
 ;   past the limit sounds BELL and is discarded outright -- not stored, not
@@ -105,6 +124,45 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ;
+; v15.30 (Nov 2026) - 1 byte free (confirmed by build) - EXECUTION SPEED + FIXES
+;   Measured as simulator instructions per iteration, v15.29 -> v15.30:
+;     FOR/NEXT loop + one assignment  705 -> 344 (-51%)   expression-heavy  1762 -> 946 (-46%)
+;     NEXT inside a 40-line program   9058 -> 346 (-96%)  GOSUB 20 lines ahead  17982 -> 696 (-96%)
+;     16x16 / 16x3 multiply           883 -> 490 / 388    divide by 7 / by 300   932 -> 579 / 466
+;     REM line skip                   11095 -> 1558 (-86%)
+;   Every inlined routine / fast path is marked "FAST PATH (v15.30)" or "v15.30 inline" at its site.
+;   Speed:
+;   - FOR frame is now 9 bytes: it also saves the IP just past the FOR clause. NEXT restores
+;     IP/CURLN from the frame instead of re-running GOTOL from the program start on every
+;     iteration (the dominant cost of any loop in a longer program).
+;   - GOTOL: while a program runs and target line > CURLN, skip the rest of the current line and
+;     scan FORWARD; backward/same-line targets and immediate mode start from PROG. Falls back to
+;     a fresh scan if the forward scan runs off the end (CURLN can be stale after RETURN).
+;   - MUL16_u: swaps operands so the smaller one drives the shift-add, exits as soon as the
+;     multiplier is exhausted (was a fixed 16 passes). Result is bit-identical.
+;   - DIV_KERN: 8 passes instead of 16 when the dividend's high byte < divisor (every divisor
+;     >= 256 and every dividend < 256). Quotient/remainder/sign quirks are unchanged.
+;   - EXPR2: variable and number atoms are tested first (before '(' and the function chain);
+;     PNUM inlines number fetch (IP += 3 with one ADC, was 3 INC_IP calls); PARSE_VAR inlines its
+;     first INC_IP; WPEEK/WPEEK_UC/WEAT removed (every JSR WPEEK became LDA (IP)).
+;   - DO_REM scans to the end of the line with TOKSKIP_IP (was byte-by-byte SKIP_STMT).
+;   - FSTK_BASE: A*9 computed with two ADCs (carry provably clear) -- no SEC/SBC/CLC.
+;   Fixes:
+;   - INPUT always raised UK ERR: DO_INPUT kept IP in T2, which PRNL/PUTSTR (called by GETLINE)
+;     overwrite. IP and CURLN are now saved on the hardware stack across the prompt.
+;   - REM whose text began with ':' executed the comment (UK ERR) -- DO_REM now consumes the line.
+;   - GOSUB return stack was 2 bytes (the 2nd nested GOSUB overran TKTOK/FSTK/FOR_STK): now 8 levels.
+;   - Showcase line 110 DATA was raw ASCII, so READ returned garbage: now tokenised.
+;   - Bare "PRINT:" and "PRINT ELSE" printed a spurious 0 (':' / ELSE were not treated as end of
+;     item list). DP_end is the single shared end-of-list test for DP_top and DP_semi.
+;   Removed: DPEEK/DPOKE (tokens $8F/$AC are placeholders; STMT_JT/FUNC_JT adjusted).
+;   Showcase: banner/version text, lines 71-79 and 81 (MUL/DIV incl. wrap and sign quirks,
+;     chained FOR, bare PRINT:, forward GOTO, REM:, backward GOTO). Costs ~300 bytes of RAM.
+;   INC_IP inlining was evaluated: each site costs +3 ROM bytes; ROM is full, so only the sites
+;     that were byte-neutral or smaller were inlined (PNUM, PARSE_VAR). Candidate next steps if
+;     ROM is freed: single-entry GOTOL target cache (backward GOTO loops), RD_CURLN inline,
+;     per-tier operator pre-filter in EXPR1/EXPR_ADD.
+
 ; v15.29 (Sep 2026) - 34 bytes free (confirmed by build) - Golf Pass
 ;   - BBR instruction deployed
 ;   - Showcase: added lines 66-68 (SHR, HEX$, and all remaining relational
@@ -363,8 +421,8 @@ TOK_FOR     = $8B            ; FOR var = start TO end [STEP n]
 TOK_NEXT    = $8C            ; NEXT [var]
 TOK_FREE    = $8D            ; FREE  (print free bytes)
 TOK_POKE    = $8E            ; POKE addr, val
-TOK_DPOKE   = $8F            ; DPOKE addr, val  16-bit write (sister of DPEEK)
-TOK_HELP    = $90            ; HELP  
+                              ; $8F removed v15.30 (DPOKE) -- KW_TABLE placeholder
+TOK_HELP    = $90            ; HELP
 ; TOK_ON ($91) removed v15.0 -- slot is now a KW_TABLE placeholder
 TOK_DATA    = $92            ; DATA val, val, ...  
 TOK_READ    = $93            ; READ var
@@ -405,9 +463,10 @@ TOK_SIN     = $A8            ; SIN(deg) -> deg*1000 (0-360)
 TOK_COS     = $A9            ; COS(deg) -> deg*1000 (0-360)
 TOK_ASIN    = $AA            ; ASIN(v)  v in -1000..1000 -> degrees -90..90 (v15.19)
 TOK_ACOS    = $AB            ; ACOS(v)  v in -1000..1000 -> degrees 0..180  (v15.19)
-TOK_DPEEK   = $AC            ; DPEEK(addr)  16-bit read  (v15.31)
-TOK_SHL     = $AD            ; n SHL c  bitwise left shift  (v15.25, renumbered v15.31)
-TOK_SHR     = $AE            ; n SHR c  arithmetic right shift, sign-preserving (v15.25, renumbered v15.31)
+TOK_FEND    = $AC            ; first non-function token above Group A (was DPEEK, removed v15.30:
+                              ; KW_TABLE placeholder; EXPR2_t1b rejects >= TOK_FEND)
+TOK_SHL     = $AD            ; n SHL c  bitwise left shift  (v15.25)
+TOK_SHR     = $AE            ; n SHR c  arithmetic right shift, sign-preserving (v15.25)
 TOK_HEX     = $FE            ; inline 16-bit unsigned hex literal follows, e.g. $1234 (v15.20)
 TOK_NUM     = $FF            ; inline 16-bit number follows
 
@@ -433,14 +492,16 @@ ERR_OD   = 14                ; out of DATA
 
 ; ---- zero-page addresses -----------------------------------------------------
 IP       = $00               ; 16-bit: interpreter pointer
-; FVAR,FLIM,FSTEP,CURLN are contiguous
-; on purpose: DO_FOR copies this 7-byte block into
+; FVAR,FLIM,FSTEP,FIP,CURLN are contiguous
+; on purpose: DO_FOR copies this 9-byte block into
 ; a FOR_STK frame with one indexed loop instead of
 ; unrolled stores (CURLN already holds the correct
 ; loop_line value, so no separate copy is needed).
 FVAR     = $02               ;  8-bit: FOR staging: var_slot (VARS offset)
 FLIM:    .RS 2               ; 16-bit: FOR staging: limit
 FSTEP:   .RS 2               ; 16-bit: FOR staging: step
+FIP:     .RS 2               ; 16-bit: FOR staging: IP just past the FOR clause (v15.30: NEXT
+                              ;  resumes here directly instead of re-searching the program)
 CURLN:   .RS 2               ; 16-bit: current executing line number
 ; --- 
 LP:      .RS 2               ; 16-bit: list/edit/scratch pointer
@@ -450,11 +511,12 @@ T2:      .RS 2               ; 16-bit: scratch 2
 PE:      .RS 2               ; 16-bit: program end
 GRET:    .RS 1               ;  8-bit: GOSUB nesting depth
 RUN:     .RS 1               ;  8-bit: 0 = idle, $FF = running
-GORET:   .RS 2               ; 16 bytes: GOSUB return stack 
+GORET:   .RS 16              ; 16 bytes: GOSUB return stack (8 levels x 2; was .RS 2 -- overran
+                              ; into TKTOK/FSTK/FOR_STK from the 2nd nested GOSUB, fixed v15.30)
 TKTOK:   .RS 1               ;  8-bit: TRYKW keyword index
 FSTK:    .RS 1               ;  8-bit: FOR nesting depth
-FOR_STK: .RS 28              ; 28 bytes: FOR frames        
-FOR_FRSZ = 7                 ; bytes per FOR frame
+FOR_STK: .RS 36              ; 36 bytes: 4 FOR frames x 9 (was 7: +FIP, v15.30)
+FOR_FRSZ = 9                 ; bytes per FOR frame
 RUNSP:   .RS 1               ;  8-bit: saved SP for stack unwind
 OP:      .RS 1               ;  8-bit: MUL/DIV operator ('*' or '/')
 DATA_PTR: .RS 2              ; 16-bit: pointer to next DATA value to READ 
@@ -501,6 +563,9 @@ ZPEND    = *                    ; audit
 ;   FOR / NEXT / STEP (including negative step)
 ;   IF / THEN / ELSE / GOSUB / RETURN / ON n GOSUB
 ;   Mandelbrot set renderer (validates expression evaluator, nested FOR, GOTO)
+;   v15.30 additions (lines 71-81): signed MUL/DIV incl. 16-bit wrap and remainder sign,
+;   chained FOR on one line, bare PRINT:, forward/backward GOTO, REM starting with a colon.
+;   Expected: MUL -84 900 -2786 | DIV -42 100 -6 | 123246 | CHAINED FOR OK | ... | ...OK 3
 ; Mandelbrot: fixed-point integer arithmetic.
 ;   Real axis C: -128..16 step 4  (37 columns)
 ;   Imag axis I:  -64..56 step 6  (21 rows)
@@ -508,8 +573,8 @@ ZPEND    = *                    ; audit
 ;   Called as a GOSUB at line 600; uses IF/THEN/ELSE for pixel output.
 ; =============================================================================
         .ORG $0200
-        .DB $0A, $00, $89, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $31, $20, $53, $48, $4F, $57, $43, $41, $53, $45, $0D  ; 10 REM  4K BASIC v15.1 SHOWCASE
-        .DB $14, $00, $80, $22, $3D, $3D, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $31, $20, $3D, $3D, $22, $0D  ; 20 PRINT "== 4K BASIC v15.1 =="
+        .DB $0A, $00, $89, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $33, $30, $20, $53, $48, $4F, $57, $43, $41, $53, $45, $0D  ; 10 REM 4K BASIC v15.30 SHOWCASE
+        .DB $14, $00, $80, $22, $3D, $3D, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $33, $30, $20, $3D, $3D, $22, $0D  ; 20 PRINT "== 4K BASIC v15.30 =="
         .DB $1E, $00, $80, $22, $43, $48, $52, $22, $3B, $98, $28, $FF, $24, $00, $29, $3B, $22, $28, $36, $35, $29, $3D, $22, $3B, $98, $28, $FF, $41, $00, $29, $0D  ; 30 PRINT "CHR";CHR$ (36 );"(65)=";CHR$ (65 )
         .DB $28, $00, $80, $22, $31, $37, $20, $4D, $4F, $44, $20, $35, $3D, $22, $3B, $FF, $11, $00, $A1, $FF, $05, $00, $3B, $22, $20, $20, $41, $42, $53, $20, $6E, $65, $67, $37, $3D, $22, $3B, $A5, $28, $2D, $FF, $07, $00, $29, $0D  ; 40 PRINT "17 MOD 5=";17 MOD 5 ;"  ABS neg7=";ABS (-7 )
         .DB $32, $00, $80, $22, $4E, $4F, $54, $20, $30, $3D, $22, $3B, $9C, $FF, $00, $00, $3B, $22, $20, $20, $36, $20, $41, $4E, $44, $20, $33, $3D, $22, $3B, $FF, $06, $00, $9A, $FF, $03, $00, $0D  ; 50 PRINT "NOT 0=";NOT 0 ;"  6 AND 3=";6 AND 3 
@@ -519,10 +584,20 @@ ZPEND    = *                    ; audit
         .DB $43, $00, $80, $22, $35, $3C, $31, $30, $3D, $22, $3B, $FF, $05, $00, $3C, $FF, $0A, $00, $3B, $22, $20, $20, $35, $3C, $3E, $33, $3D, $22, $3B, $FF, $05, $00, $3C, $3E, $FF, $03, $00, $0D  ; 67 PRINT "5<10=";5<10;"  5<>3=";5<>3
         .DB $44, $00, $80, $22, $33, $3C, $3D, $33, $3D, $22, $3B, $FF, $03, $00, $3C, $3D, $FF, $03, $00, $3B, $22, $20, $20, $35, $3E, $3D, $36, $3D, $22, $3B, $FF, $05, $00, $3E, $3D, $FF, $06, $00, $0D  ; 68 PRINT "3<=3=";3<=3;"  5>=6=";5>=6
         .DB $46, $00, $80, $22, $52, $4E, $44, $20, $4D, $4F, $44, $20, $31, $30, $3D, $22, $3B, $A4, $A1, $FF, $0A, $00, $0D  ; 70 PRINT "RND MOD 10=";RND MOD 10 
+        .DB $47, $00, $80, $22, $4D, $55, $4C, $20, $31, $32, $2A, $2D, $37, $3D, $22, $3B, $FF, $0C, $00, $2A, $28, $2D, $FF, $07, $00, $29, $3B, $22, $20, $33, $2A, $33, $30, $30, $3D, $22, $3B, $FF, $03, $00, $2A, $FF, $2C, $01, $3B, $22, $20, $32, $35, $30, $2A, $32, $35, $31, $3D, $22, $3B, $FF, $FA, $00, $2A, $FF, $FB, $00, $0D  ; 71 PRINT "MUL 12*-7=";12*(-7);" 3*300=";3*300;" 250*251=";250*251
+        .DB $48, $00, $80, $22, $44, $49, $56, $20, $2D, $33, $30, $30, $2F, $37, $3D, $22, $3B, $2D, $FF, $2C, $01, $2F, $FF, $07, $00, $3B, $22, $20, $33, $30, $30, $30, $30, $2F, $33, $30, $30, $3D, $22, $3B, $FF, $30, $75, $2F, $FF, $2C, $01, $3B, $22, $20, $33, $30, $30, $20, $4D, $4F, $44, $20, $2D, $37, $3D, $22, $3B, $FF, $2C, $01, $A1, $28, $2D, $FF, $07, $00, $29, $0D  ; 72 PRINT "DIV -300/7=";-300/7;" 30000/300=";30000/300;" 300 MOD -7=";300 MOD (-7)
+        .DB $49, $00, $8B, $49, $3D, $FF, $01, $00, $97, $FF, $02, $00, $3A, $8B, $4A, $3D, $FF, $01, $00, $97, $FF, $03, $00, $0D  ; 73 FOR I=1 TO 2: FOR J=1 TO 3
+        .DB $4A, $00, $80, $49, $2A, $4A, $3B, $0D  ; 74 PRINT I*J;
+        .DB $4B, $00, $8C, $4A, $3A, $8C, $49, $0D  ; 75 NEXT J: NEXT I
+        .DB $4C, $00, $80, $3A, $80, $22, $43, $48, $41, $49, $4E, $45, $44, $20, $46, $4F, $52, $20, $4F, $4B, $22, $3A, $82, $FF, $4E, $00, $0D  ; 76 PRINT: PRINT "CHAINED FOR OK": GOTO 78
+        .DB $4D, $00, $80, $22, $42, $41, $44, $20, $46, $57, $44, $20, $47, $4F, $54, $4F, $22, $0D  ; 77 PRINT "BAD FWD GOTO"
+        .DB $4E, $00, $89, $3A, $50, $52, $49, $4E, $54, $20, $22, $42, $41, $44, $20, $52, $45, $4D, $22, $0D  ; 78 REM:PRINT "BAD REM"
+        .DB $4F, $00, $51, $3D, $51, $2B, $FF, $01, $00, $3A, $81, $51, $3C, $FF, $03, $00, $9F, $82, $FF, $4F, $00, $0D  ; 79 Q=Q+1: IF Q<3 THEN GOTO 79
         .DB $50, $00, $8E, $FE, $FF, $00, $2C, $FF, $2A, $00, $3A, $80, $22, $50, $4F, $4B, $45, $3D, $22, $3B, $A6, $28, $FE, $FF, $00, $29, $0D  ; 80 POKE $00FF ,42 :PRINT "POKE=";PEEK ($00FF )
+        .DB $51, $00, $80, $22, $42, $41, $43, $4B, $20, $47, $4F, $54, $4F, $2C, $20, $46, $57, $44, $20, $47, $4F, $54, $4F, $2C, $20, $52, $45, $4D, $3A, $20, $4F, $4B, $20, $22, $3B, $51, $0D  ; 81 PRINT "BACK GOTO, FWD GOTO, REM: OK ";Q
         .DB $5A, $00, $93, $41, $2C, $42, $2C, $43, $3A, $80, $22, $44, $41, $54, $41, $20, $20, $22, $3B, $41, $3B, $22, $20, $20, $22, $3B, $42, $3B, $22, $20, $20, $22, $3B, $43, $0D  ; 90 READ A,B,C:PRINT "DATA  ";A;"  ";B;"  ";C
         .DB $64, $00, $94, $3A, $93, $41, $3A, $80, $22, $52, $45, $53, $54, $4F, $52, $45, $20, $41, $3D, $22, $3B, $41, $0D  ; 100 RESTORE :READ A:PRINT "RESTORE A=";A
-        .DB $6E, $00, $92, $20, $31, $31, $31, $2C, $32, $32, $32, $2C, $33, $33, $33, $0D  ; 110 DATA  111,222,333
+        .DB $6E, $00, $92, $FF, $6F, $00, $2C, $FF, $DE, $00, $2C, $FF, $4D, $01, $0D  ; 110 DATA 111,222,333  (v15.30: tokenised -- was raw ASCII, so READ returned garbage)
         .DB $78, $00, $8B, $49, $3D, $FF, $01, $00, $97, $FF, $05, $00, $0D  ; 120 FOR I=1 TO 5 
         .DB $82, $00, $80, $49, $3B, $0D  ; 130 PRINT I;
         .DB $8C, $00, $8C, $49, $0D  ; 140 NEXT I
@@ -604,7 +679,7 @@ SHOWCASE_END = *               ; v15.20: extended with Integer Spiral Vortex dem
 ; STRING TABLE (all strings on same page)
 ; =============================================================================
 STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string/kw addresses
-STR_BANNER: .DB "4K BASIC v15.29"
+STR_BANNER: .DB "4K BASIC v15.30"
 STR_CRLF:   .DB $0D,$8A             ; CR, LF|$80 = $8A
 STR_BYTES:  .DB " BYTES FREE",$0D,$8A  ; last LF has high-bit
 STR_ERROR:  .DB " ER",$D2           ; 'R'|$80 = $D2
@@ -625,7 +700,7 @@ KW_TABLE:
 ; ---- statement tokens $80..$95 (must appear first in this order) ------------
 ; NOTE: $90 (HELP) and $91 (ON) removed. Placeholder $80 bytes keep TKTOK
 ; in sync. STMT_JT entries for those slots point to DO_DATA (RTS stub).
-; $8F (former CLS slot) reused for DPOKE (v15.29).
+; $8F (former CLS slot, then DPOKE v15.29) is a placeholder again (v15.30).
         .DB "PRIN",$D4        ; $80 TOK_PRINT   ('T'|$80=$D4)
         .DB "I",$C6           ; $81 TOK_IF      ('F'|$80=$C6)
         .DB "GOT",$CF         ; $82 TOK_GOTO    ('O'|$80=$CF)
@@ -641,7 +716,7 @@ KW_TABLE:
         .DB "NEX",$D4         ; $8C TOK_NEXT    ('T'|$80=$D4)
         .DB "FRE",$C5         ; $8D TOK_FREE    ('E'|$80=$C5)
         .DB "POK",$C5         ; $8E TOK_POKE    ('E'|$80=$C5)
-        .DB "DPOK",$C5        ; $8F TOK_DPOKE   ('E'|$80=$C5)
+        .DB $80               ; $8F placeholder (DPOKE removed v15.30, STMT_JT -> RTS stub)
         .DB $80               ; $90 placeholder (HELP removed, STMT_JT -> RTS stub)
         .DB $80               ; $91 placeholder (ON removed, STMT_JT -> RTS stub)
         .DB "DAT",$C1         ; $92 TOK_DATA    ('A'|$80=$C1)  was $A1
@@ -678,9 +753,9 @@ KW_TABLE:
         .DB "CO",$D3          ; $A9 TOK_COS     ('S'|$80=$D3)  Group A: FUNC_JT[4]
         .DB "ASI",$CE         ; $AA TOK_ASIN    ('N'|$80=$CE)  Group A: FUNC_JT[5]  (v15.19)
         .DB "ACO",$D3         ; $AB TOK_ACOS    ('S'|$80=$D3)  Group A: FUNC_JT[6]  (v15.19)
-        .DB "DPEE",$CB        ; $AC TOK_DPEEK   ('K'|$80=$CB)  Group A: FUNC_JT[7]  (v15.31)
-        .DB "SH",$CC          ; $AD TOK_SHL     ('L'|$80=$CC)  v15.25, renumbered v15.31
-        .DB "SH",$D2          ; $AE TOK_SHR     ('R'|$80=$D2)  v15.25, renumbered v15.31
+        .DB $80               ; $AC placeholder (DPEEK removed v15.30; keeps SHL/SHR token values)
+        .DB "SH",$CC          ; $AD TOK_SHL     ('L'|$80=$CC)  v15.25
+        .DB "SH",$D2          ; $AE TOK_SHR     ('R'|$80=$D2)  v15.25
         .DB 0                 ; end-of-table sentinel
 
 ; Statement dispatch table (used by STMT via JMP (STMT_JT,X))
@@ -691,7 +766,7 @@ STMT_JT:
         .DW DO_PRINT,   DO_IF,      DO_GOTO,    DO_GOSUB,  DO_RETURN  ; $80-$84
         .DW DO_RUN,     DO_LIST,    DO_NEW,     DO_INPUT,  DO_REM     ; $85-$89
         .DW DO_END,     DO_FOR,     DO_NEXT,    DO_FREE,   DO_POKE    ; $8A-$8E
-        .DW DO_DPOKE,   DO_DATA,    DO_DATA,    DO_DATA,   DO_READ    ; $8F(DPOKE),$90(nop),$91(nop),$92-$93
+        .DW DO_DATA,    DO_DATA,    DO_DATA,    DO_DATA,   DO_READ    ; $8F-$91(nop),$92(DATA),$93
         .DW DO_RESTORE, DO_ELSE_SK                                     ; $94-$95
 ;   v15.20: DATA is now tokenized normally (no more raw-copy special case);
 ;   at runtime we still just return -- RUNLP's own SKIPEOL call advances
@@ -738,7 +813,7 @@ MAIN:
         LDA #<TBUF
         STA IP
         STZ IP+1
-        JSR WPEEK
+        LDA (IP)
         CMP #TOK_NUM         ; starts with a number -> line edit
         BNE MAIN_direct
         JSR EDITLN
@@ -1253,7 +1328,7 @@ EL_ck:  BCC EL_skip          ; stored < target (whichever CMP fired): keep scann
         ; neither branch taken -> exact match: fall through to replace
 EL_found:
         JSR DELINE           ; delete existing line before re-inserting
-EL_ins: JSR WPEEK            ; check for empty body (just CR/sentinel)
+EL_ins: LDA (IP)            ; check for empty body (just CR/sentinel)
         CMP #$0D
         BEQ EL_done
         TAX                  ; CMP #0 replacement: TAX sets Z for free (X dead here)
@@ -1413,7 +1488,7 @@ DL_ok:  RTS
 ;   on same line. Implemented as a tail-recursive loop (bounded by line length).
 ; =============================================================================
 STMT:
-        JSR WPEEK
+        LDA (IP)
         CMP #$0D             ; empty / end-of-line
         BEQ ST_nop
         TAX                  ; CMP #0 replacement: TAX sets Z for free (X dead here)
@@ -1445,7 +1520,7 @@ ST_colon:
         BRA STMT             ; execute next statement on same line
 ST_sep_m1:                   ; real label: RTS from handler adds 1 ? ST_sep
         NOP                  ; never executed ? anchor byte for RTS return trick
-ST_sep: JSR WPEEK            ; after any statement: check for ':'
+ST_sep: LDA (IP)            ; after any statement: check for ':'
         CMP #':'
         BEQ ST_colon         ; another statement on same line: loop
 ST_nop: RTS
@@ -1462,11 +1537,11 @@ ST_nop: RTS
 ;   Clobbers: A X Y T0 T1 T2
 ; =============================================================================
 DO_PRINT:
-DP_top: JSR WPEEK            ; Peek next token -> A
-        TAX                  ; CMP #0 replacement (sets Z flag if A=0)
-        BEQ DP_nl            ; bare PRINT (sentinel): just print newline
-        CMP #CR
-        BEQ DP_nl            ; bare PRINT (EOL): just print newline
+DP_top: LDA (IP)            ; Peek next token -> A
+        JSR DP_end           ; bare PRINT (EOL / ':' / ELSE / sentinel)?
+        BEQ DP_nl            ; yes: just print newline.  (v15.30 FIX: ':' and ELSE were
+                             ;  missing here, so "PRINT: ..." evaluated ':' as an
+                             ;  expression and printed a spurious 0)
         CMP #'"'             ; string literal?
         BNE DP_expr    
         JSR GETCI            ; consume opening '"'
@@ -1513,24 +1588,33 @@ DP_norm:
         JSR PRT16
         ; Falls through to DP_aft
 
-DP_aft: JSR WPEEK
+DP_aft: LDA (IP)
         CMP #';'
         BEQ DP_semi
 DP_nl:  JMP PRNL             ; Tail call: Print newline and return (No trampoline needed!)
 
 DP_semi:
         JSR GETCI            ; consume ';'
-        JSR WPEEK
-        CMP #CR             
-        BEQ DP_semi_dn       ; trailing semicolon at EOL
-        CMP #':'             
-        BEQ DP_semi_dn       ; semicolon before ':'
-        CMP #TOK_ELSE        
-        BEQ DP_semi_dn       ; semicolon before ELSE      
-        TAX                  ; Is A == 0 (sentinel)? Sets Z flag.
-        BNE DP_top           ; If NOT zero, keep printing! If zero, falls through to RTS.
+        LDA (IP)
+        JSR DP_end           ; trailing ';' at EOL / before ':' / before ELSE / sentinel?
+        BNE DP_top           ; no: more items, keep printing
+        RTS                  ; yes: suppress the newline
 
-DP_semi_dn:
+; -----------------------------------------------------------------------------
+; DP_end -- shared end-of-item-list test for DP_top and DP_semi (v15.30: one
+;           copy instead of two inline compare chains)
+;   In:  A = token at IP
+;   Out: Z=1 if A is CR, ':', ELSE or 0 (sentinel); Z=0 otherwise.  A preserved.
+;   Clobbers: X (only on the sentinel test)
+; -----------------------------------------------------------------------------
+DP_end: CMP #CR
+        BEQ DP_end_x
+        CMP #':'
+        BEQ DP_end_x
+        CMP #TOK_ELSE
+        BEQ DP_end_x
+        TAX                  ; TAX sets Z iff A=0 and leaves A unchanged
+DP_end_x:
         RTS
 
 ; -- bare $HHHH literal (v15.20): print as hex ONLY when it is the whole
@@ -1572,7 +1656,7 @@ DO_IF:
 
         ; -- condition false: scan for ELSE -----------------------------------
 DO_IF_f:
-        JSR WPEEK
+        LDA (IP)
         CMP #CR              ; EOL with no ELSE: done
         BEQ DO_IF_done
         TAX                  ; 1-byte CMP #0 replacement
@@ -1592,7 +1676,7 @@ DO_IF_else:
         JSR GETCI            ; consume TOK_ELSE and fall through to exec
 
 DO_IF_exec:                  ; shared execution block for both True and ELSE
-        JSR WPEEK
+        LDA (IP)
         CMP #TOK_THEN        ; optional THEN keyword (forgiving for both IF and ELSE)
         BNE DO_IF_stmt
         JSR GETCI             ; consume TOK_THEN
@@ -1667,28 +1751,54 @@ DO_INPUT:
         JSR PARSE_VAR
         BCS DO_input_dn
         PHA                  ; save slot
-        LDA IP               ; save IP across GETLINE
-        STA T2
-        LDA IP+1
-        STA T2+1
+        LDA IP+1             ; save IP across GETLINE on the hardware stack
+        PHA                  ;  (v15.30: was held in T2, which GETLINE's PRNL/PUTSTR
+        LDA IP               ;   overwrites -> every INPUT ended in UK ERR)
+        PHA
+        LDA CURLN+1          ; TOKENIZE (TKPNUM) also clobbers CURLN: save it too so
+        PHA                  ;  error line numbers / GOTO search stay right after INPUT
+        LDA CURLN
+        PHA
         JSR GETLINE_I          ; reads into IBUF, tokenises into TBUF
         LDA #<TBUF
         STA IP
         STZ IP+1
         JSR EXPR             ; evaluate expression from TBUF
-        LDA T2               ; restore IP
+        PLA
+        STA CURLN
+        PLA
+        STA CURLN+1
+        PLA                  ; restore IP
         STA IP
-        LDA T2+1
+        PLA
         STA IP+1
         PLX
         JSR STORE_VAR
-DO_input_dn:    ; drop through
+DO_input_dn:
+        RTS                  ; (no longer falls into DO_REM, which now does real work)
 
 ; =============================================================================
-; DO_REM ? REM (comment): body already absorbed into token stream by TOKENIZE
-;   Clobbers: None.
+; DO_REM ? REM (comment): skip the raw comment text up to (not past) the $0D
+;   In:  IP   just past the REM token
+;   Out: IP   points AT the line's $0D, so ST_sep / SKIPEOL see end-of-line
+;   Clobbers: A Y
+;   v15.30: previously a bare RTS, which let ST_sep treat a ':' at the start of
+;   the comment as a statement separator and execute the raw comment text
+;   (REM :PRINT 1 -> UK ERR), and left SKIPEOL to walk the comment byte by
+;   byte (~41 cycles/byte). TOKSKIP_IP scans ~17 cycles/byte; REM text is raw
+;   ASCII so the number-payload test inside it never fires.
 ; =============================================================================
-DO_REM: RTS
+DO_REM: LDY #0
+        JSR TOKSKIP_IP        ; Y = offset just past the $0D
+        DEY                   ; -> offset of the $0D itself
+        TYA
+        CLC
+        ADC IP
+        STA IP
+        BCC DO_rem_dn
+        INC IP+1
+DO_rem_dn:
+        RTS
 
 ; =============================================================================
 ; DO_RUN ? RUN: start program from first line
@@ -1801,7 +1911,7 @@ DO_LIST:
         STA CY                ; default hi-bound = $7FFF
         LDA #$7F
         STA CY+1
-        JSR WPEEK
+        LDA (IP)
         CMP #$0E
         BCC LS_scan           ; bare LIST? defaults stand
 
@@ -1983,26 +2093,26 @@ PS_norm: JSR PUTCH
 ; =============================================================================
 ; FSTK_BASE ? compute base address of a FOR stack frame into LP
 ;   In:  A    frame index  (0 = bottom, FSTK-1 = current top)
-;   Out: LP   = FOR_STK + A*7
+;   Out: LP   = FOR_STK + A*9
 ;   Clobbers: A T2
-;   Frame layout  (7 bytes at LP):
+;   Frame layout  (9 bytes at LP):
 ;     [0]  var_slot  (byte offset into VARS, 0=$A, 2=$B, ?)
 ;     [1]  limit_lo
 ;     [2]  limit_hi
 ;     [3]  step_lo
 ;     [4]  step_hi
-;     [5]  loop_line_lo   (CURLN when FOR was executed)
-;     [6]  loop_line_hi
+;     [5]  resume_ip_lo   (IP just past the FOR clause: ':' or $0D)   v15.30
+;     [6]  resume_ip_hi
+;     [7]  loop_line_lo   (CURLN when FOR was executed)
+;     [8]  loop_line_hi
 ; =============================================================================
 FSTK_BASE:
         STA T2
         ASL
         ASL
-        ASL               ; A * 8
-        SEC
-        SBC T2            ; A * 8 - A = A * 7
-        CLC
-        ADC #<FOR_STK
+        ASL               ; A * 8   (A <= 3 so no carry out)
+        ADC T2            ; + A = A * 9; carry is clear from the shifts, and A*9 <= 27
+        ADC #<FOR_STK     ;   cannot carry either, so no CLC needed (v15.30 inline: was SEC/SBC/CLC)
         STA LP
         STZ LP+1
 PS_DN:   RTS
@@ -2012,12 +2122,16 @@ PS_DN:   RTS
 ;   In:  IP -> variable letter
 ;   Out: loop frame pushed onto FOR_STK; VARS[var] = start
 ;   Clobbers: A X Y T0 T2 LP
-;   Stages var_slot/limit/step into FVAR/FLIM/FSTEP, which sit immediately
-;   before CURLN in zero page (see equates) forming one contiguous 7-byte
-;   run [FVAR,FLIM,FLIM+1,FSTEP,FSTEP+1,CURLN,CURLN+1] matching the FOR_STK
-;   frame layout exactly. CURLN already holds the correct loop_line value
-;   (set once per line before STMT runs), so no separate copy is needed for
-;   it. The final push is one indexed loop instead of 7 unrolled stores.
+;   Stages var_slot/limit/step/resume-IP into FVAR/FLIM/FSTEP/FIP, which sit
+;   immediately before CURLN in zero page (see equates) forming one contiguous
+;   9-byte run [FVAR,FLIM,FLIM+1,FSTEP,FSTEP+1,FIP,FIP+1,CURLN,CURLN+1]
+;   matching the FOR_STK frame layout exactly. CURLN already holds the correct
+;   loop_line value (set once per line before STMT runs), so no separate copy
+;   is needed for it. The final push is one indexed loop of 9 bytes.
+;   FAST PATH (v15.30): the frame records IP just past the FOR clause so NEXT
+;   can jump straight back to the loop body. NEXT used to re-run GOTOL on the
+;   FOR's line number, a linear walk from PROG (~6 instr per program byte:
+;   ~8,000 instructions for a loop 40 lines into a program, on EVERY iteration).
 ;   Variable letter is consumed before validation (not peeked): safe because
 ;   DO_ERROR never returns to its caller (ends in JMP MAIN), so IP's exact
 ;   position after an aborted statement is never examined.
@@ -2038,7 +2152,7 @@ DO_for_ok:
         STA FLIM             ; stage limit directly
         LDA T0+1
         STA FLIM+1
-        JSR WPEEK
+        LDA (IP)
         CMP #TOK_STEP
         BNE DO_for_nostep
         JSR GETCI            ; consume STEP token
@@ -2062,10 +2176,14 @@ DO_for_szok:
         BCC DO_for_push
         JMP DO_ERR_NR        ; ? shared error stub
 DO_for_push:
-        JSR FSTK_BASE        ; LP = FOR_STK + FSTK*7 (A already holds FSTK)
-        LDY #6
+        JSR FSTK_BASE        ; LP = FOR_STK + FSTK*9 (A already holds FSTK)
+        LDA IP               ; stage resume point: IP is just past the FOR clause
+        STA FIP              ;  (at ':' or the $0D) -- this is where NEXT jumps back to
+        LDA IP+1
+        STA FIP+1
+        LDY #8
 DO_for_cp:
-        LDA FVAR,y           ; copy FVAR,FLIM,FLIM+1,FSTEP,FSTEP+1,CURLN,CURLN+1
+        LDA FVAR,y           ; copy FVAR,FLIM(2),FSTEP(2),FIP(2),CURLN(2)
         STA (LP),y           ; into the frame in one pass (offsets match exactly)
         DEY
         BPL DO_for_cp
@@ -2087,7 +2205,7 @@ DO_for_cp:
 ;   positive- and negative-step loops with one shared path.
 ; =============================================================================
 DO_NEXT:
-        JSR WPEEK_UC         ; consume optional variable name (ignored)
+        LDA (IP)             ; consume optional variable name (ignored)
         SEC
         SBC #'A'
         CMP #26               ; 0-25 = valid letter
@@ -2131,16 +2249,27 @@ DO_next_ok:
         BMI DN_loop          ; differing signs: limit not yet crossed
         DEC FSTK             ; matching signs: limit crossed, done
         RTS
-DN_loop:                     ; branch back to body: load loop line, run it
+DN_loop:                     ; branch back to body: restore IP and CURLN from the frame
+        ; FAST PATH (v15.30): no program search. The frame holds the IP just past
+        ; the FOR clause and the FOR's line number, so loop-back is 4 byte copies.
+        ; (Was: T0 = loop_line; GOTOL walked the whole program from PROG every
+        ; iteration, then SKIP_STMT re-skipped the FOR clause from the line start.)
+        ; Side effect: FOR may now follow other statements on its line
+        ; (X=0: FOR I=1 TO 3 ...) and FOR may be chained (FOR I..: FOR J..), since
+        ; the resume point is the FOR clause itself, not the start of its line.
         LDY #5
-        LDA (LP),y           ; [5] loop_line_lo
-        STA T0
+        LDA (LP),y           ; [5] resume_ip_lo
+        STA IP
         INY
-        LDA (LP),y           ; [6] loop_line_hi
-        STA T0+1
-        JSR GOTOL
-        BCS DN_ul
-        JSR SKIP_STMT        ; skip past FOR clause only (stop at ':' or $0D)
+        LDA (LP),y           ; [6] resume_ip_hi
+        STA IP+1
+        INY
+        LDA (LP),y           ; [7] loop_line_lo
+        STA CURLN
+        INY
+        LDA (LP),y           ; [8] loop_line_hi
+        STA CURLN+1
+        JSR SKIP_STMT        ; step over any junk after the FOR clause (stop at ':' or $0D)
         BCC DN_samel         ; C=0: ':' found -- body is colon-chained on this line
         ; C=1: $0D found -- FOR was alone on its line (original behaviour)
         JSR INC_IP            ; consume the $0D
@@ -2151,11 +2280,8 @@ DN_loop:                     ; branch back to body: load loop line, run it
         JSR RD_CURLN          ; read 2-byte line-number header, advance IP
         JMP RUN_LINE         ; restore S and jump to target
 DN_samel:                    ; colon-chained: resume right after ':' on same line
-        JSR INC_IP            ; consume the ':'
-        JSR T0_TO_CURLN      ; T0 still holds loop_line (GOTOL doesn't clobber it)
+        JSR INC_IP            ; consume the ':'  (CURLN already restored above)
         JMP RUNGO             ; re-enter statement dispatch mid-line (no header)
-DN_ul:
-        JMP DO_ERR_UL        ; ? shared error stub
 
 ; DN_end must stay separate from RUNEND: RUNEND only clears RUN, it does
 ; NOT decrement FSTK. A program ending on the last line of a bare FOR/NEXT
@@ -2201,20 +2327,6 @@ DO_POKE:
         RTS
 
 ; =============================================================================
-; DO_DPOKE ? DPOKE addr, value: write a 16-bit value to memory (lo,hi) -- sister
-;   of E2_dpeek/DPEEK(addr).
-;   Clobbers: A Y T0 T1
-; =============================================================================
-DO_DPOKE:
-        JSR GET_TWO_ARGS      ; T1 = addr, T0 = value
-        LDA T0
-        STA (T1)             ; lo byte at addr
-        LDY #1
-        LDA T0+1
-        STA (T1),Y            ; hi byte at addr+1
-        RTS
-
-; =============================================================================
 ; DO_RESTORE ? RESTORE: reset DATA pointer (0 = rescan from PROG on next READ)
 ;   READ/RESTORE consume the raw bytes via DATA_PTR.  (Same pattern as DO_REM.)
 ;   Clobbers: None.  (STZ does not touch A/X/Y)
@@ -2244,7 +2356,7 @@ DO_DATA:
 ;   Clobbers: A X Y T0
 ; =============================================================================
 DO_READ:
-RD_var: JSR WPEEK_UC         ; peek at next IP token (uppercased)
+RD_var: LDA (IP)             ; peek at next IP token
         CMP #'A'
         BCC RD_sn
         CMP #'Z'+1
@@ -2256,7 +2368,7 @@ RD_var: JSR WPEEK_UC         ; peek at next IP token (uppercased)
         BCS RD_od
         PLX
         JSR STORE_VAR
-        JSR WPEEK            ; check for ', var' continuation
+        LDA (IP)            ; check for ', var' continuation
         CMP #','
         BNE RD_var_done
         JSR GETCI            ; consume ','
@@ -2367,11 +2479,37 @@ RD_readnum:
 ; =============================================================================
 ; GOTOL ? search program store for a line number; point IP at its body
 ;   In:  T0   target line number (16-bit)
+;        RUN/CURLN/IP  current program position (used only when RUN != 0)
 ;   Out: C=0  found: IP points at first token after the 2-byte header
 ;        C=1  not found (caller should raise ERR_UL)
 ;   Clobbers: A X Y IP
+;
+;   FAST PATH (v15.30): the search used to ALWAYS start at PROG and walk every
+;   line before the target (~6 instr per program byte). Lines are stored in
+;   ascending order, so while a program is running and the target line number
+;   is GREATER than CURLN the target lies AHEAD of IP: skip the rest of the
+;   current line (TOKSKIP_IP from Y=0) and scan forward from there. Typical
+;   GOSUB to a subroutine a few lines down now costs a handful of lines, not
+;   the whole program prefix.
+;   Backward or same-line targets (T0 <= CURLN) and immediate mode (RUN=0, where
+;   IP/CURLN are not a program position) start fresh from PROG as before.
+;   Safety net: CURLN is not restored by RETURN (it can be stale after a GOSUB
+;   inside the same line). If the forward scan runs off the end without
+;   finding T0 it falls back to a fresh scan from PROG, so a stale CURLN can
+;   only cost time, never a wrong target or a false UL ERR.
 ; =============================================================================
 GOTOL:
+        BBR #0,RUN,GT_fresh  ; immediate mode: no valid program position
+        LDA CURLN            ; 16-bit CURLN - T0: borrow (C=0) iff CURLN < T0,
+        CMP T0               ;  i.e. target strictly ahead of the current line
+        LDA CURLN+1
+        SBC T0+1
+        BCS GT_fresh         ; target is this line or behind us: fresh scan
+        LDY #0               ; fast path: skip rest of current line...
+        JSR GT_sk            ;  ...then scan forward (returns C=0 found / C=1 off the end)
+        BCS GT_fresh         ; off the end: CURLN was stale, retry from PROG
+        RTS                  ; C=0: found (IP already past the header)
+GT_fresh:
         JSR PROG2IP
 GT_sc:  LDX #IP
         LDY #PE
@@ -2385,7 +2523,7 @@ GT_go:  LDA (IP)             ; line-number lo  (65C02 zp-indirect, no Y needed)
         CMP T0+1
         BEQ GT_ok
 GT_nx:  LDY #2               ; skip to body, scan for $0D
-        JSR TOKSKIP_IP
+GT_sk:  JSR TOKSKIP_IP       ; (fast path enters here with Y=0: IP is mid-line)
         TYA
         CLC
         ADC IP
@@ -2432,7 +2570,7 @@ EXPECT_LPAREN: LDA #'('
 ; =============================================================================
 EXPECT:
         STA T2                ; stash expected char (WPEEK's result also -> A)
-        JSR WPEEK              ; peek only -- IP unchanged either way
+        LDA (IP)              ; peek only -- IP unchanged either way
         CMP T2
         BNE EXPECT_sn
         JSR GETCI                ; matched: consume it for real
@@ -2456,7 +2594,7 @@ EXPECT_sn:
 ; =============================================================================
 EXPR:
         JSR EXPR_ADD
-        JSR WPEEK
+        LDA (IP)
         CMP #'='
         BEQ EB_rel
         CMP #'<'
@@ -2556,7 +2694,7 @@ REL_F:
         RTS		      
 
 EB_bool:                     ; boolean/bitwise operator loop
-        JSR WPEEK
+        LDA (IP)
         CMP #TOK_AND
         BEQ EB_and
         CMP #TOK_OR
@@ -2617,7 +2755,7 @@ EB_O:   ORA T0,X
 ; =============================================================================
 EXPR_ADD:
         JSR EXPR1
-EA_lp:  JSR WPEEK
+EA_lp:  LDA (IP)
         CMP #'+'
         BEQ EA_do
         CMP #'-'
@@ -2651,7 +2789,7 @@ EA_sum:
 ; =============================================================================
 EXPR1:
         JSR EXPR_POW
-E1_lp:  JSR WPEEK
+E1_lp:  LDA (IP)
         CMP #'*'
         BEQ E1_md
         CMP #'/'
@@ -2688,9 +2826,8 @@ E1_md:  PHA                  ; stash operator on hw stack (survives recursion --
 E1_divchk:
         LDA T0               ; divisor zero?
         ORA T0+1
-        BEQ E1_divchk_ovfl   ; zero: divide by zero error (in BEQ range: 5B ahead)
-        BRA E1_nochk         ; non-zero: safe (skip inline error)
-E1_divchk_ovfl:              ; shared ERR_OV stub: EP_ovfl in EXPR_POW, below
+        BNE E1_nochk         ; non-zero: safe (v15.30: inverted branch saves the BRA)
+E1_divchk_ovfl:              ; zero: shared ERR_OV stub: EP_ovfl in EXPR_POW, below
         JMP EP_ovfl
 
 E1_mod_result:
@@ -2786,13 +2923,35 @@ E1_sh_pre:
 ; MUL16_u -- unsigned 16-bit multiply (standalone, self-contained)
 ;   In:  T0, T1  (both consumed as scratch during the shift-add)
 ;   Out: T2 = T0 * T1, truncated mod 65536;  T0, T1 left in an undefined state
-;   Clobbers: A X Y T0 T1 T2
+;   Clobbers: A X T0 T1 T2
 ;   Callers: EXPR1 (signed '*' wrapper does sign handling); EXPR_POW
+;
+;   FAST PATH (v15.30): shift-add costs one loop pass per significant bit of
+;   the MULTIPLIER (T1), so
+;     (1) the product is commutative (low 16 bits are identical either way
+;         round), so first swap the operands if needed to make T1 the SMALLER
+;         one: A*3 now loops 2 times instead of ~14 for A=12345;
+;     (2) the loop ends as soon as the multiplier is exhausted (T1 = 0)
+;         instead of always running 16 passes. X=I*7 -> 3 passes, not 16.
+;   (Was: fixed 16 passes with a LDY counter.)
 ; =============================================================================
 MUL16_u:
-        STZ T2               ; clear accumulator
+        LDA T1+1             ; unsigned T1 vs T0: if T1 >= T0 swap so T1 is the smaller
+        CMP T0+1
+        BNE MU_cmp
+        LDA T1
+        CMP T0
+MU_cmp: BCC MU_go            ; T1 < T0: already the smaller
+        LDA T0               ; swap T0 <-> T1
+        LDX T1
+        STX T0
+        STA T1
+        LDA T0+1
+        LDX T1+1
+        STX T0+1
+        STA T1+1
+MU_go:  STZ T2               ; clear accumulator
         STZ T2+1
-        LDY #16              ; 16-bit iteration count
 MU_lp:  LSR T1+1
         ROR T1
         BCC MU_ms
@@ -2800,7 +2959,8 @@ MU_lp:  LSR T1+1
         JSR ADDT0_TO
 MU_ms:  ASL T0
         ROL T0+1
-        DEY
+        LDA T1               ; multiplier exhausted? (early exit)
+        ORA T1+1
         BNE MU_lp
         RTS
 
@@ -2811,11 +2971,31 @@ MU_ms:  ASL T0
 ;   Clobbers: A X Y T1 T2
 ;   Callers: EXPR1 (signed */,%,MOD wrapper does sign handling); SC_GO
 ;            (SIN/COS angle-mod-360 reduction)
+;
+;   FAST PATH (v15.30): long division processes the dividend MSB first, so if
+;   the dividend's HIGH byte is already smaller than the divisor, the first 8
+;   passes would only shift that byte into the remainder and produce 8 zero
+;   quotient bits. Skip them: preload remainder = T1 hi, move T1 lo up into the
+;   shifter and run 8 passes instead of 16. This covers every divisor >= 256
+;   and every dividend < 256 (e.g. A/7 for A<256, I MOD 10); roughly halves
+;   the cost. (Was: always 16 passes.)  Result registers are identical: T1
+;   ends with hi = 0 because the pre-shifted byte is fully consumed.
 ; =============================================================================
 DIV_KERN:
-        STZ T2
+        STZ T2               ; remainder = 0 (full path)
         STZ T2+1
         LDY #16
+        LDA T0+1
+        BNE DK_pre           ; divisor >= 256: quotient < 256, take the fast path
+        LDA T1+1
+        CMP T0               ; divisor < 256: fast path iff dividend hi < divisor
+        BCS DK_lp            ; no: full 16 passes
+DK_pre: LDY #8               ; 8 passes
+        LDA T1+1
+        STA T2               ; remainder = dividend hi (already < divisor)
+        LDA T1
+        STA T1+1             ; dividend lo moves into the shifter's top byte
+        STZ T1               ; quotient accumulator
 DK_lp:  ASL T1
         ROL T1+1
         ROL T2
@@ -2894,7 +3074,7 @@ E2_pos: JSR GETCI            ; unary plus: no-op
 ; =============================================================================
 E2_grp: JSR GETCI            ; consume '('
         JSR EXPR             ; evaluate inner expression
-        JMP WEAT              ; consume ')' and return (tail call, out of BRA range)
+        JMP GETCI             ; consume ')' and return (tail call, out of BRA range)
 
 ; =============================================================================
 ; EXPR_POW -- Tier 3.5: power (^)
@@ -2911,7 +3091,7 @@ E2_grp: JSR GETCI            ; consume '('
 ; =============================================================================
 EXPR_POW:
         JSR EXPR2               ; base -> T0
-EP_lp:  JSR WPEEK
+EP_lp:  LDA (IP)
         CMP #'^'
         BEQ EP_have
         RTS                     ; not '^': loop exit (EP_have is close, no JMP needed)
@@ -3022,15 +3202,60 @@ EP_sign:
 EP_done:
         JMP EP_lp                ; loop back for chained ^ (left-associative)
 
+; =============================================================================
+; PNUM ? consume an inline $FF/$FE lo hi number token at IP, place value in T0
+;   In:  IP   points at the marker byte ($FF TOK_NUM or $FE TOK_HEX)
+;   Out: T0   16-bit value  (little-endian)
+;        IP   advanced past the 3-byte marker lo hi sequence
+;   Clobbers: A Y
+;   v15.30: reads lo/hi with (IP),Y and bumps IP once by 3 (was WEAT + 2 x GETCI,
+;   ~100 cycles per number literal; now ~40). Placed directly above EXPR2 so
+;   EXPR2's literal test can reach it with a short BCS.
+; =============================================================================
+PNUM:   LDY #1
+        LDA (IP),y           ; lo byte
+        STA T0
+        INY
+        LDA (IP),y           ; hi byte
+        STA T0+1
+        LDA IP               ; IP += 3
+        CLC
+        ADC #3
+        STA IP
+        BCC PN_dn
+        INC IP+1
+PN_dn:  RTS
+
+;   v15.30: number literals and variables -- by far the commonest atoms -- are
+;   now tested FIRST (they used to be the last two of ~8 compares, then went
+;   through PNUM's WEAT/GETCI chain and PARSE_VAR/WPEEK_UC/GETVARC, ~150
+;   cycles per variable). The variable case is fully inline: token-stream
+;   letters are always upper case (TOKENIZE UCs them), so no UC is needed.
+;   In:  IP -> atom;  Out: T0 = value, IP advanced;  Clobbers: A X Y T1 T2
 EXPR2:
-        JSR WPEEK
+        LDA (IP)
+        CMP #TOK_HEX         ; $FE/$FF: dec or hex literal
+        BCS PNUM
+        SEC
+        SBC #'A'
+        CMP #26              ; 0-25: variable letter
+        BCS EXPR2_nv
+        ASL                  ; byte offset into VARS
+        TAX
+        LDA VARS,x
+        STA T0
+        LDA VARS+1,x
+        STA T0+1
+        JMP INC_IP           ; consume the letter and return
+EXPR2_nv:
+        LDA (IP)             ; reload the byte (the range test above consumed A)
         CMP #'('
         BNE EXPR2_ng
         JMP E2_grp
 EXPR2_ng:
         CMP #'-'
         BNE EXPR2_ng2
-        JMP E2_neg
+        BRA E2_neg
 EXPR2_ng2:
         CMP #'+'
         BNE EXPR2_np
@@ -3041,12 +3266,8 @@ EXPR2_np:
         BRA E2_not
 EXPR2_np2:
         CMP #TOK_SGN
-        BNE EXPR2_np3
-        JMP E2_sgn
-EXPR2_np3:
-        CMP #TOK_HEX          ; dec or hex literal, v15.20
-        BCC EXPR2_t1
-        BRA PNUM
+        BNE EXPR2_t1
+        BRA E2_sgn
 
 ; =============================================================================
 ; EXPR2_t1 -- Group A/B function tokens: table-dispatched (v15.17, extended v15.19)
@@ -3066,16 +3287,20 @@ EXPR2_np3:
 EXPR2_t1:
         CMP #TOK_RND          ; FUNC_LO
         BCS EXPR2_t1a         ; in range (>= FUNC_LO): continue below
-        JMP EXPR2_tvar        ; below range: not a function token, try as variable
+; E2_bad ? below range: not an atom at all (variables/numbers were handled at the
+;   top of EXPR2) -> return 0 without consuming anything.   Clobbers: T0
+E2_bad: STZ T0
+        STZ T0+1
+        RTS
 EXPR2_t1a:
         BNE EXPR2_t1b          ; != FUNC_LO: not RND, continue below
         JMP E2_rnd              ; == FUNC_LO: RND (0-arg, no parens)
 EXPR2_t1b:
-        CMP #TOK_SHL           ; upper bound: TOK_SHL/TOK_SHR are not function
-        BCC EXPR2_t1c            ; tokens -- reject before the table jump below
+        CMP #TOK_FEND          ; upper bound: the $AC placeholder, TOK_SHL/TOK_SHR
+        BCC EXPR2_t1c            ; are not function tokens -- reject before the table jump
         JMP RD_sn
 EXPR2_t1c:
-        ; else: TOK_ABS..TOK_DPEEK -- consume token + eat '(' expr ')' into T0
+        ; else: TOK_ABS..TOK_ACOS -- consume token + eat '(' expr ')' into T0
         ; centrally (was done per-handler via each's own JSR E2_chrs), then
         ; index into FUNC_JT (word index = (token - TOK_ABS) * 2).
         SEC
@@ -3087,7 +3312,7 @@ EXPR2_t1c:
         JMP (FUNC_JT,X)        ; 65C02 absolute indexed indirect
 
 FUNC_JT:
-        .DW E2_abs, E2_peek, E2_usr, E2_sin, E2_cos, E2_asin, E2_acos, E2_dpeek  ; TOK_ABS..TOK_DPEEK ($A5-$AC)
+        .DW E2_abs, E2_peek, E2_usr, E2_sin, E2_cos, E2_asin, E2_acos  ; TOK_ABS..TOK_ACOS ($A5-$AB)
 
 ; =============================================================================
 ; E2_PEEK ? PEEK(addr): read one byte from memory address  ?  0..255
@@ -3098,20 +3323,6 @@ E2_peek:
         LDA (T0)             ; 65C02 zp-indirect: read memory at addr
         STA T0
         STZ T0+1
-        RTS
-
-; =============================================================================
-; E2_DPEEK ? DPEEK(addr): read a 16-bit value from memory address (lo,hi)
-;   In:  T0 = address (consumed centrally by EXPR2_t1 dispatcher)
-;   Clobbers: A X Y T0
-; =============================================================================
-E2_dpeek:
-        LDY #1
-        LDA (T0),Y            ; hi byte at addr+1
-        TAX
-        LDA (T0)              ; lo byte at addr
-        STA T0
-        STX T0+1
         RTS
 
 ; =============================================================================
@@ -3134,15 +3345,10 @@ E2_chrs:
 ; =============================================================================
 E2_ARG1:
         JSR EXPECT_LPAREN     ; require '(', then evaluate argument
-        ; drop through
-; =============================================================================
-; WEAT ? skip whitespace, consume (eat) the next byte
-;   In:  IP   token stream pointer
-;   Out: A    the consumed byte;  IP  advanced one past the first non-space
-;   Clobbers: None.
-; =============================================================================
-WEAT:   JSR WPEEK
-        JMP GETCI            ; consume the non-space byte and return  (tail call)
+        JMP GETCI             ; consume the closing ')' and return (tail call)
+                              ; (v15.30: was WEAT = WPEEK + GETCI; the token stream
+                              ;  never holds a raw space outside strings/REM, so the
+                              ;  whitespace skip is gone and WEAT with it)
 
 ; --- atom handlers (placed here so preamble BEQs above are in range) ---
 
@@ -3150,8 +3356,8 @@ WEAT:   JSR WPEEK
 ; then recurse straight into EXPR2 for the operand -- do NOT route through
 ; E2_chrs/E2_ARG1, which assumes a following '(' and would eat one byte
 ; of the operand instead (this was a real bug: "NOT 0;X" truncated the
-; rest of the statement because E2_ARG1's WEAT ate the operand's leading
-; byte). Mirrors E2_neg's shape exactly.
+; rest of the statement because E2_ARG1's closing-paren eat took the operand's
+; leading byte). Mirrors E2_neg's shape exactly.
 E2_not: JSR GETCI    ; consume NOT token
         JSR EXPR2    ; evaluate operand directly (no paren expected)
         ; NOT x  ==  -(x+1); reuse NEG16 instead of a fresh EOR #$FF pair
@@ -3162,18 +3368,6 @@ E2_not_sk:
         BRA N16TRAMP  ; tail call: negate (shared trampoline, see E2_neg/E2_abs)
 
 ; =============================================================================
-; PNUM ? consume an inline $FF lo hi number token from IP, place value in T0
-;   In:  IP   points at $FF token  (or whitespace before it)
-;   Out: T0   16-bit value  (little-endian)
-;        IP   advanced past the 3-byte $FF lo hi sequence
-;   Clobbers: A
-; =============================================================================
-PNUM:   JSR WEAT             ; skip whitespace, consume $FF token
-        JSR GETCI            ; fetch lo byte and advance IP
-        STA T0
-        JSR GETCI            ; fetch hi byte and advance IP
-        STA T0+1
-        RTS
 
 E2_neg: JSR GETCI            ; unary minus
         JSR EXPR2
@@ -3691,24 +3885,6 @@ CMP_T0_LP:
 CMP_T0_LP_ne:
         RTS
 
-; =============================================================================
-; EXPR2_tvar ? variable or unrecognised atom (BRA from dispatch above)
-;   Clobbers: A X T0
-; =============================================================================
-EXPR2_tvar:
-        JSR PARSE_VAR        ; harmless redundant WPEEK_UC re-peek (IP unmoved so far)
-        BCC ET_ok            ; C=0: matched
-;        JMP E2_bad           ; C=1: no match (E2_bad too far for BCS)
-E2_bad: STZ T0               ; unrecognised atom: return 0
-        STZ T0+1
-        RTS   
-
-ET_ok:  TAX
-        LDA VARS,x
-        STA T0
-        LDA VARS+1,x
-        STA T0+1
-        RTS
 
 ; =============================================================================
 ; DO_LET ? LET var = expr  (or implicit assignment without LET keyword)
@@ -3718,7 +3894,7 @@ ET_ok:  TAX
 ;   Clobbers: A X T0 T1 T2
 ; =============================================================================
 DO_LET:
-        JSR WPEEK
+        LDA (IP)
         CMP #TOK_LET
         BNE DO_let_var
         JSR GETCI            ; consume optional LET keyword
@@ -3726,7 +3902,7 @@ DO_let_var:
         JSR PARSE_VAR
         BCS DO_let_dn
         PHA                  ; save var slot
-        JSR WPEEK
+        LDA (IP)
         CMP #'='
         BNE DO_let_pop
         JSR GETCI            ; consume '='
@@ -3869,12 +4045,12 @@ SKST_adv:
 ;   Clobbers: A
 ; =============================================================================
 PARSE_VAR:
-        JSR WPEEK_UC
-        CMP #'A'
-        BCC PV_fail
-        CMP #'Z'+1
-        BCS PV_fail
-        JSR GETVARC
+        LDA (IP)             ; token-stream letters are always upper case (TOKENIZE UCs them)
+        SEC
+        SBC #'A'
+        CMP #26              ; 0-25 = valid letter
+        BCS PV_fail          ; C=1 on this path too
+        JSR INC_IP           ; consume the letter (A and C unaffected... INC_IP only touches flags Z/N)
         ASL                  ; x2: byte offset into VARS
 SKST_colon:
         CLC
@@ -3885,39 +4061,22 @@ PV_fail:
         RTS
 
 ; =============================================================================
-; WPEEK_UC ? skip whitespace, peek next byte, uppercase it
-;   In:  IP   token stream pointer
-;   Out: A    first non-space byte, uppercased;  IP  unchanged
-;   Clobbers: None.
-;
 ; UC ? convert A to uppercase if it is a lowercase ASCII letter
 ;   In:  A    any byte
 ;   Out: A    uppercased (a-z ? A-Z); all other bytes unchanged
 ;   Clobbers: None.  (flags are affected)
+;   (v15.30: WPEEK/WPEEK_UC/WEAT are gone. The old WPEEK skipped raw spaces
+;    before every token peek, but TOKENIZE strips every space outside string
+;    literals and REM bodies, so the token stream never holds one at a token
+;    boundary: every former "JSR WPEEK" is now a plain "LDA (IP)".)
 ; =============================================================================
-WPEEK_UC:
-        JSR WPEEK
 UC:     CMP #'a'
         BCC UC_d
         CMP #'z'+1
         BCS UC_d
         AND #$DF
-WPEEK_d:
-SKIPEOL_d:
 UC_d:   RTS
 
-; =============================================================================
-; WPEEK ? skip whitespace, peek at next non-space byte (do not consume it)
-;   In:  IP   token stream pointer
-;   Out: A    first non-space byte at or after (IP);  IP  unchanged
-;   Clobbers: None.
-; =============================================================================
-WPEEK:  LDA (IP)             ; 65C02: PEEKC inlined for speed
-        CMP #' '
-        BNE WPEEK_d
-        JSR GETCI
-        BRA WPEEK
-        
 ; -----------------------------------------------------------------------------
 ; TOKSKIP_LP/IP ? scan (LP),Y for $0D, skipping TOK_NUM payloads
 ;   In:  Y   starting offset (caller sets it, e.g. LDY #2 to skip a header)
