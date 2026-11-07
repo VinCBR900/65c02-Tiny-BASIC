@@ -1,5 +1,5 @@
 ; =============================================================================
-; 4K Integer BASIC v15.30 for the 65C02
+; 4K Integer BASIC v15.31 for the 65C02
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -88,14 +88,21 @@
 ;   (a stale line number only costs a slower, from-the-start search).
 ;
 ; A backward GOTO/GOSUB (target line <= the current line) still searches from the
-;   start of the program; forward targets search ahead from the current line.
+;   start of the program; forward targets search ahead from the current line. Since
+;   v15.31 either search hops from line to line by the stored length byte (one hop per
+;   line, not one step per byte), so a long program costs lines, not bytes.
+;
+; Stored line format is <lo> <hi> <len> <tokens> $00 (v15.31). <len> is one byte (the
+;   whole record, header and NUL included), so a stored line is at most 255 bytes. The
+;   40-character input limit keeps a tokenised line (a 1-digit number costs 3 bytes) at
+;   about 90 bytes at most, so this cannot be reached from the keyboard.
 ;
 ; PRINT; (semicolon immediately after PRINT, no item) evaluates an empty expression
 ;   and prints 0; bare PRINT, PRINT: and PRINT ELSE print a blank line.
 ;
 ; DPEEK/DPOKE (v15.29) were removed in v15.30 to make room for the speed paths.
 ;
-; Input buffer is 41 bytes (40 usable chars + CR terminator). Each keypress
+; Input buffer is 41 bytes (40 usable chars + NUL terminator). Each keypress
 ;   past the limit sounds BELL and is discarded outright -- not stored, not
 ;   echoed, buffer position does not advance.
 ;
@@ -124,6 +131,41 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ;
+; v15.31 (Nov 2026) - 108 bytes free (confirmed by build at $F000) - LINE FORMAT + SIZE PASS
+;   Program lines are now stored as   <lo> <hi> <len> <tokens...> $00   (was <lo> <hi> <tokens...> $0D)
+;   - NUL line ends: every scanner tests for zero instead of comparing with $0D, and TBUF/IBUF are
+;     NUL-terminated too. Saved 56 bytes before anything else was touched.
+;   - <len> = length of the whole record (3-byte header + tokens + NUL). Everything that moves from
+;     line to line now hops by it instead of scanning the body: GOTO/GOSUB search (forward and
+;     backward), DELINE, the EDITLN insertion-point search, LIST (lines below the range) and the
+;     DATA/READ line search. TOKSKIP_LP is gone (TOKSKIP_IP remains for REM, the mid-line start of
+;     a forward GOTO search, and INSLINE). INSLINE writes <len> and now copies TBUF straight to
+;     the store with one shared index.
+;   - RUN still executes the tokens where they sit in the program store (no copy); RD_CURLN/GT_ok
+;     just skip a 3-byte header instead of 2. Immediate-mode lines still run from TBUF.
+;   Speed, simulator instructions per iteration, v15.30 -> v15.31:
+;     backward GOTO (40-line program) 8973 -> 1283 (-86%)   forward GOTO 9446 -> 1748 (-82%)
+;     GOSUB 20 lines ahead 696 -> 627 (-10%)                everything else -0.2 .. -0.6%
+;   Size, non-RUN path (net 107 bytes: 1 -> 108 free):
+;   - NUL ends (-56). TRYKW rewritten as one pass over KW_TABLE (-24; note a keyword table entry
+;     can no longer contain a source char >= $80). Tokenizer saves a call via PHA/PLA (-3).
+;   - DELINE rewritten as a forward copy that stops when the source pointer reaches PE (-25).
+;   - Length byte: EDITLN/DELINE/GOTOL/LIST/DATA hops replace TOKSKIP_LP and the DATA/LIST body
+;     scanners (-4 net after INSLINE and the IPADD3/LPADD3/DATAPTRADD3 header skips).
+;   Fixes (all pre-existing):
+;   - After RUN ended, IP was left at PE, so a stale ':' left in free RAM by an earlier, longer
+;     program executed as a statement ("10 REM A" printed an extra line after a longer program);
+;     likewise "END: PRINT 2" ran the PRINT after the END. RUNEND/DO_END now park IP on a NUL (+4).
+;   - An unterminated string in PRINT consumed the end-of-line byte and ran on into the next
+;     line (or past the program). DP_str peeks for the terminator first (+1).
+;   Showcase: version text only; lines 71-81 (backward/forward GOTO, DATA/READ via line 110) and the
+;     Mandelbrot/vortex subroutines already exercise every length-byte hop. Image is 99 bytes bigger
+;     (one <len> per line); it lives in RAM at $0200 and costs no ROM.
+;   Regression: 15 of 17 scripts byte-identical to v15.30 output (includes new edit/LIST/DATA
+;     and keyword round-trip scripts); the other two (edit, malformed-EOL) differ only where
+;     v15.30 mis-handled an unterminated PRINT string and skipped or ran past a line.
+;     Showcase RUN/LIST output identical.
+
 ; v15.30 (Nov 2026) - 1 byte free (confirmed by build) - EXECUTION SPEED + FIXES
 ;   Measured as simulator instructions per iteration, v15.29 -> v15.30:
 ;     FOR/NEXT loop + one assignment  705 -> 344 (-51%)   expression-heavy  1762 -> 946 (-46%)
@@ -382,10 +424,15 @@
 ; Token stream format  (TBUF / program store):
 ;   Keywords    $80-$A5  (single byte)
 ;   Numbers     $FF <lo> <hi>  (3 bytes, little-endian)
+;   Hex numbers $FE <lo> <hi>
 ;   Strings     passed through as-is, including surrounding quotes
-;   End-of-line $0D followed by $00 sentinel
-; Program storage line format:
-;   <lineno_lo> <lineno_hi> <tokenised_body> $0D
+;   End-of-line $00 (NUL). Number payload bytes may be $00 too, so every scanner
+;               skips the two payload bytes after $FE/$FF and never tests them.
+;   TBUF holds  $FF <lo> <hi> <tokenised_body> $00  for the line being entered.
+; Program storage line format (v15.31):
+;   <lineno_lo> <lineno_hi> <len> <tokenised_body> $00
+;   <len> = total record length in bytes (3 header + body + NUL); next line = this line + <len>.
+;   Records are packed back to back from PROG up to PE.
 
 ; =============================================================================
 ; ---- compile-time constants --------------------------------------------------
@@ -573,105 +620,105 @@ ZPEND    = *                    ; audit
 ;   Called as a GOSUB at line 600; uses IF/THEN/ELSE for pixel output.
 ; =============================================================================
         .ORG $0200
-        .DB $0A, $00, $89, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $33, $30, $20, $53, $48, $4F, $57, $43, $41, $53, $45, $0D  ; 10 REM 4K BASIC v15.30 SHOWCASE
-        .DB $14, $00, $80, $22, $3D, $3D, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $33, $30, $20, $3D, $3D, $22, $0D  ; 20 PRINT "== 4K BASIC v15.30 =="
-        .DB $1E, $00, $80, $22, $43, $48, $52, $22, $3B, $98, $28, $FF, $24, $00, $29, $3B, $22, $28, $36, $35, $29, $3D, $22, $3B, $98, $28, $FF, $41, $00, $29, $0D  ; 30 PRINT "CHR";CHR$ (36 );"(65)=";CHR$ (65 )
-        .DB $28, $00, $80, $22, $31, $37, $20, $4D, $4F, $44, $20, $35, $3D, $22, $3B, $FF, $11, $00, $A1, $FF, $05, $00, $3B, $22, $20, $20, $41, $42, $53, $20, $6E, $65, $67, $37, $3D, $22, $3B, $A5, $28, $2D, $FF, $07, $00, $29, $0D  ; 40 PRINT "17 MOD 5=";17 MOD 5 ;"  ABS neg7=";ABS (-7 )
-        .DB $32, $00, $80, $22, $4E, $4F, $54, $20, $30, $3D, $22, $3B, $9C, $FF, $00, $00, $3B, $22, $20, $20, $36, $20, $41, $4E, $44, $20, $33, $3D, $22, $3B, $FF, $06, $00, $9A, $FF, $03, $00, $0D  ; 50 PRINT "NOT 0=";NOT 0 ;"  6 AND 3=";6 AND 3 
-        .DB $3C, $00, $80, $22, $35, $20, $4F, $52, $20, $32, $3D, $22, $3B, $FF, $05, $00, $9B, $FF, $02, $00, $3B, $22, $20, $20, $37, $20, $58, $4F, $52, $20, $33, $3D, $22, $3B, $FF, $07, $00, $9D, $FF, $03, $00, $0D  ; 60 PRINT "5 OR 2=";5 OR 2 ;"  7 XOR 3=";7 XOR 3 
-        .DB $41, $00, $80, $22, $53, $47, $4E, $28, $2D, $35, $29, $3D, $22, $3B, $A3, $28, $2D, $FF, $05, $00, $29, $3B, $22, $20, $20, $31, $20, $53, $48, $4C, $20, $34, $3D, $22, $3B, $FF, $01, $00, $AD, $FF, $04, $00, $0D  ; 65 PRINT "SGN(-5)=";SGN (-5 );"  1 SHL 4=";1 SHL 4
-        .DB $42, $00, $80, $22, $2D, $31, $36, $20, $53, $48, $52, $20, $32, $3D, $22, $3B, $2D, $FF, $10, $00, $AE, $FF, $02, $00, $3B, $22, $20, $20, $48, $45, $58, $24, $28, $32, $35, $35, $29, $3D, $22, $3B, $A2, $28, $FF, $FF, $00, $29, $0D  ; 66 PRINT "-16 SHR 2=";-16 SHR 2;"  HEX$(255)=";HEX$ (255 )
-        .DB $43, $00, $80, $22, $35, $3C, $31, $30, $3D, $22, $3B, $FF, $05, $00, $3C, $FF, $0A, $00, $3B, $22, $20, $20, $35, $3C, $3E, $33, $3D, $22, $3B, $FF, $05, $00, $3C, $3E, $FF, $03, $00, $0D  ; 67 PRINT "5<10=";5<10;"  5<>3=";5<>3
-        .DB $44, $00, $80, $22, $33, $3C, $3D, $33, $3D, $22, $3B, $FF, $03, $00, $3C, $3D, $FF, $03, $00, $3B, $22, $20, $20, $35, $3E, $3D, $36, $3D, $22, $3B, $FF, $05, $00, $3E, $3D, $FF, $06, $00, $0D  ; 68 PRINT "3<=3=";3<=3;"  5>=6=";5>=6
-        .DB $46, $00, $80, $22, $52, $4E, $44, $20, $4D, $4F, $44, $20, $31, $30, $3D, $22, $3B, $A4, $A1, $FF, $0A, $00, $0D  ; 70 PRINT "RND MOD 10=";RND MOD 10 
-        .DB $47, $00, $80, $22, $4D, $55, $4C, $20, $31, $32, $2A, $2D, $37, $3D, $22, $3B, $FF, $0C, $00, $2A, $28, $2D, $FF, $07, $00, $29, $3B, $22, $20, $33, $2A, $33, $30, $30, $3D, $22, $3B, $FF, $03, $00, $2A, $FF, $2C, $01, $3B, $22, $20, $32, $35, $30, $2A, $32, $35, $31, $3D, $22, $3B, $FF, $FA, $00, $2A, $FF, $FB, $00, $0D  ; 71 PRINT "MUL 12*-7=";12*(-7);" 3*300=";3*300;" 250*251=";250*251
-        .DB $48, $00, $80, $22, $44, $49, $56, $20, $2D, $33, $30, $30, $2F, $37, $3D, $22, $3B, $2D, $FF, $2C, $01, $2F, $FF, $07, $00, $3B, $22, $20, $33, $30, $30, $30, $30, $2F, $33, $30, $30, $3D, $22, $3B, $FF, $30, $75, $2F, $FF, $2C, $01, $3B, $22, $20, $33, $30, $30, $20, $4D, $4F, $44, $20, $2D, $37, $3D, $22, $3B, $FF, $2C, $01, $A1, $28, $2D, $FF, $07, $00, $29, $0D  ; 72 PRINT "DIV -300/7=";-300/7;" 30000/300=";30000/300;" 300 MOD -7=";300 MOD (-7)
-        .DB $49, $00, $8B, $49, $3D, $FF, $01, $00, $97, $FF, $02, $00, $3A, $8B, $4A, $3D, $FF, $01, $00, $97, $FF, $03, $00, $0D  ; 73 FOR I=1 TO 2: FOR J=1 TO 3
-        .DB $4A, $00, $80, $49, $2A, $4A, $3B, $0D  ; 74 PRINT I*J;
-        .DB $4B, $00, $8C, $4A, $3A, $8C, $49, $0D  ; 75 NEXT J: NEXT I
-        .DB $4C, $00, $80, $3A, $80, $22, $43, $48, $41, $49, $4E, $45, $44, $20, $46, $4F, $52, $20, $4F, $4B, $22, $3A, $82, $FF, $4E, $00, $0D  ; 76 PRINT: PRINT "CHAINED FOR OK": GOTO 78
-        .DB $4D, $00, $80, $22, $42, $41, $44, $20, $46, $57, $44, $20, $47, $4F, $54, $4F, $22, $0D  ; 77 PRINT "BAD FWD GOTO"
-        .DB $4E, $00, $89, $3A, $50, $52, $49, $4E, $54, $20, $22, $42, $41, $44, $20, $52, $45, $4D, $22, $0D  ; 78 REM:PRINT "BAD REM"
-        .DB $4F, $00, $51, $3D, $51, $2B, $FF, $01, $00, $3A, $81, $51, $3C, $FF, $03, $00, $9F, $82, $FF, $4F, $00, $0D  ; 79 Q=Q+1: IF Q<3 THEN GOTO 79
-        .DB $50, $00, $8E, $FE, $FF, $00, $2C, $FF, $2A, $00, $3A, $80, $22, $50, $4F, $4B, $45, $3D, $22, $3B, $A6, $28, $FE, $FF, $00, $29, $0D  ; 80 POKE $00FF ,42 :PRINT "POKE=";PEEK ($00FF )
-        .DB $51, $00, $80, $22, $42, $41, $43, $4B, $20, $47, $4F, $54, $4F, $2C, $20, $46, $57, $44, $20, $47, $4F, $54, $4F, $2C, $20, $52, $45, $4D, $3A, $20, $4F, $4B, $20, $22, $3B, $51, $0D  ; 81 PRINT "BACK GOTO, FWD GOTO, REM: OK ";Q
-        .DB $5A, $00, $93, $41, $2C, $42, $2C, $43, $3A, $80, $22, $44, $41, $54, $41, $20, $20, $22, $3B, $41, $3B, $22, $20, $20, $22, $3B, $42, $3B, $22, $20, $20, $22, $3B, $43, $0D  ; 90 READ A,B,C:PRINT "DATA  ";A;"  ";B;"  ";C
-        .DB $64, $00, $94, $3A, $93, $41, $3A, $80, $22, $52, $45, $53, $54, $4F, $52, $45, $20, $41, $3D, $22, $3B, $41, $0D  ; 100 RESTORE :READ A:PRINT "RESTORE A=";A
-        .DB $6E, $00, $92, $FF, $6F, $00, $2C, $FF, $DE, $00, $2C, $FF, $4D, $01, $0D  ; 110 DATA 111,222,333  (v15.30: tokenised -- was raw ASCII, so READ returned garbage)
-        .DB $78, $00, $8B, $49, $3D, $FF, $01, $00, $97, $FF, $05, $00, $0D  ; 120 FOR I=1 TO 5 
-        .DB $82, $00, $80, $49, $3B, $0D  ; 130 PRINT I;
-        .DB $8C, $00, $8C, $49, $0D  ; 140 NEXT I
-        .DB $96, $00, $80, $0D  ; 150 PRINT 
-        .DB $A0, $00, $8B, $49, $3D, $FF, $0A, $00, $97, $FF, $01, $00, $96, $2D, $FF, $03, $00, $0D  ; 160 FOR I=10 TO 1 STEP -3 
-        .DB $AA, $00, $80, $49, $3B, $0D  ; 170 PRINT I;
-        .DB $B4, $00, $8C, $49, $0D  ; 180 NEXT I
-        .DB $BE, $00, $80, $0D  ; 190 PRINT 
-        .DB $C8, $00, $81, $FF, $03, $00, $3E, $FF, $01, $00, $9F, $80, $22, $49, $46, $20, $74, $72, $75, $65, $22, $0D  ; 200 IF 3 >1 THEN PRINT "IF true"
-        .DB $D2, $00, $81, $FF, $01, $00, $3E, $FF, $03, $00, $9F, $80, $22, $57, $52, $4F, $4E, $47, $22, $95, $80, $22, $45, $4C, $53, $45, $20, $6F, $6B, $22, $0D  ; 210 IF 1 >3 THEN PRINT "WRONG"ELSE PRINT "ELSE ok"
-        .DB $DC, $00, $83, $FF, $F4, $01, $0D  ; 220 GOSUB 500 
-        .DB $E6, $00, $89, $20, $73, $69, $6E, $65, $20, $77, $61, $76, $65, $20, $20, $54, $41, $42, $28, $32, $30, $2B, $53, $49, $4E, $28, $58, $29, $2F, $35, $30, $29, $0D  ; 230 REM  sine wave  TAB(20+SIN(X)/50)
-        .DB $F0, $00, $8B, $58, $3D, $FF, $00, $00, $97, $FF, $67, $01, $96, $FF, $0F, $00, $0D  ; 240 FOR X=0 TO 359 STEP 15 
-        .DB $FA, $00, $80, $A0, $28, $FF, $14, $00, $2B, $A8, $28, $58, $29, $2F, $FF, $32, $00, $29, $3B, $22, $2A, $22, $0D  ; 250 PRINT TAB (20 +SIN (X)/50 );"*"
-        .DB $04, $01, $8C, $58, $0D  ; 260 NEXT X
-        .DB $0E, $01, $82, $FF, $58, $02, $0D  ; 270 GOTO 600 
-        .DB $18, $01, $8A, $0D  ; 280 END 
-        .DB $F4, $01, $80, $22, $47, $4F, $53, $55, $42, $20, $6F, $6B, $22, $3A, $84, $0D  ; 500 PRINT "GOSUB ok":RETURN 
-        .DB $58, $02, $8B, $49, $3D, $2D, $FF, $40, $00, $97, $FF, $38, $00, $96, $FF, $06, $00, $0D  ; 600 FOR I=-64 TO 56 STEP 6 
-        .DB $62, $02, $44, $3D, $49, $0D  ; 610 D=I
-        .DB $6C, $02, $8B, $43, $3D, $2D, $FF, $80, $00, $97, $FF, $10, $00, $96, $FF, $04, $00, $0D  ; 620 FOR C=-128 TO 16 STEP 4 
-        .DB $76, $02, $41, $3D, $43, $3A, $42, $3D, $44, $3A, $45, $3D, $FF, $00, $00, $0D  ; 630 A=C:B=D:E=0 
-        .DB $80, $02, $8B, $4E, $3D, $FF, $01, $00, $97, $FF, $10, $00, $0D  ; 640 FOR N=1 TO 16 
-        .DB $8A, $02, $81, $45, $3E, $FF, $00, $00, $9F, $82, $FF, $A8, $02, $0D  ; 650 IF E>0 THEN GOTO 680 
-        .DB $94, $02, $54, $3D, $41, $2A, $41, $2F, $FF, $40, $00, $2D, $42, $2A, $42, $2F, $FF, $40, $00, $2B, $43, $0D  ; 660 T=A*A/64 -B*B/64 +C
-        .DB $9E, $02, $42, $3D, $FF, $02, $00, $2A, $41, $2A, $42, $2F, $FF, $40, $00, $2B, $44, $3A, $41, $3D, $54, $0D  ; 670 B=2 *A*B/64 +D:A=T
-        .DB $A8, $02, $81, $45, $3D, $FF, $00, $00, $9F, $81, $41, $2A, $41, $2F, $FF, $40, $00, $2B, $42, $2A, $42, $2F, $FF, $40, $00, $3E, $FF, $00, $01, $9F, $45, $3D, $4E, $0D  ; 680 IF E=0 THEN IF A*A/64 +B*B/64 >256 THEN E=N
-        .DB $B2, $02, $8C, $4E, $0D  ; 690 NEXT N
-        .DB $BC, $02, $81, $45, $3E, $FF, $00, $00, $9F, $80, $98, $28, $45, $2B, $FF, $20, $00, $29, $3B, $95, $80, $98, $28, $FF, $20, $00, $29, $3B, $0D  ; 700 IF E>0 THEN PRINT CHR$ (E+32 );ELSE PRINT CHR$ (32 );
-        .DB $C6, $02, $8C, $43, $0D  ; 710 NEXT C
-        .DB $D0, $02, $80, $22, $22, $0D  ; 720 PRINT ""
-        .DB $DA, $02, $8C, $49, $0D  ; 730 NEXT I
-        .DB $EE, $02, $80, $22, $3D, $3D, $3D, $20, $52, $65, $6E, $64, $65, $72, $20, $31, $36, $2D, $42, $69, $74, $20, $49, $6E, $74, $65, $67, $65, $72, $20, $53, $70, $69, $72, $61, $6C, $20, $56, $6F, $72, $74, $65, $78, $20, $3D, $3D, $3D, $22, $0D  ; 750 PRINT "=== Render 16-Bit Integer Spiral Vortex ==="
-        .DB $F8, $02, $80, $22, $54, $45, $53, $54, $53, $3A, $20, $53, $49, $4E, $2C, $20, $43, $4F, $53, $2C, $20, $41, $53, $49, $4E, $2C, $20, $41, $43, $4F, $53, $20, $28, $4E, $4F, $20, $53, $51, $52, $54, $2F, $54, $41, $4E, $2F, $41, $54, $4E, $29, $22, $0D  ; 760 PRINT "TESTS: SIN, COS, ASIN, ACOS (NO SQRT/TAN/ATN)"
-        .DB $02, $03, $89, $4C, $20, $54, $52, $41, $43, $4B, $53, $20, $4C, $41, $53, $54, $20, $43, $4F, $4C, $55, $4D, $4E, $20, $53, $49, $4E, $43, $45, $20, $54, $41, $42, $28, $6E, $29, $20, $48, $45, $52, $45, $20, $50, $52, $49, $4E, $54, $53, $20, $6E, $20, $73, $70, $61, $63, $65, $73, $0D  ; 770 REM L TRACKS LAST COLUMN SINCE TAB(n) HERE PRINTS n spaces
-        .DB $20, $03, $89, $48, $20, $41, $4E, $44, $20, $56, $20, $43, $4F, $4E, $53, $54, $41, $4E, $54, $53, $20, $48, $41, $52, $44, $43, $4F, $44, $45, $44, $20, $54, $4F, $20, $53, $41, $56, $45, $20, $56, $41, $52, $49, $41, $42, $4C, $45, $53, $0D  ; 800 REM H AND V CONSTANTS HARDCODED TO SAVE VARIABLES
-        .DB $2A, $03, $8B, $52, $3D, $FF, $00, $00, $97, $FF, $1A, $00, $0D  ; 810 FOR R=0 TO 26
-        .DB $34, $03, $9E, $4C, $3D, $FF, $00, $00, $0D  ; 820 LET L=0
-        .DB $3E, $03, $8B, $43, $3D, $FF, $00, $00, $97, $FF, $3C, $00, $0D  ; 830 FOR C=0 TO 60
-        .DB $48, $03, $9E, $58, $3D, $43, $2D, $FF, $1E, $00, $0D  ; 840 LET X=C-30
-        .DB $52, $03, $89, $53, $43, $41, $4C, $45, $20, $59, $20, $42, $59, $20, $32, $20, $46, $4F, $52, $20, $41, $53, $43, $49, $49, $20, $43, $48, $41, $52, $41, $43, $54, $45, $52, $20, $41, $53, $50, $45, $43, $54, $20, $52, $41, $54, $49, $4F, $0D  ; 850 REM SCALE Y BY 2 FOR ASCII CHARACTER ASPECT RATIO
-        .DB $5C, $03, $9E, $59, $3D, $28, $52, $2D, $FF, $0D, $00, $29, $2A, $FF, $02, $00, $0D  ; 860 LET Y=(R-13)*2
-        .DB $66, $03, $89, $27, $44, $27, $20, $49, $53, $20, $53, $51, $55, $41, $52, $45, $44, $20, $44, $49, $53, $54, $41, $4E, $43, $45, $2E, $20, $41, $56, $4F, $49, $44, $53, $20, $4E, $45, $45, $44, $49, $4E, $47, $20, $53, $51, $52, $54, $21, $0D  ; 870 REM 'D' IS SQUARED DISTANCE. AVOIDS NEEDING SQRT!
-        .DB $70, $03, $9E, $44, $3D, $58, $5E, $FF, $02, $00, $2B, $59, $5E, $FF, $02, $00, $0D  ; 880 LET D=X^2+Y^2
-        .DB $7A, $03, $81, $44, $3E, $FF, $84, $03, $9F, $82, $FF, $60, $04, $0D  ; 890 IF D>900 THEN GOTO 1120 (v15.20 fix: skip the L=C+1 update too, else TAB(C-L) is always 0 -- see changelog)
-        .DB $84, $03, $89, $53, $43, $41, $4C, $45, $20, $54, $4F, $20, $2D, $31, $30, $30, $30, $20, $54, $4F, $20, $2B, $31, $30, $30, $30, $20, $52, $41, $4E, $47, $45, $20, $46, $4F, $52, $20, $49, $4E, $56, $45, $52, $53, $45, $20, $54, $52, $49, $47, $0D  ; 900 REM SCALE TO -1000 TO +1000 RANGE FOR INVERSE TRIG
-        .DB $8E, $03, $89, $33, $30, $2A, $31, $30, $30, $30, $3D, $33, $30, $30, $30, $30, $20, $57, $48, $49, $43, $48, $20, $53, $41, $46, $45, $4C, $59, $20, $46, $49, $54, $53, $20, $49, $4E, $20, $31, $36, $2D, $42, $49, $54, $20, $53, $49, $47, $4E, $45, $44, $20, $49, $4E, $54, $0D  ; 910 REM 30*1000=30000 WHICH SAFELY FITS IN 16-BIT SIGNED INT
-        .DB $98, $03, $9E, $55, $3D, $28, $58, $2A, $FF, $E8, $03, $29, $2F, $FF, $1E, $00, $0D  ; 920 LET U=(X*1000)/30
-        .DB $A2, $03, $9E, $57, $3D, $28, $59, $2A, $FF, $E8, $03, $29, $2F, $FF, $1E, $00, $0D  ; 930 LET W=(Y*1000)/30
-        .DB $AC, $03, $89, $2D, $2D, $2D, $20, $54, $45, $53, $54, $20, $41, $53, $49, $4E, $2F, $41, $43, $4F, $53, $20, $43, $4F, $4F, $52, $44, $20, $4D, $41, $50, $50, $49, $4E, $47, $20, $2D, $2D, $2D, $0D  ; 940 REM --- TEST ASIN/ACOS COORD MAPPING ---
-        .DB $B6, $03, $9E, $45, $3D, $AA, $28, $55, $29, $0D  ; 950 LET E=ASIN(U)
-        .DB $C0, $03, $9E, $46, $3D, $AB, $28, $57, $29, $0D  ; 960 LET F=ACOS(W)
-        .DB $CA, $03, $89, $2D, $2D, $2D, $20, $54, $45, $53, $54, $20, $43, $4F, $52, $44, $49, $43, $20, $53, $49, $4E, $2F, $43, $4F, $53, $20, $2D, $2D, $2D, $0D  ; 970 REM --- TEST CORDIC SIN/COS ---
-        .DB $D4, $03, $89, $4D, $55, $4C, $54, $49, $50, $4C, $59, $20, $44, $20, $54, $4F, $20, $4D, $41, $4B, $45, $20, $52, $49, $4E, $47, $53, $2C, $20, $53, $55, $42, $54, $52, $41, $43, $54, $20, $41, $4E, $47, $4C, $45, $53, $20, $46, $4F, $52, $20, $53, $50, $49, $52, $41, $4C, $0D  ; 980 REM MULTIPLY D TO MAKE RINGS, SUBTRACT ANGLES FOR SPIRAL
-        .DB $DE, $03, $9E, $49, $3D, $A8, $28, $44, $2A, $FF, $02, $00, $2D, $45, $2A, $FF, $05, $00, $29, $0D  ; 990 LET I=SIN(D*2-E*5)
-        .DB $E8, $03, $9E, $4A, $3D, $A9, $28, $44, $2B, $46, $2A, $FF, $03, $00, $29, $0D  ; 1000 LET J=COS(D+F*3)
-        .DB $F2, $03, $89, $2D, $2D, $2D, $20, $4E, $45, $53, $54, $45, $44, $20, $54, $52, $49, $47, $20, $54, $45, $53, $54, $53, $20, $2D, $2D, $2D, $0D  ; 1010 REM --- NESTED TRIG TESTS ---
-        .DB $FC, $03, $89, $49, $20, $41, $4E, $44, $20, $4A, $20, $41, $52, $45, $20, $2D, $31, $30, $30, $30, $20, $54, $4F, $20, $2B, $31, $30, $30, $30, $2C, $20, $50, $45, $52, $46, $45, $43, $54, $20, $46, $4F, $52, $20, $49, $4E, $56, $45, $52, $53, $45, $20, $54, $52, $49, $47, $0D  ; 1020 REM I AND J ARE -1000 TO +1000, PERFECT FOR INVERSE TRIG
-        .DB $06, $04, $9E, $41, $3D, $AA, $28, $4A, $29, $0D  ; 1030 LET A=ASIN(J)
-        .DB $10, $04, $9E, $42, $3D, $AB, $28, $49, $29, $0D  ; 1040 LET B=ACOS(I)
-        .DB $1A, $04, $89, $2D, $2D, $2D, $20, $4D, $41, $54, $48, $20, $53, $48, $41, $44, $45, $20, $56, $41, $4C, $55, $45, $20, $28, $52, $45, $53, $55, $4C, $54, $53, $20, $49, $4E, $20, $30, $20, $54, $4F, $20, $7E, $32, $37, $30, $29, $20, $2D, $2D, $2D, $0D  ; 1050 REM --- MATH SHADE VALUE (RESULTS IN 0 TO ~270) ---
-        .DB $24, $04, $9E, $5A, $3D, $A5, $28, $41, $2D, $42, $29, $0D  ; 1060 LET Z=ABS(A-B)
-        .DB $2E, $04, $89, $2D, $2D, $2D, $20, $4D, $41, $50, $20, $54, $4F, $20, $41, $53, $43, $49, $49, $20, $43, $48, $41, $52, $53, $20, $2D, $2D, $2D, $0D  ; 1070 REM --- MAP TO ASCII CHARS ---
-        .DB $38, $04, $9E, $53, $3D, $FF, $20, $00, $0D  ; 1080 LET S=32
-        .DB $3D, $04, $81, $5A, $3E, $FF, $1E, $00, $9F, $9E, $53, $3D, $FF, $2E, $00, $0D  ; 1085 IF Z>30 THEN LET S=46
-        .DB $42, $04, $81, $5A, $3E, $FF, $46, $00, $9F, $9E, $53, $3D, $FF, $2B, $00, $0D  ; 1090 IF Z>70 THEN LET S=43
-        .DB $47, $04, $81, $5A, $3E, $FF, $6E, $00, $9F, $9E, $53, $3D, $FF, $4F, $00, $0D  ; 1095 IF Z>110 THEN LET S=79
-        .DB $4C, $04, $81, $5A, $3E, $FF, $96, $00, $9F, $9E, $53, $3D, $FF, $40, $00, $0D  ; 1100 IF Z>150 THEN LET S=64
-        .DB $51, $04, $80, $A0, $28, $43, $2D, $4C, $29, $3B, $98, $28, $53, $29, $3B, $0D  ; 1105 PRINT TAB(C-L);CHR$(S);
-        .DB $56, $04, $9E, $4C, $3D, $43, $2B, $FF, $01, $00, $0D  ; 1110 LET L=C+1
-        .DB $60, $04, $8C, $43, $0D  ; 1120 NEXT C
-        .DB $6A, $04, $80, $0D  ; 1130 PRINT
-        .DB $74, $04, $8C, $52, $0D  ; 1140 NEXT R
-        .DB $7E, $04, $8A, $0D  ; 1150 END
+        .DB $0A, $00, $1E, $89, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $33, $31, $20, $53, $48, $4F, $57, $43, $41, $53, $45, $00  ; 10 REM 4K BASIC v15.31 SHOWCASE
+        .DB $14, $00, $1C, $80, $22, $3D, $3D, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $33, $31, $20, $3D, $3D, $22, $00  ; 20 PRINT "== 4K BASIC v15.31 =="
+        .DB $1E, $00, $20, $80, $22, $43, $48, $52, $22, $3B, $98, $28, $FF, $24, $00, $29, $3B, $22, $28, $36, $35, $29, $3D, $22, $3B, $98, $28, $FF, $41, $00, $29, $00  ; 30 PRINT "CHR";CHR$ (36 );"(65)=";CHR$ (65 )
+        .DB $28, $00, $2E, $80, $22, $31, $37, $20, $4D, $4F, $44, $20, $35, $3D, $22, $3B, $FF, $11, $00, $A1, $FF, $05, $00, $3B, $22, $20, $20, $41, $42, $53, $20, $6E, $65, $67, $37, $3D, $22, $3B, $A5, $28, $2D, $FF, $07, $00, $29, $00  ; 40 PRINT "17 MOD 5=";17 MOD 5 ;"  ABS neg7=";ABS (-7 )
+        .DB $32, $00, $27, $80, $22, $4E, $4F, $54, $20, $30, $3D, $22, $3B, $9C, $FF, $00, $00, $3B, $22, $20, $20, $36, $20, $41, $4E, $44, $20, $33, $3D, $22, $3B, $FF, $06, $00, $9A, $FF, $03, $00, $00  ; 50 PRINT "NOT 0=";NOT 0 ;"  6 AND 3=";6 AND 3 
+        .DB $3C, $00, $2B, $80, $22, $35, $20, $4F, $52, $20, $32, $3D, $22, $3B, $FF, $05, $00, $9B, $FF, $02, $00, $3B, $22, $20, $20, $37, $20, $58, $4F, $52, $20, $33, $3D, $22, $3B, $FF, $07, $00, $9D, $FF, $03, $00, $00  ; 60 PRINT "5 OR 2=";5 OR 2 ;"  7 XOR 3=";7 XOR 3 
+        .DB $41, $00, $2C, $80, $22, $53, $47, $4E, $28, $2D, $35, $29, $3D, $22, $3B, $A3, $28, $2D, $FF, $05, $00, $29, $3B, $22, $20, $20, $31, $20, $53, $48, $4C, $20, $34, $3D, $22, $3B, $FF, $01, $00, $AD, $FF, $04, $00, $00  ; 65 PRINT "SGN(-5)=";SGN (-5 );"  1 SHL 4=";1 SHL 4
+        .DB $42, $00, $30, $80, $22, $2D, $31, $36, $20, $53, $48, $52, $20, $32, $3D, $22, $3B, $2D, $FF, $10, $00, $AE, $FF, $02, $00, $3B, $22, $20, $20, $48, $45, $58, $24, $28, $32, $35, $35, $29, $3D, $22, $3B, $A2, $28, $FF, $FF, $00, $29, $00  ; 66 PRINT "-16 SHR 2=";-16 SHR 2;"  HEX$(255)=";HEX$ (255 )
+        .DB $43, $00, $27, $80, $22, $35, $3C, $31, $30, $3D, $22, $3B, $FF, $05, $00, $3C, $FF, $0A, $00, $3B, $22, $20, $20, $35, $3C, $3E, $33, $3D, $22, $3B, $FF, $05, $00, $3C, $3E, $FF, $03, $00, $00  ; 67 PRINT "5<10=";5<10;"  5<>3=";5<>3
+        .DB $44, $00, $28, $80, $22, $33, $3C, $3D, $33, $3D, $22, $3B, $FF, $03, $00, $3C, $3D, $FF, $03, $00, $3B, $22, $20, $20, $35, $3E, $3D, $36, $3D, $22, $3B, $FF, $05, $00, $3E, $3D, $FF, $06, $00, $00  ; 68 PRINT "3<=3=";3<=3;"  5>=6=";5>=6
+        .DB $46, $00, $18, $80, $22, $52, $4E, $44, $20, $4D, $4F, $44, $20, $31, $30, $3D, $22, $3B, $A4, $A1, $FF, $0A, $00, $00  ; 70 PRINT "RND MOD 10=";RND MOD 10 
+        .DB $47, $00, $42, $80, $22, $4D, $55, $4C, $20, $31, $32, $2A, $2D, $37, $3D, $22, $3B, $FF, $0C, $00, $2A, $28, $2D, $FF, $07, $00, $29, $3B, $22, $20, $33, $2A, $33, $30, $30, $3D, $22, $3B, $FF, $03, $00, $2A, $FF, $2C, $01, $3B, $22, $20, $32, $35, $30, $2A, $32, $35, $31, $3D, $22, $3B, $FF, $FA, $00, $2A, $FF, $FB, $00, $00  ; 71 PRINT "MUL 12*-7=";12*(-7);" 3*300=";3*300;" 250*251=";250*251
+        .DB $48, $00, $4B, $80, $22, $44, $49, $56, $20, $2D, $33, $30, $30, $2F, $37, $3D, $22, $3B, $2D, $FF, $2C, $01, $2F, $FF, $07, $00, $3B, $22, $20, $33, $30, $30, $30, $30, $2F, $33, $30, $30, $3D, $22, $3B, $FF, $30, $75, $2F, $FF, $2C, $01, $3B, $22, $20, $33, $30, $30, $20, $4D, $4F, $44, $20, $2D, $37, $3D, $22, $3B, $FF, $2C, $01, $A1, $28, $2D, $FF, $07, $00, $29, $00  ; 72 PRINT "DIV -300/7=";-300/7;" 30000/300=";30000/300;" 300 MOD -7=";300 MOD (-7)
+        .DB $49, $00, $19, $8B, $49, $3D, $FF, $01, $00, $97, $FF, $02, $00, $3A, $8B, $4A, $3D, $FF, $01, $00, $97, $FF, $03, $00, $00  ; 73 FOR I=1 TO 2: FOR J=1 TO 3
+        .DB $4A, $00, $09, $80, $49, $2A, $4A, $3B, $00  ; 74 PRINT I*J;
+        .DB $4B, $00, $09, $8C, $4A, $3A, $8C, $49, $00  ; 75 NEXT J: NEXT I
+        .DB $4C, $00, $1C, $80, $3A, $80, $22, $43, $48, $41, $49, $4E, $45, $44, $20, $46, $4F, $52, $20, $4F, $4B, $22, $3A, $82, $FF, $4E, $00, $00  ; 76 PRINT: PRINT "CHAINED FOR OK": GOTO 78
+        .DB $4D, $00, $13, $80, $22, $42, $41, $44, $20, $46, $57, $44, $20, $47, $4F, $54, $4F, $22, $00  ; 77 PRINT "BAD FWD GOTO"
+        .DB $4E, $00, $15, $89, $3A, $50, $52, $49, $4E, $54, $20, $22, $42, $41, $44, $20, $52, $45, $4D, $22, $00  ; 78 REM:PRINT "BAD REM"
+        .DB $4F, $00, $17, $51, $3D, $51, $2B, $FF, $01, $00, $3A, $81, $51, $3C, $FF, $03, $00, $9F, $82, $FF, $4F, $00, $00  ; 79 Q=Q+1: IF Q<3 THEN GOTO 79
+        .DB $50, $00, $1C, $8E, $FE, $FF, $00, $2C, $FF, $2A, $00, $3A, $80, $22, $50, $4F, $4B, $45, $3D, $22, $3B, $A6, $28, $FE, $FF, $00, $29, $00  ; 80 POKE $00FF ,42 :PRINT "POKE=";PEEK ($00FF )
+        .DB $51, $00, $26, $80, $22, $42, $41, $43, $4B, $20, $47, $4F, $54, $4F, $2C, $20, $46, $57, $44, $20, $47, $4F, $54, $4F, $2C, $20, $52, $45, $4D, $3A, $20, $4F, $4B, $20, $22, $3B, $51, $00  ; 81 PRINT "BACK GOTO, FWD GOTO, REM: OK ";Q
+        .DB $5A, $00, $24, $93, $41, $2C, $42, $2C, $43, $3A, $80, $22, $44, $41, $54, $41, $20, $20, $22, $3B, $41, $3B, $22, $20, $20, $22, $3B, $42, $3B, $22, $20, $20, $22, $3B, $43, $00  ; 90 READ A,B,C:PRINT "DATA  ";A;"  ";B;"  ";C
+        .DB $64, $00, $18, $94, $3A, $93, $41, $3A, $80, $22, $52, $45, $53, $54, $4F, $52, $45, $20, $41, $3D, $22, $3B, $41, $00  ; 100 RESTORE :READ A:PRINT "RESTORE A=";A
+        .DB $6E, $00, $10, $92, $FF, $6F, $00, $2C, $FF, $DE, $00, $2C, $FF, $4D, $01, $00  ; 110 DATA 111,222,333  (v15.30: tokenised -- was raw ASCII, so READ returned garbage)
+        .DB $78, $00, $0E, $8B, $49, $3D, $FF, $01, $00, $97, $FF, $05, $00, $00  ; 120 FOR I=1 TO 5 
+        .DB $82, $00, $07, $80, $49, $3B, $00  ; 130 PRINT I;
+        .DB $8C, $00, $06, $8C, $49, $00  ; 140 NEXT I
+        .DB $96, $00, $05, $80, $00  ; 150 PRINT 
+        .DB $A0, $00, $13, $8B, $49, $3D, $FF, $0A, $00, $97, $FF, $01, $00, $96, $2D, $FF, $03, $00, $00  ; 160 FOR I=10 TO 1 STEP -3 
+        .DB $AA, $00, $07, $80, $49, $3B, $00  ; 170 PRINT I;
+        .DB $B4, $00, $06, $8C, $49, $00  ; 180 NEXT I
+        .DB $BE, $00, $05, $80, $00  ; 190 PRINT 
+        .DB $C8, $00, $17, $81, $FF, $03, $00, $3E, $FF, $01, $00, $9F, $80, $22, $49, $46, $20, $74, $72, $75, $65, $22, $00  ; 200 IF 3 >1 THEN PRINT "IF true"
+        .DB $D2, $00, $20, $81, $FF, $01, $00, $3E, $FF, $03, $00, $9F, $80, $22, $57, $52, $4F, $4E, $47, $22, $95, $80, $22, $45, $4C, $53, $45, $20, $6F, $6B, $22, $00  ; 210 IF 1 >3 THEN PRINT "WRONG"ELSE PRINT "ELSE ok"
+        .DB $DC, $00, $08, $83, $FF, $F4, $01, $00  ; 220 GOSUB 500 
+        .DB $E6, $00, $22, $89, $20, $73, $69, $6E, $65, $20, $77, $61, $76, $65, $20, $20, $54, $41, $42, $28, $32, $30, $2B, $53, $49, $4E, $28, $58, $29, $2F, $35, $30, $29, $00  ; 230 REM  sine wave  TAB(20+SIN(X)/50)
+        .DB $F0, $00, $12, $8B, $58, $3D, $FF, $00, $00, $97, $FF, $67, $01, $96, $FF, $0F, $00, $00  ; 240 FOR X=0 TO 359 STEP 15 
+        .DB $FA, $00, $18, $80, $A0, $28, $FF, $14, $00, $2B, $A8, $28, $58, $29, $2F, $FF, $32, $00, $29, $3B, $22, $2A, $22, $00  ; 250 PRINT TAB (20 +SIN (X)/50 );"*"
+        .DB $04, $01, $06, $8C, $58, $00  ; 260 NEXT X
+        .DB $0E, $01, $08, $82, $FF, $58, $02, $00  ; 270 GOTO 600 
+        .DB $18, $01, $05, $8A, $00  ; 280 END 
+        .DB $F4, $01, $11, $80, $22, $47, $4F, $53, $55, $42, $20, $6F, $6B, $22, $3A, $84, $00  ; 500 PRINT "GOSUB ok":RETURN 
+        .DB $58, $02, $13, $8B, $49, $3D, $2D, $FF, $40, $00, $97, $FF, $38, $00, $96, $FF, $06, $00, $00  ; 600 FOR I=-64 TO 56 STEP 6 
+        .DB $62, $02, $07, $44, $3D, $49, $00  ; 610 D=I
+        .DB $6C, $02, $13, $8B, $43, $3D, $2D, $FF, $80, $00, $97, $FF, $10, $00, $96, $FF, $04, $00, $00  ; 620 FOR C=-128 TO 16 STEP 4 
+        .DB $76, $02, $11, $41, $3D, $43, $3A, $42, $3D, $44, $3A, $45, $3D, $FF, $00, $00, $00  ; 630 A=C:B=D:E=0 
+        .DB $80, $02, $0E, $8B, $4E, $3D, $FF, $01, $00, $97, $FF, $10, $00, $00  ; 640 FOR N=1 TO 16 
+        .DB $8A, $02, $0F, $81, $45, $3E, $FF, $00, $00, $9F, $82, $FF, $A8, $02, $00  ; 650 IF E>0 THEN GOTO 680 
+        .DB $94, $02, $17, $54, $3D, $41, $2A, $41, $2F, $FF, $40, $00, $2D, $42, $2A, $42, $2F, $FF, $40, $00, $2B, $43, $00  ; 660 T=A*A/64 -B*B/64 +C
+        .DB $9E, $02, $17, $42, $3D, $FF, $02, $00, $2A, $41, $2A, $42, $2F, $FF, $40, $00, $2B, $44, $3A, $41, $3D, $54, $00  ; 670 B=2 *A*B/64 +D:A=T
+        .DB $A8, $02, $23, $81, $45, $3D, $FF, $00, $00, $9F, $81, $41, $2A, $41, $2F, $FF, $40, $00, $2B, $42, $2A, $42, $2F, $FF, $40, $00, $3E, $FF, $00, $01, $9F, $45, $3D, $4E, $00  ; 680 IF E=0 THEN IF A*A/64 +B*B/64 >256 THEN E=N
+        .DB $B2, $02, $06, $8C, $4E, $00  ; 690 NEXT N
+        .DB $BC, $02, $1E, $81, $45, $3E, $FF, $00, $00, $9F, $80, $98, $28, $45, $2B, $FF, $20, $00, $29, $3B, $95, $80, $98, $28, $FF, $20, $00, $29, $3B, $00  ; 700 IF E>0 THEN PRINT CHR$ (E+32 );ELSE PRINT CHR$ (32 );
+        .DB $C6, $02, $06, $8C, $43, $00  ; 710 NEXT C
+        .DB $D0, $02, $07, $80, $22, $22, $00  ; 720 PRINT ""
+        .DB $DA, $02, $06, $8C, $49, $00  ; 730 NEXT I
+        .DB $EE, $02, $32, $80, $22, $3D, $3D, $3D, $20, $52, $65, $6E, $64, $65, $72, $20, $31, $36, $2D, $42, $69, $74, $20, $49, $6E, $74, $65, $67, $65, $72, $20, $53, $70, $69, $72, $61, $6C, $20, $56, $6F, $72, $74, $65, $78, $20, $3D, $3D, $3D, $22, $00  ; 750 PRINT "=== Render 16-Bit Integer Spiral Vortex ==="
+        .DB $F8, $02, $34, $80, $22, $54, $45, $53, $54, $53, $3A, $20, $53, $49, $4E, $2C, $20, $43, $4F, $53, $2C, $20, $41, $53, $49, $4E, $2C, $20, $41, $43, $4F, $53, $20, $28, $4E, $4F, $20, $53, $51, $52, $54, $2F, $54, $41, $4E, $2F, $41, $54, $4E, $29, $22, $00  ; 760 PRINT "TESTS: SIN, COS, ASIN, ACOS (NO SQRT/TAN/ATN)"
+        .DB $02, $03, $3B, $89, $4C, $20, $54, $52, $41, $43, $4B, $53, $20, $4C, $41, $53, $54, $20, $43, $4F, $4C, $55, $4D, $4E, $20, $53, $49, $4E, $43, $45, $20, $54, $41, $42, $28, $6E, $29, $20, $48, $45, $52, $45, $20, $50, $52, $49, $4E, $54, $53, $20, $6E, $20, $73, $70, $61, $63, $65, $73, $00  ; 770 REM L TRACKS LAST COLUMN SINCE TAB(n) HERE PRINTS n spaces
+        .DB $20, $03, $32, $89, $48, $20, $41, $4E, $44, $20, $56, $20, $43, $4F, $4E, $53, $54, $41, $4E, $54, $53, $20, $48, $41, $52, $44, $43, $4F, $44, $45, $44, $20, $54, $4F, $20, $53, $41, $56, $45, $20, $56, $41, $52, $49, $41, $42, $4C, $45, $53, $00  ; 800 REM H AND V CONSTANTS HARDCODED TO SAVE VARIABLES
+        .DB $2A, $03, $0E, $8B, $52, $3D, $FF, $00, $00, $97, $FF, $1A, $00, $00  ; 810 FOR R=0 TO 26
+        .DB $34, $03, $0A, $9E, $4C, $3D, $FF, $00, $00, $00  ; 820 LET L=0
+        .DB $3E, $03, $0E, $8B, $43, $3D, $FF, $00, $00, $97, $FF, $3C, $00, $00  ; 830 FOR C=0 TO 60
+        .DB $48, $03, $0C, $9E, $58, $3D, $43, $2D, $FF, $1E, $00, $00  ; 840 LET X=C-30
+        .DB $52, $03, $32, $89, $53, $43, $41, $4C, $45, $20, $59, $20, $42, $59, $20, $32, $20, $46, $4F, $52, $20, $41, $53, $43, $49, $49, $20, $43, $48, $41, $52, $41, $43, $54, $45, $52, $20, $41, $53, $50, $45, $43, $54, $20, $52, $41, $54, $49, $4F, $00  ; 850 REM SCALE Y BY 2 FOR ASCII CHARACTER ASPECT RATIO
+        .DB $5C, $03, $12, $9E, $59, $3D, $28, $52, $2D, $FF, $0D, $00, $29, $2A, $FF, $02, $00, $00  ; 860 LET Y=(R-13)*2
+        .DB $66, $03, $32, $89, $27, $44, $27, $20, $49, $53, $20, $53, $51, $55, $41, $52, $45, $44, $20, $44, $49, $53, $54, $41, $4E, $43, $45, $2E, $20, $41, $56, $4F, $49, $44, $53, $20, $4E, $45, $45, $44, $49, $4E, $47, $20, $53, $51, $52, $54, $21, $00  ; 870 REM 'D' IS SQUARED DISTANCE. AVOIDS NEEDING SQRT!
+        .DB $70, $03, $12, $9E, $44, $3D, $58, $5E, $FF, $02, $00, $2B, $59, $5E, $FF, $02, $00, $00  ; 880 LET D=X^2+Y^2
+        .DB $7A, $03, $0F, $81, $44, $3E, $FF, $84, $03, $9F, $82, $FF, $60, $04, $00  ; 890 IF D>900 THEN GOTO 1120 (v15.20 fix: skip the L=C+1 update too, else TAB(C-L) is always 0 -- see changelog)
+        .DB $84, $03, $33, $89, $53, $43, $41, $4C, $45, $20, $54, $4F, $20, $2D, $31, $30, $30, $30, $20, $54, $4F, $20, $2B, $31, $30, $30, $30, $20, $52, $41, $4E, $47, $45, $20, $46, $4F, $52, $20, $49, $4E, $56, $45, $52, $53, $45, $20, $54, $52, $49, $47, $00  ; 900 REM SCALE TO -1000 TO +1000 RANGE FOR INVERSE TRIG
+        .DB $8E, $03, $39, $89, $33, $30, $2A, $31, $30, $30, $30, $3D, $33, $30, $30, $30, $30, $20, $57, $48, $49, $43, $48, $20, $53, $41, $46, $45, $4C, $59, $20, $46, $49, $54, $53, $20, $49, $4E, $20, $31, $36, $2D, $42, $49, $54, $20, $53, $49, $47, $4E, $45, $44, $20, $49, $4E, $54, $00  ; 910 REM 30*1000=30000 WHICH SAFELY FITS IN 16-BIT SIGNED INT
+        .DB $98, $03, $12, $9E, $55, $3D, $28, $58, $2A, $FF, $E8, $03, $29, $2F, $FF, $1E, $00, $00  ; 920 LET U=(X*1000)/30
+        .DB $A2, $03, $12, $9E, $57, $3D, $28, $59, $2A, $FF, $E8, $03, $29, $2F, $FF, $1E, $00, $00  ; 930 LET W=(Y*1000)/30
+        .DB $AC, $03, $29, $89, $2D, $2D, $2D, $20, $54, $45, $53, $54, $20, $41, $53, $49, $4E, $2F, $41, $43, $4F, $53, $20, $43, $4F, $4F, $52, $44, $20, $4D, $41, $50, $50, $49, $4E, $47, $20, $2D, $2D, $2D, $00  ; 940 REM --- TEST ASIN/ACOS COORD MAPPING ---
+        .DB $B6, $03, $0B, $9E, $45, $3D, $AA, $28, $55, $29, $00  ; 950 LET E=ASIN(U)
+        .DB $C0, $03, $0B, $9E, $46, $3D, $AB, $28, $57, $29, $00  ; 960 LET F=ACOS(W)
+        .DB $CA, $03, $20, $89, $2D, $2D, $2D, $20, $54, $45, $53, $54, $20, $43, $4F, $52, $44, $49, $43, $20, $53, $49, $4E, $2F, $43, $4F, $53, $20, $2D, $2D, $2D, $00  ; 970 REM --- TEST CORDIC SIN/COS ---
+        .DB $D4, $03, $39, $89, $4D, $55, $4C, $54, $49, $50, $4C, $59, $20, $44, $20, $54, $4F, $20, $4D, $41, $4B, $45, $20, $52, $49, $4E, $47, $53, $2C, $20, $53, $55, $42, $54, $52, $41, $43, $54, $20, $41, $4E, $47, $4C, $45, $53, $20, $46, $4F, $52, $20, $53, $50, $49, $52, $41, $4C, $00  ; 980 REM MULTIPLY D TO MAKE RINGS, SUBTRACT ANGLES FOR SPIRAL
+        .DB $DE, $03, $15, $9E, $49, $3D, $A8, $28, $44, $2A, $FF, $02, $00, $2D, $45, $2A, $FF, $05, $00, $29, $00  ; 990 LET I=SIN(D*2-E*5)
+        .DB $E8, $03, $11, $9E, $4A, $3D, $A9, $28, $44, $2B, $46, $2A, $FF, $03, $00, $29, $00  ; 1000 LET J=COS(D+F*3)
+        .DB $F2, $03, $1E, $89, $2D, $2D, $2D, $20, $4E, $45, $53, $54, $45, $44, $20, $54, $52, $49, $47, $20, $54, $45, $53, $54, $53, $20, $2D, $2D, $2D, $00  ; 1010 REM --- NESTED TRIG TESTS ---
+        .DB $FC, $03, $39, $89, $49, $20, $41, $4E, $44, $20, $4A, $20, $41, $52, $45, $20, $2D, $31, $30, $30, $30, $20, $54, $4F, $20, $2B, $31, $30, $30, $30, $2C, $20, $50, $45, $52, $46, $45, $43, $54, $20, $46, $4F, $52, $20, $49, $4E, $56, $45, $52, $53, $45, $20, $54, $52, $49, $47, $00  ; 1020 REM I AND J ARE -1000 TO +1000, PERFECT FOR INVERSE TRIG
+        .DB $06, $04, $0B, $9E, $41, $3D, $AA, $28, $4A, $29, $00  ; 1030 LET A=ASIN(J)
+        .DB $10, $04, $0B, $9E, $42, $3D, $AB, $28, $49, $29, $00  ; 1040 LET B=ACOS(I)
+        .DB $1A, $04, $34, $89, $2D, $2D, $2D, $20, $4D, $41, $54, $48, $20, $53, $48, $41, $44, $45, $20, $56, $41, $4C, $55, $45, $20, $28, $52, $45, $53, $55, $4C, $54, $53, $20, $49, $4E, $20, $30, $20, $54, $4F, $20, $7E, $32, $37, $30, $29, $20, $2D, $2D, $2D, $00  ; 1050 REM --- MATH SHADE VALUE (RESULTS IN 0 TO ~270) ---
+        .DB $24, $04, $0D, $9E, $5A, $3D, $A5, $28, $41, $2D, $42, $29, $00  ; 1060 LET Z=ABS(A-B)
+        .DB $2E, $04, $1F, $89, $2D, $2D, $2D, $20, $4D, $41, $50, $20, $54, $4F, $20, $41, $53, $43, $49, $49, $20, $43, $48, $41, $52, $53, $20, $2D, $2D, $2D, $00  ; 1070 REM --- MAP TO ASCII CHARS ---
+        .DB $38, $04, $0A, $9E, $53, $3D, $FF, $20, $00, $00  ; 1080 LET S=32
+        .DB $3D, $04, $11, $81, $5A, $3E, $FF, $1E, $00, $9F, $9E, $53, $3D, $FF, $2E, $00, $00  ; 1085 IF Z>30 THEN LET S=46
+        .DB $42, $04, $11, $81, $5A, $3E, $FF, $46, $00, $9F, $9E, $53, $3D, $FF, $2B, $00, $00  ; 1090 IF Z>70 THEN LET S=43
+        .DB $47, $04, $11, $81, $5A, $3E, $FF, $6E, $00, $9F, $9E, $53, $3D, $FF, $4F, $00, $00  ; 1095 IF Z>110 THEN LET S=79
+        .DB $4C, $04, $11, $81, $5A, $3E, $FF, $96, $00, $9F, $9E, $53, $3D, $FF, $40, $00, $00  ; 1100 IF Z>150 THEN LET S=64
+        .DB $51, $04, $11, $80, $A0, $28, $43, $2D, $4C, $29, $3B, $98, $28, $53, $29, $3B, $00  ; 1105 PRINT TAB(C-L);CHR$(S);
+        .DB $56, $04, $0C, $9E, $4C, $3D, $43, $2B, $FF, $01, $00, $00  ; 1110 LET L=C+1
+        .DB $60, $04, $06, $8C, $43, $00  ; 1120 NEXT C
+        .DB $6A, $04, $05, $80, $00  ; 1130 PRINT
+        .DB $74, $04, $06, $8C, $52, $00  ; 1140 NEXT R
+        .DB $7E, $04, $05, $8A, $00  ; 1150 END
 SHOWCASE_END = *               ; v15.20: extended with Integer Spiral Vortex demo (lines 750-1150) after Mandelbrot; regenerate this comment
 
 ; =============================================================================
@@ -679,7 +726,7 @@ SHOWCASE_END = *               ; v15.20: extended with Integer Spiral Vortex dem
 ; STRING TABLE (all strings on same page)
 ; =============================================================================
 STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string/kw addresses
-STR_BANNER: .DB "4K BASIC v15.30"
+STR_BANNER: .DB "4K BASIC v15.31"
 STR_CRLF:   .DB $0D,$8A             ; CR, LF|$80 = $8A
 STR_BYTES:  .DB " BYTES FREE",$0D,$8A  ; last LF has high-bit
 STR_ERROR:  .DB " ER",$D2           ; 'R'|$80 = $D2
@@ -877,7 +924,7 @@ ERR_TABLE:
 ;
 ;   In:  GETLINE_M prints "> " (main prompt); GETLINE_I prints "? " (INPUT
 ;        prompt); both then fall into GETLINE, which just reads.
-;   Out: IBUF holds the typed line (CR-terminated, backspace-editable,
+;   Out: IBUF holds the typed line (NUL-terminated, backspace-editable,
 ;        truncated past IBUF_MAX -- each keypress past the limit sounds
 ;        BELL); IP -> IBUF
 ;   Clobbers: A, X, IP
@@ -909,15 +956,15 @@ GLS:     CPX #IBUF_MAX
 GLFULL:  LDA #BELL              ; buffer full: discard the char (X
          JSR PUTCH               ; doesn't move), beep instead of echoing it
          BRA GLL                 ; -- the character itself is never printed
-GLD:     STA IBUF,X
-         JSR PUTCH              ; echo the raw CR (mirrors the old GETCH echo)
+GLD:     JSR PUTCH              ; echo the raw CR (mirrors the old GETCH echo)
+         STZ IBUF,X             ; v15.31: IBUF (and every tokenised line) is NUL-terminated
          JSR PRNL
         ; *** FALL THROUGH to TOKENIZE ***
 ; =============================================================================
 ; TOKENIZE ? translate raw text in IBUF into token stream in TBUF
-;   In:  IBUF  CR-terminated ASCII source line
+;   In:  IBUF  NUL-terminated ASCII source line
 ;   Out: TBUF  token stream (keywords $80-$9F, numbers $FF lo hi,
-;              strings/punct passed through, $0D $00 sentinel at end)
+;              strings/punct passed through, single $00 terminator at end)
 ;        CURLN set to parsed leading line number (0 if none)
 ;   Clobbers: A X Y T0 T1 T2
 ; =============================================================================
@@ -930,9 +977,7 @@ TOKENIZE:
         STZ T1+1
 
 TK_TOP: LDA (T0)             ; 65C02 zp-indirect
-        BEQ TK_EOL           ; Null sentinel ($00) -> EOL
-        CMP #$0D
-        BEQ TK_EOL           ; CR ($0D) -> EOL
+        BEQ TK_EOL           ; NUL terminator -> EOL
         CMP #' '             ; Skip spaces
         BEQ INC_TOP
 
@@ -945,9 +990,7 @@ TK_SC:  JSR INC_T0
         JSR TKEMIT
         CMP #'"'
         BEQ INC_TOP          ; Closing '"' -> advance T0 & resume loop
-        CMP #$0D
-        BNE TK_SC            ; Keep copying string bytes
-        BRA TK_EOL           ; Unterminated string ($0D) -> EOL
+        BRA TK_SC            ; Keep copying string bytes
 
 TK_NSTR:
         CMP #'$'             ; Hex literal? $HHHH (1-4 hex digits, v15.20)
@@ -976,20 +1019,18 @@ TK_NNUM:
         BCC TK_OTHER
         CMP #'Z'+1
         BCS TK_OTHER
-        JSR TRYKW            ; Try keyword match (C=0 matched, C=1 not)
+        PHA                  ; keep the uppercased char across TRYKW (v15.31: saves
+        JSR TRYKW            ;  re-reading and re-uppercasing it at TK_OTHER)
+        PLA                  ; PLA leaves the carry from TRYKW alone
         BCC TK_TOP           ; Keyword matched & emitted: continue
 
-TK_OTHER:
-        LDA (T0)             ; Re-read char for variable/punctuation
-        JSR UC
+TK_OTHER:                    ; A = uppercased char: variable letter / punctuation
         JSR TKEMIT
 INC_TOP:
         JSR INC_T0           ; Shared helper: advance T0 and loop
         BRA TK_TOP
 
-TK_EOL: LDA #$0D             ; Write $0D $00 end-of-line sentinel
-        JSR TKEMIT
-        LDA #0
+TK_EOL: LDA #0               ; write the $00 end-of-line terminator
         BRA TKEMIT           ; Tail call: emits $00 and RTS
 
 ; =============================================================================
@@ -1004,10 +1045,14 @@ INC_T0_ok:
         RTS
 
 ; =============================================================================
-; INC_DATA_PTR ? advance DATA_PTR by 1 ---------------------------------------
-;   Clobbers: Flags only (A unchanged).
+; DATAPTRADD3 / INC_DATA_PTR ? advance DATA_PTR by 3 (record header lo, hi, len;
+;   two calls then falls into INC_DATA_PTR) / by 1
+;   In:  DATA_PTR   pointer into the program store
+;   Out: DATA_PTR advanced by 3 or 1; A unchanged
+;   Clobbers: Flags only.
 ; =============================================================================
-DATAPTRADD2:
+DATAPTRADD3:                     ; DATA_PTR += 3 (record header: lo, hi, length)
+        JSR INC_DATA_PTR
         JSR INC_DATA_PTR
 INC_DATA_PTR:
         INC DATA_PTR
@@ -1017,17 +1062,21 @@ RD_ap_ok:
         RTS
 
 ; =============================================================================
-; IPADD2 ? skip a 2-byte payload at IP (e.g. a TOK_NUM's lo/hi bytes), then
-;   fall through into GETCI for the byte now at IP
-;   In:  IP   points at the first of the 2 bytes to skip
-;   Out: A    byte now at (IP), i.e. two bytes past the original IP;  IP+=2
-;   Clobbers: None.
+; IPADD3 / IPADD2 ? advance IP by 3 / by 2 (v15.31: IPADD3 added for the 3-byte
+;   record header lo, hi, len; IPADD2 skips e.g. a TOK_NUM's lo/hi payload). IPADD3
+;   calls INC_IP once and falls into IPADD2, which calls it once and then runs INC_IP
+;   inline; the BIT abs ($2C) hides GETCI's LDA (IP) so the fall-through does not load.
+;   In:  IP   points at the first byte to skip
+;   Out: IP+=3 (IPADD3) or IP+=2 (IPADD2); A unchanged
+;   Clobbers: Flags only.
 ;
+
 ; GETCI ? read byte at IP and advance IP by one
 ;   In:  IP   token stream pointer
 ;   Out: A    byte that was at (IP);  IP  incremented
 ;   Clobbers: None.
 ; =============================================================================
+IPADD3: JSR INC_IP              ; IP += 3 (record header: lo, hi, length), then as IPADD2
 IPADD2: JSR INC_IP
         .DB $2C                 ; Swallow LDA (IP)
 GETCI:  LDA (IP)             ; 65C02 zp-indirect: fetch byte at IP, then advance
@@ -1045,12 +1094,14 @@ INC_IP_ok:
         RTS
 
 ; =============================================================================
-; INC_LP ? advance list pointer LP by one byte
+; LPADD3 / INC_LP ? advance list pointer LP by 3 / by 1 (LPADD3 skips a record
+;   header lo, hi, len; it calls INC_LP twice then falls into INC_LP)
 ;   In:  LP   pointer into program store
-;   Out: LP   incremented
-;   Clobbers: None.
+;   Out: LP   incremented by 3 (LPADD3) or 1 (INC_LP); A unchanged
+;   Clobbers: Flags only.
 ; =============================================================================
-LPADD2: JSR INC_LP
+LPADD3: JSR INC_LP              ; LP += 3 (record header: lo, hi, length)
+        JSR INC_LP
 INC_LP: INC LP
         BNE INC_LP_ok
         INC LP+1
@@ -1195,11 +1246,15 @@ TKPH_dn:
 ;   Out: C=0   matched: token byte emitted via TKEMIT, T0 advanced past keyword
 ;        C=1   no match: T0 unchanged, nothing emitted
 ;        TKTOK keyword scan index (scratch; caller must not rely on value)
-;   Clobbers: A X Y T2 LP OP
-;   Note: CURLN is temporarily used to save/restore T0 during comparison;
-;         the value is not meaningful until TOKENIZE assigns it via TKPNUM.
-;         OP ($BB) is used as a single-byte temp in TRY_cmp loop -- safe because
-;         OP is only set during expression evaluation (mul/div), not tokenise.
+;   Clobbers: A Y T2
+;   Table entries carry bit 7 on their LAST character.  The source (T0) and the
+;   entry (T2) are indexed with the SAME Y, so T0 is never moved while comparing:
+;   a miss needs no backtrack, and a hit adds Y+1 to T0 once.
+;   v15.31 (size): was T0 advanced per char + saved/restored through CURLN, the
+;   entry copied to LP, and the table char masked through OP.  Here the compare
+;   is src ^ table:  0 = equal, $80 = equal on the flagged last char, else miss.
+;   (A source byte >= $80 can no longer be told apart from a flagged char; the
+;   terminal never sends one and string/REM text never reaches this routine.)
 ; =============================================================================
 TRYKW:
         LDA #<KW_TABLE
@@ -1209,56 +1264,40 @@ TRYKW:
         LDA #TOK_PRINT
         STA TKTOK
 TRY_ent:
-        LDA (T2)             ; 65C02 zp-indirect: first char of entry ($00 = end of table)
+        LDA (T2)             ; first char of entry ($00 = end of table)
         BEQ TRY_fail         ; $00 sentinel = end of table: no match
-        JSR T0_TO_CURLN      ; save source pos for possible backtrack
-        LDA T2               ; LP = T2 (point at start of keyword chars)
-        STA LP
-        LDA T2+1
-        STA LP+1
-        LDY #0               ; Y = index into keyword entry
+        LDY #0               ; Y = index into the source text AND the table entry
 TRY_cmp:
-        LDA (LP),y           ; char from keyword table (bit 7 = last-char flag)
-        TAX                  ; X = raw table byte (preserves bit 7 for end-check)
-        AND #$7F             ; strip high-bit: get printable char for comparison
-        STA OP               ; OP ($BB) = masked table char temp (safe: not used in tokenise)
-        LDA (T0)             ; char from source (IBUF); T0=source ptr, T1=dest ptr -- NEVER STA T1 here!
-        JSR UC               ; uppercase source char
-        CMP OP               ; compare: Z=1 on match -- MUST NOT touch Z before BNE
-        BNE TRY_miss         ; Z=0: mismatch -> try next keyword
-        ; matched -- is this the last char? bit 7 is in X
-        TXA                  ; restore raw byte to A; TXA sets N=bit7, does not affect Z
-        BMI TRY_matched_adv  ; N=1: high-bit set -> last char of keyword, full match
-        ; not last char: advance source pointer and loop
-        JSR INC_T0            ; advance T0 (source ptr); clobbers flags but not X or Y
-        INY                  ; next table char index
-        BNE TRY_cmp          ; always (no keyword >= 256 chars)
-TRY_matched_adv:
-        JSR INC_T0            ; advance source past the final matched char
-        ; ---- full match ----
+        LDA (T0),y           ; source char
+        JSR UC               ; uppercase it
+        EOR (T2),y           ; 0 = equal; $80 = equal, entry's last char; else mismatch
+        BEQ TRY_nxt          ; equal, more chars follow
+        CMP #$80
+        BNE TRY_miss         ; mismatch: try next keyword
+        ; ---- full match: advance T0 past the Y+1 matched chars ----
+        TYA
+        SEC
+        ADC T0
+        STA T0
+        BCC TRY_hit
+        INC T0+1
+TRY_hit:
         LDA TKTOK
-        PHA
-TRY_chk_rem:
-        CMP #TOK_REM         ; REM: emit token FIRST, then absorb rest of line verbatim
-        BNE TRY_emt
-        PLA
-        JSR TKEMIT           ; emit TOK_REM before the raw comment text
-TRY_raw:                     ; copy raw bytes until $0D (REM body)
+        JSR TKEMIT           ; emit the token (TKEMIT leaves A alone)
+        CMP #TOK_REM         ; REM: token first, then absorb rest of line verbatim
+        BNE TRY_ok
+TRY_raw:                     ; copy raw bytes until the NUL terminator (REM body)
         LDA (T0)
-        CMP #$0D
-        BEQ TRY_raw_done
+        BEQ TRY_ok
         JSR TKEMIT
         JSR INC_T0
         BRA TRY_raw
-TRY_emt:
-        PLA
-        JSR TKEMIT
-TRY_raw_done:
-        CLC
+TRY_ok: CLC
         RTS
-TRY_miss:                    ; this keyword doesn't match: restore T0, try next
-        LDX #(CURLN-T0)
-        JSR TO_T0
+TRY_nxt:
+        INY                  ; next char pair
+        BNE TRY_cmp          ; always (no keyword >= 256 chars)
+TRY_miss:                    ; this keyword doesn't match: next entry (T0 untouched)
         JSR KW_NEXT          ; advance T2 past current entry
         INC TKTOK
         BRA TRY_ent
@@ -1290,7 +1329,7 @@ EL_done:
 
 ; =============================================================================
 ; EDITLN ? insert, replace, or delete a numbered program line
-;   In:  IP   points at tokenised line in TBUF  ($FF lo hi body $0D)
+;   In:  IP   points at tokenised line in TBUF  ($FF lo hi body $00)
 ;   Out: program store updated:
 ;          body non-empty ? INSLINE (insert or replace)
 ;          body empty     ? DELINE  (delete existing line)
@@ -1303,10 +1342,9 @@ EDITLN:
         LDX #(LP-IP)
         JSR PROG2P
         BRA EL_fl             ; skip EL_skip's own body on the first pass
-EL_skip:                     ; advance LP past current line  (scan body for $0D)
+EL_skip:                     ; advance LP past current line (hop by its length byte)
         LDY #2
-        JSR TOKSKIP_LP
-        TYA                  ; Y = offset just past $0D
+        LDA (LP),y           ; A = record length (v15.31 length byte)
         CLC
         ADC LP
         STA LP
@@ -1328,19 +1366,17 @@ EL_ck:  BCC EL_skip          ; stored < target (whichever CMP fired): keep scann
         ; neither branch taken -> exact match: fall through to replace
 EL_found:
         JSR DELINE           ; delete existing line before re-inserting
-EL_ins: LDA (IP)            ; check for empty body (just CR/sentinel)
-        CMP #$0D
-        BEQ EL_done
-        TAX                  ; CMP #0 replacement: TAX sets Z for free (X dead here)
+EL_ins: LDA (IP)            ; check for empty body (just the NUL terminator)
         BEQ EL_done
         ; drop through
 ; =============================================================================
 ; INSLINE ? insert (or replace) a tokenised line in the program store
-;   In:  IP   source: <body> $0D  (no $FF prefix ? PNUM already consumed it)
+;   In:  IP   source: TBUF = $FF lo hi <body> $00 (EDITLN's PNUM already consumed the
+;             number, but INSLINE rewinds IP to TBUF itself -- see below)
 ;        LP   insertion point (bytes LP..PE shifted up to make room)
 ;        PE   current program end
-;        CURLN line number for the 2-byte header
-;   Out: new line written at LP with 2-byte header prepended
+;        CURLN line number for the 3-byte header
+;   Out: new line [lo hi len body NUL] written at LP
 ;        PE   advanced by inserted byte count
 ;   Clobbers: A X Y T0 T1
 ;   Ported from uBASIC6502b (v15.5): the NMOS original counted the shift
@@ -1354,11 +1390,12 @@ EL_ins: LDA (IP)            ; check for empty body (just CR/sentinel)
 ;   exactly correct (not approximate) because RAM_TOP=$1000 is page-aligned.
 ; =============================================================================
 INSLINE:
-        LDY #0
-        JSR TOKSKIP_IP
-        INY                  ; +2 for the 2-byte line-number header
-        INY
-        TYA                  ; A = total line size
+        LDA #<TBUF           ; v15.31: rewind IP to the start of TBUF ($FF lo hi body NUL;
+        STA IP               ;  TBUF is in zero page, IP+1 is already 0). The stored record
+        LDY #3               ;  is [lo hi len body NUL], so source and destination now share
+        JSR TOKSKIP_IP       ;  one index (Y=3 = first body byte on both sides) and TOKSKIP's
+        TYA                  ;  Y = offset past the NUL = total record length, no +2 fixup.
+        PHA                  ; save the length for the header write below
         CLC
         ADC PE                ; new PE = PE + total size
         STA T1
@@ -1390,86 +1427,74 @@ IN_d1:  DEC T1
         STA (T1),y
         JSR CMP_T0_LP        ; stop exactly when T0 == LP
         BNE IN_bk
-IN_hdr: LDA CURLN             ; write 2-byte line-number header at LP
+IN_hdr: LDA CURLN             ; write 3-byte header at LP: line number lo, hi, record length
         STA (LP),y            ; Y is 0 here
         INY
         LDA CURLN+1
         STA (LP),y
-        ; advance LP by 2 for the payload destination
-        JSR LPADD2
-IN_l2:  LDY #0
-IN_cp:  LDA (IP),y            ; copy payload from IP
+        INY
+        PLA                   ; record length saved at entry
         STA (LP),y
+        INY                   ; Y = 3: body offset (same in source TBUF and destination)
+IN_cp:  LDA (IP),y            ; copy payload from TBUF
+        STA (LP),y
+        BEQ IN_done            ; NUL terminator copied: done (Z is still from the LDA)
         CMP #TOK_HEX           ; inline number (dec or hex, v15.20): copy its
-        BCC IN_cp_chk          ;  2-byte lo/hi payload unconditionally --
-                                ;  must not test them for $0D
+        BCC IN_nx              ;  2-byte lo/hi payload unconditionally --
+                                ;  must not test them for the terminator
         INY
         LDA (IP),y
         STA (LP),y
         INY
         LDA (IP),y
         STA (LP),y
-        INY
-        BRA IN_cp
-IN_cp_chk:
-        CMP #$0D
-        BEQ IN_done
-        INY
+IN_nx:  INY
         BRA IN_cp             ; always taken for bounded line lengths (<256)
 
 ; =============================================================================
-; DELINE ? remove the program line whose 2-byte header starts at LP
-;   In:  LP   points at <lo> <hi> of line to delete
+; DELINE ? remove the program line whose 3-byte header starts at LP
+;   In:  LP   points at <lo> <hi> <len> of line to delete
 ;        PE   program end pointer
-;   Out: program bytes [LP+size .. PE) shifted down to LP
-;        PE   decremented by deleted line's byte count
-;   Clobbers: A Y T0 T1 T2
+;   Out: program bytes [LP+len .. PE) shifted down to LP
+;        PE   decremented by the deleted line's length
+;        LP   unchanged (INSLINE, called right after on the replace path, needs
+;             it to still be the insertion point)
+;   Clobbers: A X Y T0 T1
+;   v15.31: the shift is a forward copy that stops when the source pointer T0
+;   reaches PE (pointer compare, like INSLINE) instead of pre-computing the
+;   remaining byte count into T2 and counting it down; LP walks as the
+;   destination and is restored from the stack. Smaller; ~2x slower per byte
+;   but this is the line-entry path, not RUN.
 ; =============================================================================
 DELINE:
         LDY #2
-        JSR TOKSKIP_LP
-        STY T1               ; T1 = line size (header + body + CR)
-        TYA                  ; T0 = LP + size  (source for compaction)
-        CLC
+        LDA (LP),y           ; A = record length (v15.31 length byte)
+        STA T1               ; T1 = line size (header + body + NUL); hi byte never needed
+        CLC                  ; T0 = LP + size  (source for compaction)
         ADC LP
         STA T0
         LDA LP+1
         ADC #0
         STA T0+1
-        LDA PE               ; T2 = bytes remaining after this line
-        SEC
-        SBC T0
-        STA T2
-        LDA PE+1
-        SBC T0+1
-        STA T2+1
-        LDA T2
-        ORA T2+1
-        BEQ DL_upd           ; nothing to shift: just update PE
-        LDA LP               ; save LP: the shift loop's own page-boundary
-        PHA                  ;  INC LP+1 must not leak to the caller -- INSLINE
-        LDA LP+1             ;  (called right after DELINE, on the replace-line
-        PHA                  ;  path) needs LP to still be the insertion point.
-        LDY #0
-DL_cp:  LDA (T0),y           ; shift bytes down
-        STA (LP),y
-        INY
-        BNE DL_nhi
-        INC T0+1
-        INC LP+1
-DL_nhi: LDA T2               ; decrement T2 (inlined; T2DEC removed, single caller)
-        BNE DL_declo
-        DEC T2+1
-DL_declo:
-        DEC T2
-        LDA T2
-        ORA T2+1
-        BNE DL_cp
+        LDA LP               ; save LP: it walks as the destination below
+        PHA
+        LDA LP+1
+        PHA
+DL_cp:  LDX #T0              ; source reached PE? then everything above the hole is moved
+        LDY #PE
+        JSR CMP16
+        BEQ DL_done
+        LDA (T0)             ; shift one byte down
+        STA (LP)
+        JSR INC_T0
+        JSR INC_LP
+        BRA DL_cp
+DL_done:
         PLA                  ; restore LP
         STA LP+1
         PLA
         STA LP
-DL_upd: LDA PE               ; update PE
+        LDA PE               ; PE -= size
         SEC
         SBC T1
         STA PE
@@ -1489,10 +1514,7 @@ DL_ok:  RTS
 ; =============================================================================
 STMT:
         LDA (IP)
-        CMP #$0D             ; empty / end-of-line
-        BEQ ST_nop
-        TAX                  ; CMP #0 replacement: TAX sets Z for free (X dead here)
-        BEQ ST_nop
+        BEQ ST_nop           ; NUL = empty / end-of-line
         BMI ST_tok           ; $80+ = keyword token (checked FIRST, before colon)
         CMP #':'             ; colon separator: skip and loop
         BEQ ST_colon
@@ -1546,11 +1568,13 @@ DP_top: LDA (IP)            ; Peek next token -> A
         BNE DP_expr    
         JSR GETCI            ; consume opening '"'
 
-DP_str: JSR GETCI
+DP_str: LDA (IP)             ; peek first: an unterminated string must NOT consume the
+        BEQ DP_nl            ;  NUL line terminator (v15.31; with NUL endings a consumed
+                             ;  terminator would leave IP on the next line's number bytes,
+                             ;  whose hi byte is 0 for lines < 256 and reads as another NUL)
+        JSR INC_IP
         CMP #'"'
         BEQ DP_aft
-        CMP #CR
-        BEQ DP_nl
         JSR PUTCH
         BRA DP_str
 
@@ -1604,12 +1628,10 @@ DP_semi:
 ; DP_end -- shared end-of-item-list test for DP_top and DP_semi (v15.30: one
 ;           copy instead of two inline compare chains)
 ;   In:  A = token at IP
-;   Out: Z=1 if A is CR, ':', ELSE or 0 (sentinel); Z=0 otherwise.  A preserved.
+;   Out: Z=1 if A is NUL, ':' or ELSE; Z=0 otherwise.  A preserved.
 ;   Clobbers: X (only on the sentinel test)
 ; -----------------------------------------------------------------------------
-DP_end: CMP #CR
-        BEQ DP_end_x
-        CMP #':'
+DP_end: CMP #':'
         BEQ DP_end_x
         CMP #TOK_ELSE
         BEQ DP_end_x
@@ -1626,7 +1648,6 @@ DP_chk_hex:
         BNE DP_norm
         LDY #3                ; peek past marker+lo+hi, don't consume
         LDA (IP),y
-        CMP #CR
         BEQ DP_hex_only
         CMP #';'
         BEQ DP_hex_only
@@ -1657,10 +1678,7 @@ DO_IF:
         ; -- condition false: scan for ELSE -----------------------------------
 DO_IF_f:
         LDA (IP)
-        CMP #CR              ; EOL with no ELSE: done
-        BEQ DO_IF_done
-        TAX                  ; 1-byte CMP #0 replacement
-        BEQ DO_IF_done
+        BEQ DO_IF_done       ; NUL = EOL with no ELSE: done
 
         CMP #TOK_ELSE
         BEQ DO_IF_else       ; found the ELSE: consume it and fall into exec
@@ -1778,9 +1796,9 @@ DO_input_dn:
         RTS                  ; (no longer falls into DO_REM, which now does real work)
 
 ; =============================================================================
-; DO_REM ? REM (comment): skip the raw comment text up to (not past) the $0D
+; DO_REM ? REM (comment): skip the raw comment text up to (not past) the NUL
 ;   In:  IP   just past the REM token
-;   Out: IP   points AT the line's $0D, so ST_sep / SKIPEOL see end-of-line
+;   Out: IP   points AT the line's NUL, so ST_sep / SKIPEOL see end-of-line
 ;   Clobbers: A Y
 ;   v15.30: previously a bare RTS, which let ST_sep treat a ':' at the start of
 ;   the comment as a statement separator and execute the raw comment text
@@ -1789,8 +1807,8 @@ DO_input_dn:
 ;   ASCII so the number-payload test inside it never fires.
 ; =============================================================================
 DO_REM: LDY #0
-        JSR TOKSKIP_IP        ; Y = offset just past the $0D
-        DEY                   ; -> offset of the $0D itself
+        JSR TOKSKIP_IP        ; Y = offset just past the NUL
+        DEY                   ; -> offset of the NUL itself
         TYA
         CLC
         ADC IP
@@ -1819,16 +1837,16 @@ RUNLP:
         LDY #PE
         JSR CMP16
         BEQ RUNEND
-        JSR RD_CURLN          ; read 2-byte line-number header, advance IP by 2
+        JSR RD_CURLN          ; read line-number header, advance IP past the 3-byte header
 RUNGO:  JSR STMT
         BBR #0,RUN,RUNEND
         JSR SKIPEOL
         BRA RUNLP
 
 ; =============================================================================
-; RD_CURLN ? read the 2-byte line-number header at IP into CURLN, advance IP
-;   In:  IP -> line-number header (lo,hi)
-;   Out: CURLN = header value; IP advanced by 2
+; RD_CURLN ? read the line-number header at IP into CURLN, advance IP past the header
+;   In:  IP -> record header (lo, hi, len)
+;   Out: CURLN = line number; IP advanced by 3 (to the first token)
 ;   Clobbers: A
 ;   Shared by RUNLP (DO_RUN) and DN_runbody (DO_NEXT) -- identical body,
 ;   extracted rather than duplicated.
@@ -1839,7 +1857,7 @@ RD_CURLN:
         JSR INC_IP
         LDA (IP)              ; hi byte
         STA CURLN+1
-        JMP INC_IP            ; tail call: advance IP past hi byte, then RTS
+        JMP IPADD2            ; tail call: skip hi byte and the length byte, then RTS
 
 ; =============================================================================
 ; PROG2IP / PROG2P -- reset a zero-page pointer pair to PROG (program start)
@@ -1883,8 +1901,15 @@ INIT_z: STZ 0,x              ; 65C02 STZ zp,x  (no LDA #0 needed)
 
 ; Two labels on one instruction: DO_END is the handler entry, RUNEND is the
 ; shared landing target used by DO_RUN and NEXT_END.
+;   v15.31 FIX: also park IP on a NUL (IP=$0000: the byte at $0000 is IP's own
+;   low byte, just zeroed). Both callers RTS into ST_sep, which peeks (IP) for a
+;   ':'. IP used to be left at PE, so a stale ':' left in free RAM by an earlier,
+;   longer program ran as garbage after RUN ("10 REM A" printed an extra line),
+;   and "END: PRINT 2" ran the PRINT after the END.
 DO_END:
 RUNEND: STZ RUN
+        STZ IP
+        STZ IP+1
 LS_done:
         RTS
 
@@ -1898,11 +1923,11 @@ LS_done:
 ;   Clobbers: A X Y T0 T1 T2 LP
 ;   T1 = lo-bound, T2 = hi-bound; defaulted to the full range (0..$7FFF) for
 ;   a bare LIST, or set via GET_TWO_ARGS.
-;   Lines below the lo-bound are walked (to correctly locate the next line)
-;   via a separate, minimal token-aware skip loop (LS_skip_body) that never
-;   calls PUTCH/PRT16/PRNL, so the shared print primitives need no
-;   suppression flag. Lines are stored in ascending order, so a current
-;   line number above the hi-bound stops the whole scan immediately.
+;   Lines below the lo-bound are hopped over with their length byte (v15.31;
+;   LS_skip_hdr), so nothing is printed or de-tokenised for them and the shared
+;   print primitives need no suppression flag. Lines are stored in ascending
+;   order, so a current line number above the hi-bound stops the whole scan
+;   immediately.
 ; =============================================================================
 DO_LIST:
         STZ T1                ; default lo-bound = 0
@@ -1912,8 +1937,7 @@ DO_LIST:
         LDA #$7F
         STA CY+1
         LDA (IP)
-        CMP #$0E
-        BCC LS_scan           ; bare LIST? defaults stand
+        BEQ LS_scan           ; bare LIST? defaults stand
 
         JSR GET_TWO_ARGS      ; args present: T1 = n (lo), T0 = m
         LDA T0
@@ -1951,11 +1975,10 @@ LS_ln:  LDX #LP               ; end of program?
         ; -- Print Valid Line --
         JSR PRT16             ; print line number
         JSR PRTSP
-        JSR LPADD2            ; advance LP past 2-byte header
+        JSR LPADD3            ; advance LP past the 3-byte header (lo, hi, length)
 
 LS_body:
         LDA (LP)
-        CMP #CR
         BEQ LS_eol
         CMP #TOK_HEX          ; hex literal? (v15.20)
         BEQ LS_hex
@@ -2001,24 +2024,21 @@ LS_num: JSR load_t0_inc      ; consume marker+lo+hi -> T0
         JSR PRT16             ; print as decimal
         BRA LS_tail
 
-; -- below-lo-bound path: advance LP past header, then skip body silently --
-LS_skip_hdr:
-        JSR LPADD2
-LS_skip_body:
-        LDA (LP)
-        CMP #CR
-        BEQ LS_skip_eol
-        CMP #TOK_HEX          ; dec or hex literal, v15.20
-        BCC LS_skip_adv
-        JSR LPADD2            ; skip the marker, skip lo byte
-LS_skip_adv:
-        JSR INC_LP            ; skip this byte (or the literal's hi byte)
-        BRA LS_skip_body
-
 LS_eol: JSR PRNL              ; fall-through EOL handler (saves 1 byte)
-LS_skip_eol:
-        JSR INC_LP
-        JMP LS_ln              ; loop back to next line
+        JSR INC_LP            ; step past the NUL
+LS_go:  JMP LS_ln              ; loop back to next line
+
+; -- below-lo-bound path: hop over the whole record by its length byte (v15.31;
+;    was a token-aware byte scan of the body) --
+LS_skip_hdr:
+        LDY #2
+        LDA (LP),y            ; A = record length
+        CLC
+        ADC LP
+        STA LP
+        BCC LS_go
+        INC LP+1
+        BRA LS_go
 
 LS_hex: JSR load_t0_inc       ; hex literal (v15.20): consume marker+lo+hi -> T0
         JSR PRT_HEX            ; print as $HHHH
@@ -2101,7 +2121,7 @@ PS_norm: JSR PUTCH
 ;     [2]  limit_hi
 ;     [3]  step_lo
 ;     [4]  step_hi
-;     [5]  resume_ip_lo   (IP just past the FOR clause: ':' or $0D)   v15.30
+;     [5]  resume_ip_lo   (IP just past the FOR clause: ':' or NUL)   v15.30
 ;     [6]  resume_ip_hi
 ;     [7]  loop_line_lo   (CURLN when FOR was executed)
 ;     [8]  loop_line_hi
@@ -2178,7 +2198,7 @@ DO_for_szok:
 DO_for_push:
         JSR FSTK_BASE        ; LP = FOR_STK + FSTK*9 (A already holds FSTK)
         LDA IP               ; stage resume point: IP is just past the FOR clause
-        STA FIP              ;  (at ':' or the $0D) -- this is where NEXT jumps back to
+        STA FIP              ;  (at ':' or the NUL) -- this is where NEXT jumps back to
         LDA IP+1
         STA FIP+1
         LDY #8
@@ -2269,15 +2289,15 @@ DN_loop:                     ; branch back to body: restore IP and CURLN from th
         INY
         LDA (LP),y           ; [8] loop_line_hi
         STA CURLN+1
-        JSR SKIP_STMT        ; step over any junk after the FOR clause (stop at ':' or $0D)
+        JSR SKIP_STMT        ; step over any junk after the FOR clause (stop at ':' or NUL)
         BCC DN_samel         ; C=0: ':' found -- body is colon-chained on this line
-        ; C=1: $0D found -- FOR was alone on its line (original behaviour)
-        JSR INC_IP            ; consume the $0D
+        ; C=1: NUL found -- FOR was alone on its line (original behaviour)
+        JSR INC_IP            ; consume the NUL
         LDX #IP
         LDY #PE
         JSR CMP16
         BEQ DN_end           ; IP == PE: program ended inside loop
-        JSR RD_CURLN          ; read 2-byte line-number header, advance IP
+        JSR RD_CURLN          ; read line-number header, advance IP past it
         JMP RUN_LINE         ; restore S and jump to target
 DN_samel:                    ; colon-chained: resume right after ':' on same line
         JSR INC_IP            ; consume the ':'  (CURLN already restored above)
@@ -2343,12 +2363,12 @@ DO_DATA:
 ;   Reads the next value(s) from DATA lines into variable(s).
 ;   DATA line format in program store (v15.20: DATA is tokenized normally,
 ;   same as any other statement -- no more raw-ASCII special case):
-;     [lineno_lo][lineno_hi][TOK_DATA][value list: '-'? (TOK_NUM|lo|hi), ','...][$0D]
+;     [lineno_lo][lineno_hi][len][TOK_DATA][value list: '-'? (TOK_NUM|lo|hi), ','...][$00]
 ;   DATA_PTR invariant:
 ;     0    reset/restored ? rescan from PROG on next READ
 ;     PE   exhausted ? no more DATA values exist
 ;     else points at current parse position INSIDE a DATA body (past TOK_DATA),
-;          i.e. at '-', TOK_NUM/TOK_HEX, a comma, or $0D (body exhausted)
+;          i.e. at '-', TOK_NUM/TOK_HEX, a comma, or NUL (body exhausted)
 ;   In:  IP        first token of READ statement (variable letter)
 ;        DATA_PTR  current position (see invariant)
 ;   Out: IP        advanced past consumed variable(s) and commas
@@ -2396,31 +2416,30 @@ RD_next_val:
         STA DATA_PTR+1        ; DATA_PTR lo already 0 (ORA above proved it)
         BRA RD_find          ; DATA_PTR now at first line header; find DATA
 
-        ; -- $0D exhaustion (shared by RD_body and RD_skip_ln below): advance
-        ;    past it, then find the next DATA line ---------------------------
-RD_exh: JSR INC_DATA_PTR       ; skip $0D
-        ; fall through to RD_find (DATA_PTR now at next line header)
-        ; -- scan from line header for next DATA line --------------------------
+        ; -- NUL exhaustion (RD_body): advance past it, then find the next DATA
+        ;    line ------------------------------------------------------------
+RD_exh: JSR INC_DATA_PTR       ; skip the NUL
+        ; fall through to RD_find (DATA_PTR now at next record header)
+        ; -- scan record headers for the next DATA line ------------------------
+        ;    (v15.31: each record carries its length, so a non-DATA line is
+        ;    skipped with one hop instead of a byte-by-byte body scan)
 RD_find:
         LDX #DATA_PTR
         LDY #PE
         JSR CMP16
         BEQ RD_ood           ; hit PE: no more DATA
-        JSR DATAPTRADD2       ; skip lineno_lo and hi
-        LDA (DATA_PTR)       ; first body token  (65C02 zp-indirect, no Y needed)
+        LDY #3
+        LDA (DATA_PTR),y     ; first body token (header is lo, hi, length)
         CMP #TOK_DATA
         BEQ RD_found_data
-        ; not DATA: scan forward to $0D then try next line
-RD_skip_ln:
-        LDA (DATA_PTR)       ; 65C02 zp-indirect
-        CMP #CR
-        BEQ RD_exh           ; share exhaustion advancement
-        CMP #TOK_HEX          ; inline number (dec or hex, v15.20): unconditionally
-        BCC RD_ADV            ;  skip its 3-byte marker+lo+hi -- must not test lo/hi for $0D
-        JSR DATAPTRADD2       ; skip lo/hi payload
-RD_ADV:
-        JSR INC_DATA_PTR
-        BRA RD_skip_ln
+        LDY #2               ; not DATA: DATA_PTR += record length, try next line
+        LDA (DATA_PTR),y
+        CLC
+        ADC DATA_PTR
+        STA DATA_PTR
+        BCC RD_find
+        INC DATA_PTR+1
+        BRA RD_find
 
         ; -- if DATA_PTR==PE: out of data -------------------------------------
 RD_chk_pe:
@@ -2431,19 +2450,19 @@ RD_chk_pe:
         ; -- DATA_PTR is inside a DATA body: skip separators ------------------
 RD_body:
         LDA (DATA_PTR)       ; 65C02 zp-indirect, no Y needed
+        BEQ RD_exh            ; NUL: exhausted -> shared advance+find
         CMP #','
         BEQ RD_sep_adv
-        CMP #$0D
-        BNE RD_parse         ; '-' or TOK_NUM/TOK_HEX: parse it
-        BRA RD_exh            ; $0D: exhausted -> shared advance+find
+        BRA RD_parse         ; '-' or TOK_NUM/TOK_HEX: parse it
 
 GT_err:
 RD_ood: SEC
         RTS
 
-RD_sep_adv:
 RD_found_data:
-        JSR INC_DATA_PTR       ; skip TOK_DATA byte ? now inside body
+        JSR DATAPTRADD3        ; skip lo, hi, length: DATA_PTR now at the TOK_DATA byte
+RD_sep_adv:
+        JSR INC_DATA_PTR       ; skip TOK_DATA (or a ',' separator) -- now inside body
         BRA RD_body          ; enter body (may be space/comma at start)
 
         ; -- parse value at DATA_PTR (v15.20: TOK_NUM/TOK_HEX, not ASCII) -----
@@ -2480,7 +2499,7 @@ RD_readnum:
 ; GOTOL ? search program store for a line number; point IP at its body
 ;   In:  T0   target line number (16-bit)
 ;        RUN/CURLN/IP  current program position (used only when RUN != 0)
-;   Out: C=0  found: IP points at first token after the 2-byte header
+;   Out: C=0  found: IP points at first token after the 3-byte header (lo, hi, len)
 ;        C=1  not found (caller should raise ERR_UL)
 ;   Clobbers: A X Y IP
 ;
@@ -2522,17 +2541,19 @@ GT_go:  LDA (IP)             ; line-number lo  (65C02 zp-indirect, no Y needed)
         LDA (IP),y           ; line-number hi
         CMP T0+1
         BEQ GT_ok
-GT_nx:  LDY #2               ; skip to body, scan for $0D
-GT_sk:  JSR TOKSKIP_IP       ; (fast path enters here with Y=0: IP is mid-line)
-        TYA
-        CLC
+GT_nx:  LDY #2               ; not this line: hop over the whole record using its
+        LDA (IP),y           ;  length byte (v15.31: no per-byte scan of the body)
+        BRA GT_adv
+GT_sk:  JSR TOKSKIP_IP       ; (fast path enters here with Y=0: IP is mid-line, so the
+        TYA                  ;  rest of the current line must still be scanned for its NUL)
+GT_adv: CLC                  ; IP += A
         ADC IP
         STA IP
         BCC GT_sc
         INC IP+1
         BRA GT_sc
-GT_ok:   ; advance IP past 2-byte header
-        JSR IPADD2
+GT_ok:   ; advance IP past the 3-byte header (lo, hi, length)
+        JSR IPADD3
 GT_r:   CLC
         RTS                  ; C=0: found
 
@@ -4019,17 +4040,16 @@ PRT_HEXN_OK:
 ; =============================================================================
 ; SKIP_STMT ? advance IP to the end of the current statement
 ;   In:  IP   anywhere within a statement's tokens
-;   Out: IP   points AT the terminating byte (':' or $0D), not past it
+;   Out: IP   points AT the terminating byte (':' or NUL), not past it
 ;        C=0  stopped at ':'  (more statements follow on this line)
-;        C=1  stopped at $0D  (end of line)
+;        C=1  stopped at NUL  (end of line)
 ;   Clobbers: A
 ; =============================================================================
 SKIP_STMT:
         LDA (IP)
+        BEQ SKST_eol
         CMP #':'
         BEQ SKST_colon
-        CMP #$0D
-        BEQ SKST_eol
         CMP #TOK_HEX          ; dec or hex literal, v15.20
         BCC SKST_adv          ; If not a number, skip ahead to the single increment
         JSR IPADD2            ; If it IS a number, skip the 2 extra bytes first
@@ -4078,28 +4098,14 @@ UC:     CMP #'a'
 UC_d:   RTS
 
 ; -----------------------------------------------------------------------------
-; TOKSKIP_LP/IP ? scan (LP),Y for $0D, skipping TOK_NUM payloads
-;   In:  Y   starting offset (caller sets it, e.g. LDY #2 to skip a header)
-;   Out: Y   offset just past the $0D
-;   Clobbers: A
-; =============================================================================
-TOKSKIP_LP:
-TSLP:   LDA (LP),y
-        INY
-        CMP #TOK_HEX          ; dec or hex literal, v15.20
-        BCC TSLP_chk
-        INY
-        INY
-;        BRA TSLP ; not needed as A is a token
-TSLP_chk:
-        CMP #$0D
-        BNE TSLP
-        RTS
-
-; TOKSKIP_IP ? identical, but via (IP),Y
+; TOKSKIP_IP ? scan (IP),Y for the NUL line terminator, skipping TOK_NUM/TOK_HEX
+;   payloads (their lo/hi bytes may legitimately be $00)
 ;   In:  Y   starting offset (caller sets it)
-;   Out: Y   offset just past the $0D
-;   Clobbers: A
+;   Out: Y   offset just past the NUL
+;   Clobbers: A X
+;   (v15.31: the (LP),Y twin TOKSKIP_LP is gone -- every LP/DATA_PTR walker now
+;    hops by the record's length byte instead of scanning the body.)
+; =============================================================================
 TOKSKIP_IP:
 TSIP:   LDA (IP),y
         INY
@@ -4109,7 +4115,7 @@ TSIP:   LDA (IP),y
         INY
 ;        BRA TSIP ; not needed as A is a token
 TSIP_chk:
-        CMP #$0D
+        TAX                   ; Z iff NUL terminator
         BNE TSIP
         RTS
 
@@ -4119,17 +4125,17 @@ TSIP_chk:
 ;   branch of IF already consumed the THEN body and RUNLP calls STMT again,
 ;   which sees ELSE first).  We simply discard everything to end-of-line.
 ;
-; SKIPEOL ? advance IP past the $0D end-of-line marker
+; SKIPEOL ? advance IP past the NUL end-of-line marker
 ;   In:  IP   anywhere in the current token stream line
 ;   Out: IP   points at first byte of the next line
 ;   Clobbers: A
 ; =============================================================================
 DO_ELSE_SK:
 SKIPEOL:
-        JSR SKIP_STMT         ; C=0 at ':', C=1 at $0D
+        JSR SKIP_STMT         ; C=0 at ':', C=1 at NUL
         JSR INC_IP              ; advance past whichever terminator we stopped at
         BCC SKIPEOL            ; ':' -> more statements on this line: keep scanning
-        RTS                     ; $0D -> IP now points past it
+        RTS                     ; NUL -> IP now points past it
 
 ; =============================================================================
 ; I/O stubs ? Kowalski simulator virtual terminal
