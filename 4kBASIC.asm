@@ -1,5 +1,5 @@
 ; =============================================================================
-; 4K Integer BASIC v15.31 for the 65C02
+; 4K Integer BASIC v15.33 for the 65C02
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -131,6 +131,48 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ;
+; v15.33 (Nov 2026) - 29 bytes free (confirmed by build at $F000) - EXECUTION SPEED: INLINING PASS
+;   Pure speed pass; behaviour is unchanged (all 18 regression scripts and the showcase output are
+;   identical to v15.32). Every inlined site carries an "INLINED ... (v15.33)" comment in the code.
+;   Sites (chosen from measured experiments, simulator instruction count per loop pass):
+;     RUNLP   CMP16 (IP==PE end test)            -> compare done in place
+;     RUNLP   RD_CURLN (read [lo hi len] header) -> read in place; RD_CURLN now only serves DO_NEXT
+;     RUNLP   SKIPEOL fast path                  -> if (IP) is already the NUL, step over it in
+;                                                   place; anything else still JSRs SKIPEOL
+;     DO_NEXT CMP16 (IP==PE end test)            -> compare done in place
+;     EXPR1   front of EXPR_POW                  -> atom fetched here; EP_have only called when a
+;                                                   '^' follows
+;     EXPR1   EXPR2 variable-atom fast path      -> plain A-Z variable loaded in place (no JSR EXPR2,
+;                                                   no INC_IP call); numbers, parens, unary ops and
+;                                                   functions take the general EXPR2 as before
+;     DO_LET  PARSE_VAR                          -> letter test + consume in place
+;   Side effects: RUN_LINE now ends in JMP RUNGO (was BRA; RUNGO moved out of branch range).
+;   Cost: +84 bytes of ROM (113 -> 29 free). The variable fast path adds 5 instructions to an atom
+;   that is not a variable (e.g. GOTO/GOSUB line numbers); the other sites more than pay for it.
+;   Measured, instructions per loop pass, v15.32 -> v15.33:
+;     empty FOR/NEXT loop 342 -> ~297 (-13%)     nested loops 3859 -> 3351 (-13%)
+;     expression loop     944 -> 841 (-11%)      GOSUB/RETURN   627 -> 571 (-9%)
+;     (JSR+RTS is 2 instructions but 12 cycles on real hardware, so cycle savings are larger.)
+;   Not done (not measured as worthwhile or too big for the ROM left): operator pre-filter in the
+;   expression levels, lazy CURLN, inlining GETCI/INC_IP at the many cold sites.
+
+; v15.32 (Nov 2026) - 113 bytes free (confirmed by build) - FIX: NEXT STACK LEAK
+;   Reported on 6502.org (thanks): when FOR is not alone on its line, e.g.
+;       10 FOR A=0 TO 100:PRINT A:NEXT
+;   every NEXT pass leaked 4 bytes of hardware stack (DN_samel did JMP RUNGO = a fresh JSR STMT
+;   while still inside the STMT activation that dispatched NEXT). After ~60 passes the 256-byte
+;   stack wrapped, return addresses were overwritten and the program died after the loop. Present
+;   since v15.3 (colon-chained FOR); reproduced on v15.29, v15.30 and v15.31.
+;   Fix: DN_samel now leaves IP at the ':' and just RTSes into ST_sep, which consumes the ':' and
+;   continues the line through STMT's own non-recursive loop. Zero stack growth, works in RUN and
+;   in immediate mode, and is 5 bytes smaller. (The suggested JMP RUN_LINE also stops the leak in a
+;   program, but RUNSP is stale at the prompt, so a chained loop typed in immediate mode crashed.)
+;   Cost: a chained loop pass takes 4 more instructions (274 -> 278 per iteration); loops with
+;   FOR on its own line are unchanged. All other benchmarks unchanged.
+;   Showcase: line 82 runs a 100-pass FOR...:NEXT on one line and checks the count (would have
+;     crashed before). New regression script r_flow_leak (colon-chained, nested, GOSUB inside,
+;     negative STEP, 2000 passes, immediate mode); the 17 existing scripts are unchanged.
+
 ; v15.31 (Nov 2026) - 108 bytes free (confirmed by build at $F000) - LINE FORMAT + SIZE PASS
 ;   Program lines are now stored as   <lo> <hi> <len> <tokens...> $00   (was <lo> <hi> <tokens...> $0D)
 ;   - NUL line ends: every scanner tests for zero instead of comparing with $0D, and TBUF/IBUF are
@@ -620,8 +662,8 @@ ZPEND    = *                    ; audit
 ;   Called as a GOSUB at line 600; uses IF/THEN/ELSE for pixel output.
 ; =============================================================================
         .ORG $0200
-        .DB $0A, $00, $1E, $89, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $33, $31, $20, $53, $48, $4F, $57, $43, $41, $53, $45, $00  ; 10 REM 4K BASIC v15.31 SHOWCASE
-        .DB $14, $00, $1C, $80, $22, $3D, $3D, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $33, $31, $20, $3D, $3D, $22, $00  ; 20 PRINT "== 4K BASIC v15.31 =="
+        .DB $0A, $00, $1E, $89, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $33, $33, $20, $53, $48, $4F, $57, $43, $41, $53, $45, $00  ; 10 REM 4K BASIC v15.33 SHOWCASE
+        .DB $14, $00, $1C, $80, $22, $3D, $3D, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $33, $33, $20, $3D, $3D, $22, $00  ; 20 PRINT "== 4K BASIC v15.33 =="
         .DB $1E, $00, $20, $80, $22, $43, $48, $52, $22, $3B, $98, $28, $FF, $24, $00, $29, $3B, $22, $28, $36, $35, $29, $3D, $22, $3B, $98, $28, $FF, $41, $00, $29, $00  ; 30 PRINT "CHR";CHR$ (36 );"(65)=";CHR$ (65 )
         .DB $28, $00, $2E, $80, $22, $31, $37, $20, $4D, $4F, $44, $20, $35, $3D, $22, $3B, $FF, $11, $00, $A1, $FF, $05, $00, $3B, $22, $20, $20, $41, $42, $53, $20, $6E, $65, $67, $37, $3D, $22, $3B, $A5, $28, $2D, $FF, $07, $00, $29, $00  ; 40 PRINT "17 MOD 5=";17 MOD 5 ;"  ABS neg7=";ABS (-7 )
         .DB $32, $00, $27, $80, $22, $4E, $4F, $54, $20, $30, $3D, $22, $3B, $9C, $FF, $00, $00, $3B, $22, $20, $20, $36, $20, $41, $4E, $44, $20, $33, $3D, $22, $3B, $FF, $06, $00, $9A, $FF, $03, $00, $00  ; 50 PRINT "NOT 0=";NOT 0 ;"  6 AND 3=";6 AND 3 
@@ -642,6 +684,7 @@ ZPEND    = *                    ; audit
         .DB $4F, $00, $17, $51, $3D, $51, $2B, $FF, $01, $00, $3A, $81, $51, $3C, $FF, $03, $00, $9F, $82, $FF, $4F, $00, $00  ; 79 Q=Q+1: IF Q<3 THEN GOTO 79
         .DB $50, $00, $1C, $8E, $FE, $FF, $00, $2C, $FF, $2A, $00, $3A, $80, $22, $50, $4F, $4B, $45, $3D, $22, $3B, $A6, $28, $FE, $FF, $00, $29, $00  ; 80 POKE $00FF ,42 :PRINT "POKE=";PEEK ($00FF )
         .DB $51, $00, $26, $80, $22, $42, $41, $43, $4B, $20, $47, $4F, $54, $4F, $2C, $20, $46, $57, $44, $20, $47, $4F, $54, $4F, $2C, $20, $52, $45, $4D, $3A, $20, $4F, $4B, $20, $22, $3B, $51, $00  ; 81 PRINT "BACK GOTO, FWD GOTO, REM: OK ";Q
+.DB $52, $00, $35, $5A, $3D, $FF, $00, $00, $3A, $8B, $59, $3D, $FF, $01, $00, $97, $FF, $64, $00, $3A, $5A, $3D, $5A, $2B, $FF, $01, $00, $3A, $8C, $3A, $80, $22, $46, $4F, $52, $3A, $4E, $45, $58, $54, $20, $78, $31, $30, $30, $20, $4F, $4B, $20, $22, $3B, $5A, $00  ; 82 Z=0:FOR Y=1 TO 100:Z=Z+1:NEXT:PRINT "FOR:NEXT x100 OK ";Z
         .DB $5A, $00, $24, $93, $41, $2C, $42, $2C, $43, $3A, $80, $22, $44, $41, $54, $41, $20, $20, $22, $3B, $41, $3B, $22, $20, $20, $22, $3B, $42, $3B, $22, $20, $20, $22, $3B, $43, $00  ; 90 READ A,B,C:PRINT "DATA  ";A;"  ";B;"  ";C
         .DB $64, $00, $18, $94, $3A, $93, $41, $3A, $80, $22, $52, $45, $53, $54, $4F, $52, $45, $20, $41, $3D, $22, $3B, $41, $00  ; 100 RESTORE :READ A:PRINT "RESTORE A=";A
         .DB $6E, $00, $10, $92, $FF, $6F, $00, $2C, $FF, $DE, $00, $2C, $FF, $4D, $01, $00  ; 110 DATA 111,222,333  (v15.30: tokenised -- was raw ASCII, so READ returned garbage)
@@ -726,7 +769,7 @@ SHOWCASE_END = *               ; v15.20: extended with Integer Spiral Vortex dem
 ; STRING TABLE (all strings on same page)
 ; =============================================================================
 STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string/kw addresses
-STR_BANNER: .DB "4K BASIC v15.31"
+STR_BANNER: .DB "4K BASIC v15.33"
 STR_CRLF:   .DB $0D,$8A             ; CR, LF|$80 = $8A
 STR_BYTES:  .DB " BYTES FREE",$0D,$8A  ; last LF has high-bit
 STR_ERROR:  .DB " ER",$D2           ; 'R'|$80 = $D2
@@ -1739,7 +1782,7 @@ DO_go_common:                ; shared by DO_GOTO and DO_GOSUB
 RUN_LINE:
         LDX RUNSP
         TXS
-        BRA RUNGO
+        JMP RUNGO            ; (v15.33: was BRA; RUNGO moved out of branch range by the RUNLP inlining)
 DO_gosub_ul:
         JMP DO_ERR_UL        ; ? shared error stub
 
@@ -1833,13 +1876,42 @@ DO_RUN:
 RUNLP:
         TSX                  ; save SP so GOTO / NEXT can unwind
         STX RUNSP
-        LDX #IP               ; check IP == PE  (end of program)
-        LDY #PE
-        JSR CMP16
+        ; INLINED CMP16 (v15.33): end-of-program test IP == PE done in place (was
+        ;   LDX #IP / LDY #PE / JSR CMP16). Common case (low bytes differ) is 3 instructions.
+        LDA IP
+        CMP PE
+        BNE RL_go
+        LDA IP+1
+        CMP PE+1
         BEQ RUNEND
-        JSR RD_CURLN          ; read line-number header, advance IP past the 3-byte header
+        ; INLINED RD_CURLN (v15.33): read the record header [lo hi len] in place and
+        ;   step IP past it with a single add (the subroutine cost a JSR, three INC_IP
+        ;   calls and a tail jump, ~24 instructions per executed line; now 11).
+        ;   RD_CURLN itself stays, DO_NEXT still uses it.
+RL_go:  LDA (IP)
+        STA CURLN
+        LDY #1
+        LDA (IP),y
+        STA CURLN+1
+        LDA IP
+        CLC
+        ADC #3                ; IP += 3 (lo, hi, len) -> first token
+        STA IP
+        BCC RUNGO
+        INC IP+1
 RUNGO:  JSR STMT
         BBR #0,RUN,RUNEND
+        ; INLINED SKIPEOL fast path (v15.33): the usual case is a statement that stops
+        ;   exactly at the line's NUL, so step over it here instead of JSR SKIPEOL ->
+        ;   JSR SKIP_STMT -> JSR INC_IP. Anything else (':' or trailing tokens) takes
+        ;   the general scan below.
+        LDA (IP)
+        BNE RL_slow
+        INC IP                ; step past the NUL
+        BNE RUNLP
+        INC IP+1
+        BRA RUNLP
+RL_slow:
         JSR SKIPEOL
         BRA RUNLP
 
@@ -1848,8 +1920,7 @@ RUNGO:  JSR STMT
 ;   In:  IP -> record header (lo, hi, len)
 ;   Out: CURLN = line number; IP advanced by 3 (to the first token)
 ;   Clobbers: A
-;   Shared by RUNLP (DO_RUN) and DN_runbody (DO_NEXT) -- identical body,
-;   extracted rather than duplicated.
+;   v15.33: RUNLP now has this inlined (see RL_go); only DO_NEXT calls it.
 ; =============================================================================
 RD_CURLN:
         LDA (IP)              ; lo byte
@@ -2293,16 +2364,28 @@ DN_loop:                     ; branch back to body: restore IP and CURLN from th
         BCC DN_samel         ; C=0: ':' found -- body is colon-chained on this line
         ; C=1: NUL found -- FOR was alone on its line (original behaviour)
         JSR INC_IP            ; consume the NUL
-        LDX #IP
-        LDY #PE
-        JSR CMP16
+        ; INLINED CMP16 (v15.33): IP == PE test in place (was LDX/LDY/JSR CMP16)
+        LDA IP
+        CMP PE
+        BNE DN_go
+        LDA IP+1
+        CMP PE+1
         BEQ DN_end           ; IP == PE: program ended inside loop
+DN_go:
         JSR RD_CURLN          ; read line-number header, advance IP past it
         JMP RUN_LINE         ; restore S and jump to target
-DN_samel:                    ; colon-chained: resume right after ':' on same line
-        JSR INC_IP            ; consume the ':'
-        JSR T0_TO_CURLN      ; T0 still holds loop_line (GOTOL doesn't clobber it) (thx to SOCI)
-        JMP RUNGO             ; re-enter statement dispatch mid-line (no header)
+DN_samel:                    ; colon-chained: body continues after the ':' on this line
+        ; v15.32 FIX (stack leak, reported on 6502.org): this used to INC_IP past the
+        ; ':' and JMP RUNGO. RUNGO does JSR STMT, but we are still INSIDE a STMT
+        ; activation (its RTS-dispatch left ST_sep_m1 on the stack), so every pass
+        ; leaked 4 bytes of hardware stack; after ~60 iterations of
+        ; "10 FOR A=0 TO 100:PRINT A:NEXT" the 256-byte page-1 stack wrapped and the
+        ; final RTS ran into garbage. Fix: leave IP AT the ':' (CURLN is already
+        ; restored from the frame) and simply RTS into ST_sep, which sees the ':',
+        ; consumes it and loops to the body via its own tail-recursive STMT loop --
+        ; zero stack growth. Unlike JMP RUN_LINE (reset S from RUNSP) this also works
+        ; in immediate mode, where RUNSP is stale. Saves 5 bytes.
+        RTS
 
 ; DN_end must stay separate from RUNEND: RUNEND only clears RUN, it does
 ; NOT decrement FSTK. A program ending on the last line of a bare FOR/NEXT
@@ -2810,7 +2893,33 @@ EA_sum:
 ;   NEG16/NEG_T1/TO_T0 clobber)
 ; =============================================================================
 EXPR1:
-        JSR EXPR_POW
+        ; INLINED front of EXPR_POW (v15.33): fetch the atom here and only call into the
+        ;   power loop (EP_have, which returns by RTS) when a '^' actually follows. Saves a
+        ;   JSR/RTS pair per EXPR1 entry. The right-operand call further down still uses
+        ;   EXPR_POW.
+        ; INLINED EXPR2 variable-atom fast path (v15.33): a plain A-Z variable (the most
+        ;   common atom) is loaded right here without JSR EXPR2 / JMP INC_IP. Anything
+        ;   else (numbers, parentheses, unary operators, functions) takes the general EXPR2.
+        LDA (IP)
+        SEC
+        SBC #'A'
+        CMP #26
+        BCS E1_gen              ; not a variable letter
+        ASL                     ; byte offset into VARS
+        TAX
+        LDA VARS,x
+        STA T0
+        LDA VARS+1,x
+        STA T0+1
+        INC IP                  ; consume the letter
+        BNE E1_pw
+        INC IP+1
+        BRA E1_pw
+E1_gen: JSR EXPR2
+E1_pw:  LDA (IP)
+        CMP #'^'
+        BNE E1_lp
+        JSR EP_have
 E1_lp:  LDA (IP)
         CMP #'*'
         BEQ E1_md
@@ -3921,8 +4030,17 @@ DO_LET:
         BNE DO_let_var
         JSR GETCI            ; consume optional LET keyword
 DO_let_var:
-        JSR PARSE_VAR
-        BCS DO_let_dn
+        ; INLINED PARSE_VAR (v15.33): variable letter test + consume done in place (was
+        ;   JSR PARSE_VAR). PARSE_VAR remains for its other caller.
+        LDA (IP)
+        SEC
+        SBC #'A'
+        CMP #26
+        BCS DO_let_dn        ; not a letter: nothing to assign (as before)
+        INC IP               ; consume the letter
+        BNE DL_pv
+        INC IP+1
+DL_pv:  ASL                  ; x2: byte offset into VARS
         PHA                  ; save var slot
         LDA (IP)
         CMP #'='
