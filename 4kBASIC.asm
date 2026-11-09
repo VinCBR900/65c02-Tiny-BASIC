@@ -2375,7 +2375,7 @@ DN_go:
         JSR RD_CURLN          ; read line-number header, advance IP past it
         JMP RUN_LINE         ; restore S and jump to target
 DN_samel:                    ; colon-chained: body continues after the ':' on this line
-        ; v15.32 FIX (stack leak, reported on 6502.org): this used to INC_IP past the
+        ; v15.32 FIX (stack leak, reported on 6502.org by SOCI): this used to INC_IP past the
         ; ':' and JMP RUNGO. RUNGO does JSR STMT, but we are still INSIDE a STMT
         ; activation (its RTS-dispatch left ST_sep_m1 on the stack), so every pass
         ; leaked 4 bytes of hardware stack; after ~60 iterations of
