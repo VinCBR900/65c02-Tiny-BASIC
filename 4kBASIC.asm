@@ -155,7 +155,7 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ;
-; v15.34 (Nov 2026) - 33 ROM bytes free - COMPACT CONSTANTS + RAM OVERLAY
+; v15.34 (Nov 2026) - 3 ROM bytes free - COMPACT CONSTANTS + RAM OVERLAY + CORDIC SPEED
 ;   - Constant literals encoded for compact single digits (See above), Showcase regenerated 
 ;     for new encoding. Token numbering closed up to eliminate dead space.
 ;   - RAM overlay (See above) 
@@ -167,6 +167,10 @@
 ;   - Removed SHL/SHR IRQ_HANDLER for space. 
 ;   - FIXED unary +: EXPR2 consumes the "+" and re-dispatches on the operand (+5, +A, 3++4 were
 ;     misparsed as "(" ")" pairs, which could swallow the rest of the line). 
+;   - CORDIC speed pass: new CK_SH copies and shifts in one loop with the high byte in A 
+;     and replaces TO_T0 + ASR16 in the loop; ASR16 removed 
+;   - 8 x 8 multiply fast path: MUL16_U takes a fixed 8-pass shift-right multiply when both
+;     operands are < 256, with no swap.
 
 ; v15.33 (Nov 2026) - 29 bytes free - EXECUTION SPEED: INLINING PASS
 ;   Speed only, behaviour unchanged (+84 bytes ROM). Inlined: RUNLP CMP16, RD_CURLN and
@@ -176,7 +180,7 @@
 ;   3859 -> 3351 (-13%), expression loop 944 -> 841 (-11%), GOSUB/RETURN 627 -> 571 (-9%).
 
 ; v15.32 (Nov 2026) - 113 bytes free - FIX: NEXT STACK LEAK
-;   Fix reportedby SOCI on 6502.org: FOR/NEXT on multi statement line memory leak. 
+;   Bug reportedby SOCI on 6502.org: FOR/NEXT on multi statement line memory leak. 
 ;   (10 FOR A=0 TO 100:PRINT A:NEXT) Fix: DN_SAMEL leaves IP at the ':' and RTSes into 
 ;   ST_SEP. No stack growth, works inimmediate mode
 
@@ -830,10 +834,9 @@ STMT_JT:
 ;   Clobbers: everything (falls into MAIN)
 ; =============================================================================
 INIT:
-        LDX #HWSTACK
-        TXS                  ; reset SP
         CLD                  ; clear decimal mode
-        JSR DO_END           ; change to JSR DO_NEW for real ROM  
+        ; Zero page comes from the RAM image: zeros, with PE = SHOWCASE_END and
+        ; RND_SEED = $ACE1 pre-loaded. A ROM without that image needs JSR DO_NEW here.
         LDA #<STR_BANNER
         JSR PUTSTR            ; print banner
         JSR DO_FREE
@@ -891,7 +894,7 @@ DO_ERROR:
         BBR #0,RUN,DO_ERR_NOLINE  ; idle: no " IN line"
         LDA #<STR_IN
         JSR PUTSTR           ; " IN "
-        LDX #(CURLN-T0)
+        LDX #CURLN-T0
         JSR TO_T0
         JSR PRT16            ; line number
 DO_ERR_NOLINE:
@@ -1317,7 +1320,7 @@ EL_DONE:
 EDITLN:
         JSR PNUM             ; consume $FF lo hi, place value in T0
         JSR T0_TO_CURLN
-        LDX #(LP-IP)
+        LDX #LP-IP
         JSR PROG2P
         BRA EL_FL             ; skip EL_SKIP's own body on the first pass
 EL_SKIP:  ; advance LP past current line (hop by its length byte)
@@ -1359,8 +1362,8 @@ INSLINE:
         STA IP               ; source and destination share one index: Y=3 is the
         LDY #3               ; first body byte on both sides
         JSR TOKSKIP_IP       ; returns Y = offset past the NUL = total record length
+        PHY                  ; save the length for the header write below
         TYA
-        PHA                  ; save the length for the header write below
         CLC
         ADC PE                ; new PE = PE + total size
         STA T1
@@ -1372,7 +1375,7 @@ INSLINE:
         LDA #ERR_OM
         JMP DO_ERROR
 IN_OK:
-        LDX #(PE-T0)          ; T0 = old PE
+        LDX #PE-T0          ; T0 = old PE
         JSR TO_T0
         LDA T1                ; commit new PE now (OOM check already passed)
         STA PE
@@ -1886,7 +1889,7 @@ INIT_Z:
         BNE INIT_Z
         ; DATA_PTR is zeroed above: sentinel 0 = rescan from PROG
         ; reset program store
-        LDX #(PE-IP)
+        LDX #PE-IP
         JSR PROG2P
 
         ; Seed RND
@@ -1936,7 +1939,7 @@ DO_LIST:
         LDA T0+1
         STA CY+1
 LS_SCAN:
-        LDX #(LP-IP)
+        LDX #LP-IP
         JSR PROG2P
 
 LS_LN:
@@ -2919,7 +2922,7 @@ E1_DIVCHK_OVFL:  ; zero: shared ERR_OV stub: EP_OVFL in EXPR_POW, below
         JMP EP_OVFL
 
 E1_MOD_RESULT:
-        LDX #(T2-T0)          ; remainder -> T0
+        LDX #T2-T0          ; remainder -> T0
         JSR TO_T0
         ; *** FALL THROUGH to E1_SIGN ***
         ; ---- shared sign postamble ----
@@ -2948,34 +2951,51 @@ E1_P2:
         LDA OP               ; MOD: result is remainder (T2), not quotient (T1)
         CMP #'%'
         BEQ E1_MOD_RESULT
-        LDX #(T1-T0)          ; quotient -> T0
+        LDX #T1-T0          ; quotient -> T0
         JSR TO_T0
         BRA E1_SIGN
 
 E1_MUL_GO:
         JSR MUL16_U           ; T2 = |T1| * |T0|
-        LDX #(T2-T0)          ; result -> T0
+        LDX #T2-T0          ; result -> T0
         JSR TO_T0
         BRA E1_SIGN
 
 
 ; =============================================================================
 ; MUL16_U - unsigned 16-bit multiply
-;   Shift-add costs one pass per significant bit of the multiplier T1, so T1 is made the
-;   smaller operand first (the low 16 bits of the product are the same either way) and the
-;   loop ends as soon as T1 = 0.
+;   Both operands < 256: classic 8 x 8 shift-right multiply (8 fixed passes, product built in
+;   A:T1, accumulator add is 8-bit). Otherwise shift-add costs one pass per significant bit
+;   of the multiplier T1, so T1 is made the smaller operand first (the low 16 bits of the
+;   product are the same either way) and the loop ends as soon as T1 = 0. Only the high
+;   bytes are compared: with equal non-zero high bytes both operands have the same bit length.
 ;   In:  T0, T1 (both consumed as scratch)
 ;   Out: T2 = T0 * T1 mod 65536; T0 and T1 undefined
 ;   Clobbers: A X T0 T1 T2    Callers: EXPR1 (signed wrapper), EXPR_POW
 ; =============================================================================
 MUL16_U:
-        LDA T1+1             ; unsigned T1 vs T0: if T1 >= T0 swap so T1 is the smaller
-        CMP T0+1
-        BNE MU_CMP
+        LDA T0+1             ; both operands < 256? (A = 0 on fall-through)
+        ORA T1+1
+        BNE MU_BIG
+        LDX #8
+        LSR T1               ; C = multiplier bit 0
+MU8:
+        BCC MU8S
+        CLC
+        ADC T0               ; A = high product byte
+MU8S:
+        ROR                  ; product shifts right through A into T1, replacing the
+        ROR T1               ; multiplier bits as they are consumed
+        DEX
+        BNE MU8
+        STA T2+1
         LDA T1
-        CMP T0
-MU_CMP:
-        BCC MU_GO            ; T1 < T0: already the smaller
+        STA T2
+        RTS
+MU_BIG:
+        LDA T0+1             ; unsigned: T0 hi >= T1 hi -> T1 is already the smaller
+        CMP T1+1
+        BCS MU_GO
         LDA T0               ; swap T0 <-> T1
         LDX T1
         STX T0
@@ -3229,7 +3249,7 @@ EP_LOOP:
         CMP CY
         BCC EP_OVFL
 EP_MUL:
-        LDX #(CX-T0)             ; CY *= CX  (safe: checked above)
+        LDX #CX-T0             ; CY *= CX  (safe: checked above)
         JSR TO_T0
         LDA CY
         STA T1
@@ -3251,7 +3271,7 @@ EP_DLO:
         BNE EP_LOOP
 
 EP_SIGN:
-        LDX #(CY-T0)
+        LDX #CY-T0
         JSR TO_T0
 
         BBR #7,ATEMP,EP_DONE  ; negate? (base negative and exponent odd)
@@ -3312,9 +3332,9 @@ EXPR2:
         SBC #'0'              ; ch-'0' -- reused below for both digit and variable
         CMP #10
         BCC EXPR2_DIGIT       ; 0-9: ascii digit
-        CMP #('A'-'0')
+        CMP #'A'-'0'
         BCC EXPR2_NV          ; catches punctuation between '9' and 'A'
-        SBC #('A'-'0')        ; carry still set from the CMP above
+        SBC #'A'-'0'        ; carry still set from the CMP above
         CMP #26               ; 0-25: variable letter
         BCS EXPR2_NV
         ASL                   ; byte offset into VARS
@@ -3468,39 +3488,46 @@ N16TRAMP:
         JMP NEG16            ; tail call: negate if negative
 
 ; =============================================================================
-; ASR16 - arithmetic right shift of T0
-;   In:  T0 = signed value; X = count (0 = no shift)
-;   Out: T0 shifted right X times, sign-extended
+; CK_SH - arithmetic right shift of a 16-bit zero-page word into T0
+;   The high byte stays in A for the whole loop: CMP #$80 puts the sign in C, so each
+;   shift is CMP / ROR A / ROR lo, with no high-byte memory traffic.
+;   In:  X = (source - T0); CIDX = shift count (0..15); source may be T0 itself
+;   Out: T0 = source >> CIDX, sign-extended (0 = plain copy); X = 0 (callers rely on it)
 ;   Clobbers: A X
 ; =============================================================================
-ASR16:
-        TXA ; test X=0
-        BEQ ASR16_R
-ASR16_L:
-        LDA T0+1
-        ASL                ; sign bit -> C (1 byte; faster than CMP #$80)
-        ROR T0+1
-        ROR T0
+CK_SH:
+        LDA T0,x
+        STA T0
+        LDA T0+1,x
+        LDX CIDX
+        BEQ CK_SD
+CK_SL:
+        CMP #$80              ; C = sign bit
+        ROR                   ; high byte
+        ROR T0                ; low byte
         DEX
-        BNE ASR16_L
-ASR16_R:
+        BNE CK_SL
+CK_SD:
+        STA T0+1
         RTS
 
 ; =============================================================================
 ; E2_SGN - SGN(n): -1, 0 or 1
-;   A 15-place arithmetic shift (ASR16) gives $0000 or $FFFF; OR-ing the low byte with 1
+;   A 15-place arithmetic shift (CK_SH) gives $0000 or $FFFF; OR-ing the low byte with 1
 ;   turns that into +1 or leaves -1.
 ;   In:  IP at the SGN token
 ;   Out: T0 = -1, 0 or 1; IP past ")"
-;   Clobbers: EXPR
+;   Clobbers: EXPR CIDX
 ; =============================================================================
 E2_SGN:
         JSR E2_CHRS           ; consume token, eat '(' expr ')' -> T0
         LDA T0
         ORA T0+1
         BEQ E2_SGN_RTS        ; zero -> T0 already 0, nothing to do
-        LDX #15
-        JSR ASR16             ; T0 = $0000 if n > 0, $FFFF if n < 0
+        LDA #15
+        STA CIDX
+        LDX #0
+        JSR CK_SH             ; T0 = n >> 15 = $0000 if n > 0, $FFFF if n < 0
         LDA T0
         ORA #1
         STA T0                ; +1 if positive; stays $FF (-1) if negative
@@ -3523,41 +3550,42 @@ CK_IT:
         STA CX_SAV+1
 
         ; 1) CX = CX -/+ (CY >> i)
-        LDX #(CY-T0)
-        JSR TO_T0
-        LDX CIDX
-        JSR ASR16
+        LDX #CY-T0
+        JSR CK_SH            ; T0 = CY >> i
         BBS #7,CZ+1,CK_P1    ; CZ<0: want ADD, skip negate
-        JSR NEG16            ; CZ>=0: want SUB, negate T0 then add
+        JSR NEG_X            ; CZ>=0: want SUB, negate T0 (X = 0 from CK_SH) then add
 CK_P1:
-        LDX #(CX-T0)
+        LDX #CX-T0
         JSR ADDT0_TO
 
         ; 2) CY = CY +/- (CX_SAV >> i)
-        LDX #(CX_SAV-T0)
-        JSR TO_T0
-        LDX CIDX
-        JSR ASR16
+        LDX #CX_SAV-T0
+        JSR CK_SH            ; T0 = CX_SAV >> i
         BBR #7,CZ+1,CK_P2    ; CZ>=0: want ADD, skip negate
-        JSR NEG16            ; CZ<0: want SUB, negate T0 then add
+        JSR NEG_X            ; CZ<0: want SUB, negate T0 (X = 0 from CK_SH) then add
 CK_P2:
-        LDX #(CY-T0)
+        LDX #CY-T0
         JSR ADDT0_TO
 
-        ; 3) CZ = CZ -/+ ATAN_TBL[i]
-        LDX CIDX
-        TXA
+        ; 3) CZ = CZ -/+ ATAN_TBL[i], branchless: CZ + (ATAN EOR M) + C, where M = $FF and
+        ;    C = 1 (two's complement subtract) for CZ >= 0, M = 0 and C = 0 (add) for CZ < 0
+        LDA CIDX
         ASL
         TAX
+        LDA CZ+1
+        ASL                  ; C = sign of CZ
+        LDA #0
+        SBC #0               ; A = $FF if CZ >= 0, else $00
+        CMP #$FF             ; C = 1 if CZ >= 0 (A unchanged)
+        STA T0               ; T0 = mask M
         LDA ATAN_TBL,x
-        STA T0
+        EOR T0
+        ADC CZ
+        STA CZ
         LDA ATAN_TBL+1,x
-        STA T0+1
-        BBS #7,CZ+1,CK_P3    ; CZ<0: want ADD, skip negate
-        JSR NEG16            ; CZ>=0: want SUB, negate T0 then add
-CK_P3:
-        LDX #(CZ-T0)
-        JSR ADDT0_TO
+        EOR T0
+        ADC CZ+1
+        STA CZ+1
 
         LDX CIDX
         INX
@@ -3604,7 +3632,7 @@ SC_ABS:
         AND #3               ; Y = Q mod 4  (quadrant)
         TAY
 
-        LDX #(T2-T0)
+        LDX #T2-T0
         JSR TO_T0            ; T0 = R (0..89)
 
         TYA
@@ -3633,7 +3661,7 @@ SC_FLAGS:
 SC_ML:
         LSR T2              ; bit -> C
         BCC SC_MN
-        LDX #(CZ-T0)
+        LDX #CZ-T0
         JSR ADDT0_TO
 SC_MN:
         ASL T0
@@ -3660,10 +3688,10 @@ SC_NCX:
         JSR NEG_X
 SC_NCY:
         ; Result select: ATEMP=0->SIN(CY), ATEMP=$80->COS(CX)
-        LDX #(CY-T0)        ; default: SIN
+        LDX #CY-T0        ; default: SIN
         LDA ATEMP
         BEQ SC_SEL
-        LDX #(CX-T0)        ; switch to COS
+        LDX #CX-T0        ; switch to COS
 SC_SEL:
         JSR TO_T0
 SC_SCALE:
@@ -3684,7 +3712,7 @@ SC_SDO:  ; >>4 (logical; val positive here)
 SC_SML:
         LSR T1
         BCC SC_SMN
-        LDX #(T2-T0)
+        LDX #T2-T0
         JSR ADDT0_TO
 SC_SMN:
         ASL T0
@@ -3692,7 +3720,7 @@ SC_SMN:
         DEX
         BNE SC_SML
         ; >>6: T0 = T2>>6
-        LDX #(T2-T0)
+        LDX #T2-T0
         JSR TO_T0
         LDX #6
         JSR SHIFT_R16_T0
@@ -3704,7 +3732,7 @@ SC_SMN:
 ; =============================================================================
 ; NEG16 / NEG_T1 / NEG_X - two's-complement negate T0 / T1 / the pair at T0+X
 ;   NEG16 loads X=0 and NEG_T1 loads X=2 (BIT abs hides the other LDX); NEG_X is entered
-;   with X preloaded: LDX #(CX-T0) / JSR NEG_X negates CX. SC_DONE is the shared RTS.
+;   with X preloaded: LDX #CX-T0 / JSR NEG_X negates CX. SC_DONE is the shared RTS.
 ;   In:  the value at T0, T1 or T0+X
 ;   Out: that location holds 0 - value
 ;   Clobbers: A X
