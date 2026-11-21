@@ -8,6 +8,7 @@
 ; LIST to view, NEW to clear and enter your own program).
 ;
 ; Credit to Oscar Toledo for his x86 BootBASIC inspiration.
+; Credit to SOCI for the simplified INSLINE block copy (v15.35).
 ;
 ; USAGE
 ;   Assemble : asm65c02 4kBASIC65c02.asm       (ROM $F000-$FFFF, showcase image at $0200)
@@ -125,7 +126,7 @@
 ;   $E000  write = TERMINAL_CLS     clear screen, cursor to (0,0)
 ;   $E001  write = character output (PUTCH)
 ;   $E004  read  = character input  (GETCH, non-blocking poll; 0 = no char)
-;   NOTE: Real system likely requiree UART setup - bytes free to do so.
+;   NOTE: Real system likely require UART setup - Delete SGN if needed .
 ;
 ; Routine headers give In / Out / Clobbers. Clobbers lists the registers and scratch cells
 ;   a routine (or anything it calls) may change; documented outputs are not repeated.
@@ -154,6 +155,11 @@
 ;
 ; =============================================================================
 ; CHANGE HISTORY
+; v15.35 (Nov 2026) - 5 bytes free - INSLINE SIMPLIFICATION (Thx SOCI), POWER-OF-TWO DIVIDE
+;   - INSLINE: TOKSKIP_IP already returns the record length, so the line is block-copied from
+;     TBUF in one loop, the header written into TBUF first. 
+;   - DIV_KERN fast path: a <256 power of two divisor takes a shift for the quotient mask the
+;     remainder instead of the 16-pass loop.
 ;
 ; v15.34 (Nov 2026) - 3 ROM bytes free - COMPACT CONSTANTS + RAM OVERLAY + CORDIC SPEED
 ;   - Constant literals encoded for compact single digits (See above), Showcase regenerated 
@@ -247,7 +253,6 @@
 ;   - Added SHL/SHR: new tokens TOK_SHL/TOK_SHR ($AC/$AD). Not folded into
 ;     E1_MD's shared path (wrong semantics for a shift). SHR reuses ASR16;
 ;     SHL used a new SHIFT_L16_T0 (later inlined, v15.27). +83 bytes.
-;
 
 ; v15.24 (Aug 2026) - 110 bytes free - CORRECTNESS FIX
 ;   E1_MD stashed the */,/,%/MOD operator in a fixed ZP byte (OP) across
@@ -267,7 +272,7 @@
 ;     BIT-trick ($2C) entry chain and REL_SETUP, mirroring uBASIC6502's
 ;     BITOP2_PREFIX/BITOP_LP.
 
-; v15.22 (Aug 2026) - 73 bytes free 
+; v15.22 (Aug 2026) - 73 bytes free (confirmed by build)
 ;   - EXPR_POW (EP_MUL, EP_SIGN): two inline 16-bit copies into T0 (from CX,
 ;     from CY) converted to the shared TO_T0 helper.
 ;
@@ -430,7 +435,8 @@
 ;   Strings     passed through as-is, including the surrounding quotes
 ;   End-of-line $00 (NUL). Payload bytes may be $00 too, so every scanner skips the payload
 ;               after $FD/$FE/$FF and never tests it.
-;   TBUF holds  $FF <lo> <hi> <tokenised_body> $00  for a numbered line being entered.
+;   TBUF holds  $FF <lo> <hi> <tokenised_body> $00  for a numbered line being entered;
+;               INSLINE overwrites its first 3 bytes with the record header <lo> <hi> <len>.
 ; Program storage line format:
 ;   <lineno_lo> <lineno_hi> <len> <tokenised_body> $00
 ;   <len> = total record length in bytes (3 header + body + NUL); next line = this line + <len>.
@@ -632,8 +638,8 @@ ZPEND    = *                    ; audit
 ; Integer spiral vortex (lines 750-1150): SIN/COS/ASIN/ACOS plot.
 ; =============================================================================
         .ORG $0200
-        .DB $0A, $00, $1F, $89, $20, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $33, $34, $20, $53, $48, $4F, $57, $43, $41, $53, $45, $00  ; 10 REM  4K BASIC v15.34 SHOWCASE
-        .DB $14, $00, $1C, $80, $22, $3D, $3D, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $33, $34, $20, $3D, $3D, $22, $00  ; 20 PRINT "== 4K BASIC v15.34 =="
+        .DB $0A, $00, $1F, $89, $20, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $33, $35, $20, $53, $48, $4F, $57, $43, $41, $53, $45, $00  ; 10 REM  4K BASIC v15.34 SHOWCASE
+        .DB $14, $00, $1C, $80, $22, $3D, $3D, $20, $34, $4B, $20, $42, $41, $53, $49, $43, $20, $76, $31, $35, $2E, $33, $35, $20, $3D, $3D, $22, $00  ; 20 PRINT "== 4K BASIC v15.34 =="
         .DB $1E, $00, $1E, $80, $22, $43, $48, $52, $22, $3B, $95, $28, $FD, $24, $29, $3B, $22, $28, $36, $35, $29, $3D, $22, $3B, $95, $28, $FD, $41, $29, $00  ; 30 PRINT "CHR";CHR$(36);"(65)=";CHR$(65)
         .DB $28, $00, $29, $80, $22, $31, $37, $20, $4D, $4F, $44, $20, $35, $3D, $22, $3B, $FD, $11, $9D, $35, $3B, $22, $20, $20, $41, $42, $53, $20, $6E, $65, $67, $37, $3D, $22, $3B, $A1, $28, $2D, $37, $29, $00  ; 40 PRINT "17 MOD 5=";17 MOD 5;"  ABS neg7=";ABS(-7)
         .DB $32, $00, $21, $80, $22, $4E, $4F, $54, $20, $30, $3D, $22, $3B, $98, $30, $3B, $22, $20, $20, $36, $20, $41, $4E, $44, $20, $33, $3D, $22, $3B, $36, $96, $33, $00  ; 50 PRINT "NOT 0=";NOT 0;"  6 AND 3=";6 AND 3
@@ -741,7 +747,7 @@ SHOWCASE_END = *               ; end of the showcase image: initial PE
 ; =============================================================================
 STR_PAGE  = >STR_BANNER      ; hi-byte shared by all string/kw addresses
 STR_BANNER:
-        .DB "4K BASIC v15.34"
+        .DB "4K BASIC v15.35"
 STR_CRLF:
         .DB $0D,$8A                 ; CR, LF|$80 = $8A
 STR_BYTES:
@@ -1350,19 +1356,23 @@ EL_INS:
         ; drop through
 ; =============================================================================
 ; INSLINE - insert a tokenised line into the program store at LP
-;   OOM test compares only the new PE high byte with RAM_TOP's: exact, RAM_TOP is page-aligned.
+;   TOKSKIP_IP gives the record length, so the record is block-copied from TBUF in one loop
+;   with no token-aware payload walk: the 3-byte header [lo hi len] is first written over
+;   TBUF's $FF lo hi (already consumed by EDITLN). Y holds the length from TOKSKIP_IP to the
+;   end: nothing in between touches it. OOM test compares only the new PE high byte with
+;   RAM_TOP's: exact, RAM_TOP is page-aligned. Credit: SOCI.
 ;   In:  TBUF = $FF lo hi body $00 (IP is rewound to TBUF here)
 ;        LP = insertion point (bytes LP..PE shift up); PE = program end; CURLN = line number
-;   Out: record [lo hi len body NUL] written at LP; PE += record length; IP = TBUF
+;   Out: record [lo hi len body NUL] written at LP; PE += record length; IP = TBUF;
+;        TBUF+0..2 overwritten with the header; Y = 0
 ;        OM ERR if the new PE would reach RAM_TOP
-;   Clobbers: A X Y T0 T1
+;   Clobbers: A X Y T0 T1 TBUF
 ; =============================================================================
 INSLINE:
         LDA #<TBUF           ; rewind IP to TBUF (zero page: IP+1 is already 0)
         STA IP               ; source and destination share one index: Y=3 is the
         LDY #3               ; first body byte on both sides
         JSR TOKSKIP_IP       ; returns Y = offset past the NUL = total record length
-        PHY                  ; save the length for the header write below
         TYA
         CLC
         ADC PE                ; new PE = PE + total size
@@ -1381,9 +1391,7 @@ IN_OK:
         STA PE
         LDA T1+1
         STA PE+1
-        LDY #0
-        JSR CMP_T0_LP        ; if old PE == LP, nothing to shift upward
-        BEQ IN_HDR
+        BRA IN_TST            ; test first: nothing to shift if old PE == LP
 IN_BK:
         LDA T0                ; pre-decrement source (T0)
         BNE IN_D0
@@ -1395,40 +1403,23 @@ IN_D0:
         DEC T1+1
 IN_D1:
         DEC T1
-        LDA (T0),y            ; backward copy loop
-        STA (T1),y
+        LDA (T0)              ; backward copy loop
+        STA (T1)
+IN_TST:
         JSR CMP_T0_LP        ; stop exactly when T0 == LP
         BNE IN_BK
-IN_HDR:
-        LDA CURLN             ; write 3-byte header at LP: line number lo, hi, record length
-        STA (LP),y            ; Y is 0 here
-        INY
+        LDA CURLN             ; header into TBUF: line number lo, hi, record length
+        STA TBUF
         LDA CURLN+1
-        STA (LP),y
-        INY
-        PLA                   ; record length saved at entry
-        STA (LP),y
-        INY                   ; Y = 3: body offset (same in source TBUF and destination)
-IN_CP:
-        LDA (IP),y            ; copy payload from TBUF
-        STA (LP),y
-        BEQ IN_DONE            ; NUL terminator copied: done (Z is still from the LDA)
-        ; Payload: TOK_BYTE has 1 extra byte, TOK_HEX/TOK_NUM 2. A loop, not unrolled:
-        ; INSLINE is off the RUN path, so ROM beats cycles.
-        LDX #1                 ; assume 1 extra byte (TOK_BYTE) if >= TOK_BYTE
-        CMP #TOK_BYTE
-        BCC IN_NX               ; < TOK_BYTE: plain byte, no payload to copy
-        BEQ IN_PAY                ; == TOK_BYTE: X=1 is right
-        INX                        ; TOK_HEX/TOK_NUM: X=2
+        STA TBUF+1
+        STY TBUF+2
 IN_PAY:
-        INY
-        LDA (IP),y
+        DEY                   ; copy the whole record [TBUF .. TBUF+len) to LP, last byte first
+        LDA (IP),y            ; (TYA/BNE, not BPL: a record can be longer than 127 bytes)
         STA (LP),y
-        DEX
+        TYA
         BNE IN_PAY
-IN_NX:
-        INY
-        BRA IN_CP             ; always taken for bounded line lengths (<256)
+        RTS
 
 ; =============================================================================
 ; DELINE - remove the program line whose header is at LP
@@ -1474,7 +1465,6 @@ DL_DONE:
         STA PE
         BCS DL_OK
         DEC PE+1
-IN_DONE:
 DL_OK:
         RTS
 
@@ -3028,7 +3018,9 @@ MU_MS:
 
 ; =============================================================================
 ; DIV_KERN - unsigned 16-bit restoring divide
-;   If the dividend's high byte is below the divisor, the first 8 passes would only shift it
+;   A divisor under 256 that is a power of two (D AND D-1 = 0, so /2 /4 ... /128, MOD 8 and
+;   the like) skips the loop: quotient = dividend >> log2(D), remainder = dividend AND D-1.
+;   Otherwise, if the dividend's high byte is below the divisor, the first 8 passes would only shift it
 ;   into the remainder: skip them (remainder = T1 hi, T1 lo moves up, 8 passes not 16).
 ;   This covers every divisor >= 256 and every dividend < 256.
 ;   Divisors < 256 use a loop that keeps the 8-bit remainder in A (DK_NLP); wider ones use
@@ -3042,6 +3034,24 @@ DIV_KERN:
         LDY #16
         LDA T0+1
         BNE DK_PRE           ; divisor >= 256: quotient < 256, take the fast path
+        LDA T0               ; divisor < 256 and a power of two (D AND D-1 = 0)?
+        DEC
+        TAX                  ; X = D-1: the remainder mask
+        AND T0
+        BNE DK_GEN           ; no: the general loops
+        TXA
+        AND T1
+        STA T2               ; remainder = dividend lo AND D-1
+        LDA T0
+DK_PW:
+        LSR                  ; D >> 1 reaches 0 only after D was 1: that many shifts, done
+        BEQ DK_PWD
+        LSR T1+1             ; quotient: dividend >> 1
+        ROR T1
+        BRA DK_PW
+DK_PWD:
+        RTS
+DK_GEN:
         LDA T1+1
         CMP T0               ; divisor < 256: fast path iff dividend hi < divisor
         LDA #0               ; remainder = 0 for the full path (LDA keeps the CMP carry)
